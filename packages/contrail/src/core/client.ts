@@ -8,6 +8,7 @@ import { type Did } from "@atcute/lexicons";
 import { Client, simpleFetchHandler } from "@atcute/client";
 import type {} from "@atcute/atproto";
 import type { ContrailConfig, Database } from "./types";
+import { labelBackfillEnqueueStatements } from "./moderation";
 
 // Slingshot-first PDS resolution with fallback to DID document resolution
 const SLINGSHOT_URL =
@@ -97,7 +98,7 @@ async function getPDSViaDidDoc(
 ): Promise<string | undefined> {
   signal?.throwIfAborted();
   const resolver = config?.networkOverrides?.resolver ?? DEFAULT_DID_RESOLVER;
-  const doc = await resolver.resolve(did as Did<"plc"> | Did<"web">);
+  const doc = await resolver.resolve(did as Did<"plc"> | Did<"web">, { signal });
   signal?.throwIfAborted();
   return doc.service
     ?.find((s) => s.id === "#atproto_pds")
@@ -232,12 +233,14 @@ async function resolvePDSCached(
   // Persist to DB for future runs. COALESCE keeps an existing handle when this
   // resolution didn't return one, and never nulls a good handle.
   if (db) {
-    await db
+    const statement = db
       .prepare(
         "INSERT INTO identities (did, handle, pds, resolved_at) VALUES (?, ?, ?, ?) ON CONFLICT(did) DO UPDATE SET pds = excluded.pds, handle = COALESCE(excluded.handle, identities.handle), resolved_at = excluded.resolved_at"
       )
-      .bind(did, resolved.handle, resolved.pds, Date.now())
-      .run();
+      .bind(did, resolved.handle, resolved.pds, Date.now());
+    const queued = labelBackfillEnqueueStatements(db, [did], config, true);
+    if (queued.length) await db.batch([...queued, statement]);
+    else await statement.run();
   }
 
   return resolved.pds;

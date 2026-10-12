@@ -42,6 +42,7 @@ import {
 } from "../dialect";
 import type { SourcePosition } from "../sources";
 import { appendChangeLogStatements } from "../change-log";
+import { actionProjectionStatements, visibleRecordSql, labelBackfillEnqueueStatements } from "../moderation";
 
 // --- Counts ---
 
@@ -178,8 +179,11 @@ function buildBatchCountStatements(
 
     // Total count
     const totalCol = countColumnName(rel.collection);
+    // Stored counts are public counts: hidden children are excluded here and
+    // moderation visibility changes recount affected parents.
+    const visible = visibleRecordSql("mc");
     setClauses.push(
-      `${totalCol} = (SELECT ${countExpr} FROM ${childTable} WHERE ${getDialect(db).jsonExtract('record', field)} = ?)`
+      `${totalCol} = (SELECT ${countExpr} FROM ${childTable} mc WHERE ${getDialect(db).jsonExtract('mc.record', field)} = ? AND ${visible})`
     );
     setBindings.push(targetValue);
 
@@ -191,7 +195,7 @@ function buildBatchCountStatements(
         for (const [groupKey, fullToken] of Object.entries(mapping.groups)) {
           const groupCol = groupedCountColumnName(rel.collection, groupKey);
           setClauses.push(
-            `${groupCol} = (SELECT ${countExpr} FROM ${childTable} WHERE ${getDialect(db).jsonExtract('record', field)} = ? AND ${getDialect(db).jsonExtract('record', rel.groupBy)} = ?)`
+            `${groupCol} = (SELECT ${countExpr} FROM ${childTable} mc WHERE ${getDialect(db).jsonExtract('mc.record', field)} = ? AND ${getDialect(db).jsonExtract('mc.record', rel.groupBy)} = ? AND ${visible})`
           );
           setBindings.push(targetValue, fullToken);
         }
@@ -210,6 +214,38 @@ function buildBatchCountStatements(
   }
 
   return statements;
+}
+
+/** Recount every parent the given child records point at, under current
+ * moderation visibility. Used when a child's visibility changes. */
+export function childRecountStatements(
+  db: Database,
+  config: ContrailConfig,
+  childShort: string,
+  records: Array<{ record: unknown }>,
+): Statement[] {
+  const targets = new Map<string, CountTarget>();
+  for (const { parentCollection, relationName, rel } of getInboundRelations(
+    config,
+    childShort,
+  )) {
+    if (rel.count === false) continue;
+    for (const row of records) {
+      const record =
+        typeof row.record === "string" ? JSON.parse(row.record) : row.record;
+      const targetValue = record
+        ? getNestedValue(record, getRelationField(rel))
+        : null;
+      if (typeof targetValue === "string" && targetValue)
+        addCountTarget(targets, {
+          parentCollection,
+          relationName,
+          rel,
+          targetValue,
+        });
+    }
+  }
+  return buildBatchCountStatements(db, config, targets);
 }
 
 // --- FTS ---
@@ -1420,6 +1456,8 @@ export async function projectEvents(
 
   // Build deduplicated count statements, then append the compact change batch.
   // Caller-provided source checkpoints deliberately remain last.
+  batch.push(...actionProjectionStatements(db, events, config));
+  batch.push(...labelBackfillEnqueueStatements(db, events.filter((e) => e.operation !== "delete").map((e) => e.did), config));
   batch.push(...buildBatchCountStatements(db, config, countTargets));
   batch.push(
     ...appendChangeLogStatements(
@@ -1547,6 +1585,7 @@ export async function rebuildDerivedProjections(
         `WITH derived AS (
            SELECT ${childTarget} AS target, ${projections.join(", ")}
            FROM ${childTable} child
+           WHERE ${visibleRecordSql("child")}
            GROUP BY ${childTarget}
          )
          UPDATE ${parentTable} AS parent
@@ -1714,7 +1753,7 @@ export async function queryRecords(
 
   const table = recordsTableName(collection);
   const limit = Math.min(Math.max(1, rawLimit ?? 50), 200);
-  const conditions: string[] = [];
+  const conditions: string[] = [visibleRecordSql("r")];
   const bindings: (string | number)[] = [];
 
   if (source?.conditions) conditions.push(...source.conditions);

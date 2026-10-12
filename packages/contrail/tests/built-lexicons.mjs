@@ -127,7 +127,20 @@ try {
     "event",
     "listRecords.ts",
   );
-  readFileSync(generatedTypes, "utf8");
+  const typeSource = readFileSync(generatedTypes, "utf8");
+  if (!typeSource.includes("selfLabels")) throw new Error("generated types omit selfLabels");
+  // Compile real client usage, not just the generated definitions.
+  writeFileSync(join(root, "src", "lexicon-types", "self-labels-smoke.ts"), `
+import type { Record } from "./types/com/example/event/listRecords.js";
+const record: Record = {
+  uri: "at://did:plc:example/community.example.event/abc", cid: "bafyexample",
+  did: "did:plc:example", collection: "community.example.event", rkey: "abc", time_us: 1,
+  value: { $type: "community.example.event", name: "Sensitive event" },
+  selfLabels: [{ val: "nudity" }],
+};
+const value: string | undefined = record.selfLabels?.[0]?.val;
+void value;
+`);
 
   writeFileSync(
     join(root, "tsconfig.json"),

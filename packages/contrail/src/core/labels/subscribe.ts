@@ -5,11 +5,12 @@ import { applyLabels, type IncomingLabel } from "./apply";
 import {
   getLabelerState,
   resetLabelerCursor,
-  saveLabelerCursor,
 } from "./resolve";
 
 const DEFAULT_CYCLE_TIMEOUT_MS = 25_000;
 const DEFAULT_BATCH_SIZE = 100;
+/** Unflushed batches retained before the socket is closed for a retry. */
+const MAX_BUFFERED_BATCHES = 20;
 const DEFAULT_FLUSH_INTERVAL_MS = 5_000;
 
 function getLogger(config: ContrailConfig): Logger {
@@ -30,6 +31,7 @@ export async function runLabelIngestCycle(
   const deadline = Date.now() + timeoutMs;
 
   for (const source of config.labels.sources) {
+    if (source.records) continue;
     if (Date.now() >= deadline) {
       log.log(`[labels] cycle deadline hit before processing ${source.did}`);
       break;
@@ -43,7 +45,7 @@ export async function runLabelIngestCycle(
         remaining,
         /* persistent */ false,
         {},
-        config.networkOverrides,
+        config,
       );
     } catch (err) {
       log.warn(`[labels] cycle for ${source.did} failed: ${err}`);
@@ -69,8 +71,8 @@ export async function runPersistentLabels(
   const log = options.logger ?? config.logger ?? console;
   const signal = options.signal;
 
-  const tasks = config.labels.sources.map((source) =>
-    runOneLabelerForever(db, source, log, signal, options, config.networkOverrides),
+  const tasks = config.labels.sources.filter((s) => !s.records).map((source) =>
+    runOneLabelerForever(db, source, log, signal, options, config),
   );
   await Promise.all(tasks);
 }
@@ -81,7 +83,7 @@ async function runOneLabelerForever(
   log: Logger,
   signal: AbortSignal | undefined,
   options: PersistentLabelsOptions,
-  networkOverrides: ContrailConfig["networkOverrides"],
+  config: ContrailConfig,
 ): Promise<void> {
   let attempts = 0;
   while (!signal?.aborted) {
@@ -97,7 +99,7 @@ async function runOneLabelerForever(
           batchSize: options.batchSize ?? DEFAULT_BATCH_SIZE,
           flushIntervalMs: options.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS,
         },
-        networkOverrides,
+        config,
       );
       attempts = 0;
     } catch (err) {
@@ -131,9 +133,9 @@ async function pumpOneLabeler(
   timeoutMs: number,
   persistent: boolean,
   pumpOpts: PumpOptions = {},
-  networkOverrides?: ContrailConfig["networkOverrides"],
+  config?: ContrailConfig,
 ): Promise<void> {
-  const state = await getLabelerState(db, source.did, source.endpoint, networkOverrides);
+  const state = await getLabelerState(db, source.did, source.endpoint, config?.networkOverrides);
   if (!state) {
     log.warn(`[labels] could not resolve labeler endpoint for ${source.did}; skipping`);
     return;
@@ -142,7 +144,7 @@ async function pumpOneLabeler(
   // First-time policy: cursor 0 = "from the beginning" if backfill is on
   // (default), null = "from now" otherwise. After the first cycle we always
   // resume from the saved cursor — `backfill` only flips the start point.
-  const isFirstRun = state.cursor === 0 && state.resolved_at === null;
+  const isFirstRun = state.cursor === 0;
   const backfill = source.backfill !== false;
   const startCursor = isFirstRun && !backfill ? null : state.cursor;
 
@@ -154,7 +156,7 @@ async function pumpOneLabeler(
 
   const buffer: IncomingLabel[] = [];
   let highestSeq = state.cursor;
-  let flushing = false;
+  let flushPending: Promise<void> = Promise.resolve();
   let resolveDone!: () => void;
   let rejectDone!: (err: unknown) => void;
   const done = new Promise<void>((res, rej) => {
@@ -162,30 +164,36 @@ async function pumpOneLabeler(
     rejectDone = rej;
   });
 
-  const flush = async () => {
-    if (buffer.length === 0 || flushing) return;
-    flushing = true;
-    const batch = buffer.splice(0);
-    try {
-      const kept = await applyLabels(db, batch);
-      if (highestSeq > state.cursor) {
-        await saveLabelerCursor(db, source.did, highestSeq);
-        state.cursor = highestSeq;
+  const flush = (): Promise<void> => {
+    const work = flushPending.catch(() => {}).then(async () => {
+      // Freeze the seq with this exact batch, never checkpoint newer frames
+      // received while SQL is in flight. Filter-only frames still advance.
+      const seq = highestSeq;
+      if (!buffer.length && seq <= state.cursor) return;
+      const batch = buffer.splice(0);
+      try {
+        const kept = await applyLabels(db, batch, { source, config, trailingStatements: [
+          db.prepare(`INSERT INTO labeler_cursors (did, cursor) VALUES (?, ?)
+            ON CONFLICT(did) DO UPDATE SET cursor = excluded.cursor
+            WHERE excluded.cursor > labeler_cursors.cursor`).bind(source.did, seq),
+        ] });
+        state.cursor = seq;
+        log.log(`[labels] ${source.did} flushed ${kept}/${batch.length} labels, cursor=${seq}`);
+      } catch (err) {
+        buffer.unshift(...batch);
+        throw err;
       }
-      log.log(
-        `[labels] ${source.did} flushed ${kept}/${batch.length} labels, cursor=${highestSeq}`,
-      );
-    } catch (err) {
-      log.error(`[labels] ${source.did} flush failed: ${err}`);
-    } finally {
-      flushing = false;
-    }
+    });
+    flushPending = work;
+    return work;
   };
 
   const batchSize = pumpOpts.batchSize ?? DEFAULT_BATCH_SIZE;
   const flushInterval = pumpOpts.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
+  const flushFailed = (err: unknown) =>
+    log.error(`[labels] ${source.did} flush failed (${buffer.length} buffered): ${err}`);
   const flushTimer = setInterval(() => {
-    flush().catch(() => {});
+    flush().catch(flushFailed);
   }, flushInterval);
 
   const cleanup = () => {
@@ -200,7 +208,7 @@ async function pumpOneLabeler(
   // External abort (persistent mode) — close socket gracefully.
   const abortHandler = () => {
     cleanup();
-    flush().finally(() => resolveDone());
+    flush().then(resolveDone, rejectDone);
   };
   pumpOpts.signal?.addEventListener("abort", abortHandler, { once: true });
 
@@ -210,7 +218,7 @@ async function pumpOneLabeler(
     deadlineTimer = setTimeout(() => {
       log.log(`[labels] ${source.did} cycle deadline reached, closing`);
       cleanup();
-      flush().finally(() => resolveDone());
+      flush().then(resolveDone, rejectDone);
     }, timeoutMs);
   }
 
@@ -224,10 +232,8 @@ async function pumpOneLabeler(
   ws.addEventListener("close", () => {
     if (deadlineTimer) clearTimeout(deadlineTimer);
     pumpOpts.signal?.removeEventListener("abort", abortHandler);
-    flush().finally(() => {
-      clearInterval(flushTimer);
-      resolveDone();
-    });
+    clearInterval(flushTimer);
+    flush().then(resolveDone, rejectDone);
   });
 
   ws.addEventListener("message", async (ev) => {
@@ -251,8 +257,13 @@ async function pumpOneLabeler(
         if (lab) buffer.push(lab);
       }
       if (Number.isFinite(seq) && seq > highestSeq) highestSeq = seq;
-      if (buffer.length >= batchSize) {
-        flush().catch(() => {});
+      if (buffer.length >= batchSize * MAX_BUFFERED_BATCHES) {
+        // Flushes keep failing: stop reading. The cursor was not advanced past
+        // unflushed labels, so the next connection replays them.
+        log.error(`[labels] ${source.did} buffer limit reached; closing to retry from cursor`);
+        cleanup();
+      } else if (buffer.length >= batchSize) {
+        flush().catch(flushFailed);
       }
     } else if (frame.t === "#info") {
       const name = String(frame.payload?.name ?? "");

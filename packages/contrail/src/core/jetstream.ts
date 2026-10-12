@@ -15,7 +15,7 @@ import {
   optimizeIntervalMs,
   optimizeAnalysisLimit,
 } from "./types";
-import { assertJetstreamServiceCompatibility, assertServingSourceCompatibility, initSchema, getLastCursor, loadKnownActorDids, saveJetstreamCursor, saveJetstreamCursorStatement, saveJetstreamCursorObservationStatements, saveOrderedSourcePositionStatement, sweepFeedItems, getFeedPruneCursor, saveFeedPruneCursor, getMetaNumber, setMeta, optimizeDatabase } from "./db";
+import { assertJetstreamServiceCompatibility, assertServingSourceCompatibility, initSchema, getLastCursor, loadKnownActorDids, saveJetstreamCursorStatement, saveJetstreamCursorObservationStatements, saveOrderedSourcePositionStatement, sweepFeedItems, getFeedPruneCursor, saveFeedPruneCursor, getMetaNumber, setMeta, optimizeDatabase } from "./db";
 import {
   createIngestEvent,
   ingestRecords,
@@ -33,6 +33,8 @@ import {
   type RuntimeCpuUsageProcess,
 } from "./runtime-telemetry";
 
+import { accountUpdateStatements, MODERATION_ACTION_NSID, type AccountUpdate } from "./moderation";
+
 const BATCH_SIZE = 50;
 
 /** Fixed estimate for the URI, source position, revision, CID, and other
@@ -48,6 +50,7 @@ export const DEFAULT_SCHEDULED_INGEST_BUDGET = Object.freeze({
   maxDrainMs: 25_000,
   maxCandidates: 250,
   maxIdentityUpdates: 250,
+  maxAccountUpdates: 500,
   maxSerializedBytes: 4 * 1024 * 1024,
 }) satisfies ScheduledIngestBudget;
 
@@ -55,6 +58,7 @@ export interface ScheduledIngestBudget {
   maxDrainMs: number;
   maxCandidates: number;
   maxIdentityUpdates: number;
+  maxAccountUpdates: number;
   maxSerializedBytes: number;
 }
 
@@ -65,6 +69,9 @@ export interface ScheduledIngestOptions {
   maxCandidates?: number;
   /** Maximum distinct handle updates retained by one drain. Default: 250. */
   maxIdentityUpdates?: number;
+  /** Maximum distinct-actor account events retained by one drain; reaching
+   * it ends the drain so no lifecycle event is skipped. Default: 500. */
+  maxAccountUpdates?: number;
   /** UTF-8 record bytes plus metadata allowances. Default: 4 MiB. */
   maxSerializedBytes?: number;
   /** @deprecated Compatibility alias for maxDrainMs. */
@@ -139,6 +146,11 @@ export function resolveScheduledIngestBudget(
       options.maxIdentityUpdates ??
         DEFAULT_SCHEDULED_INGEST_BUDGET.maxIdentityUpdates,
       "maxIdentityUpdates",
+    ),
+    maxAccountUpdates: positiveInteger(
+      options.maxAccountUpdates ??
+        DEFAULT_SCHEDULED_INGEST_BUDGET.maxAccountUpdates,
+      "maxAccountUpdates",
     ),
     maxSerializedBytes: positiveInteger(
       options.maxSerializedBytes ??
@@ -398,6 +410,7 @@ export async function ingestEvents(
   lastCursor: number | null;
   cursorObservations: Set<string>;
   identityUpdates: Map<string, string>;
+  accountUpdates: AccountUpdate[];
   stats: ScheduledIngestCollectionStats;
 }> {
   const budget = resolveScheduledIngestBudget(budgetInput);
@@ -413,6 +426,8 @@ export async function ingestEvents(
 
   const seenObservations = new Map<string, Set<string>>();
   const identityUpdates = new Map<string, string>();
+  // Latest event per actor: the stored state only depends on the newest one.
+  const accountUpdates = new Map<string, AccountUpdate>();
   const stats: ScheduledIngestCollectionStats = {
     observedSourceItems: 0,
     commitObservations: 0,
@@ -502,9 +517,14 @@ export async function ingestEvents(
         return;
       }
 
+      if (commit.collection === MODERATION_ACTION_NSID && !config.moderation?.moderators.includes(event.did)) {
+        stats.sourceScopeFiltered++;
+        return;
+      }
       if (
         provisionalKnownDids &&
         !dependentCollections.has(commit.collection) &&
+        commit.collection !== MODERATION_ACTION_NSID &&
         commit.operation !== "delete"
       ) {
         provisionalKnownDids.add(event.did);
@@ -578,8 +598,11 @@ export async function ingestEvents(
         // Account overflow so global identity traffic cannot starve commits.
         stats.identityUpdatesOmitted++;
       }
-    } else {
-      accountSourceItem(event);
+    } else if (event.kind === "account") {
+      if (accountSourceItem(event)) return;
+      accountUpdates.delete(event.did);
+      accountUpdates.set(event.did, { did: event.did, active: event.account.active, status: event.account.status, timeUs: event.time_us, cursor: event.seq });
+      stats.serializedCandidateBytes += SCHEDULED_INGEST_METADATA_BYTES;
     }
   };
 
@@ -614,7 +637,10 @@ export async function ingestEvents(
         event.seq,
       );
 
-      if (stats.retainedCandidates >= budget.maxCandidates) {
+      if (
+        stats.retainedCandidates >= budget.maxCandidates ||
+        accountUpdates.size >= budget.maxAccountUpdates
+      ) {
         stats.stopReason = "count";
         break;
       }
@@ -646,6 +672,7 @@ export async function ingestEvents(
     lastCursor,
     cursorObservations,
     identityUpdates,
+    accountUpdates: [...accountUpdates.values()],
     stats,
   };
 }
@@ -727,6 +754,7 @@ export async function runIngestCycle(
     lastCursor,
     cursorObservations,
     identityUpdates,
+    accountUpdates,
     stats,
   } = await ingestEvents(
     config,
@@ -756,6 +784,7 @@ export async function runIngestCycle(
       trailingStatements:
         isFinalBatch && lastCursor !== null
           ? [
+              ...accountUpdateStatements(db, accountUpdates, config),
               saveJetstreamCursorStatement(db, lastCursor),
               ...(config.orderedSource
                 ? [
@@ -826,12 +855,12 @@ export async function runIngestCycle(
     // empty first drain so the next cron cannot silently start later.
     (stats.lastAccountedCursor !== null || cursor === null)
   ) {
-    await saveJetstreamCursor(
-      db,
-      lastCursor,
-      config.orderedSource,
-      cursorObservations,
-    );
+    await db.batch([
+      ...accountUpdateStatements(db, accountUpdates, config),
+      saveJetstreamCursorStatement(db, lastCursor),
+      ...(config.orderedSource ? [saveOrderedSourcePositionStatement(db, config.orderedSource, lastCursor)] : []),
+      ...saveJetstreamCursorObservationStatements(db, lastCursor, cursorObservations),
+    ]);
     databaseSubBatchesCommitted++;
   }
 
@@ -921,6 +950,7 @@ export async function runIngestCycle(
     observed_source_items: stats.observedSourceItems,
     commit_observations: stats.commitObservations,
     identity_observations: stats.identityObservations,
+    retained_account_updates: accountUpdates.length,
     retained_candidates: stats.retainedCandidates,
     retained_identity_updates: stats.retainedIdentityUpdates,
     identity_updates_omitted: stats.identityUpdatesOmitted,
@@ -935,6 +965,7 @@ export async function runIngestCycle(
     serialized_candidate_bytes: stats.serializedCandidateBytes,
     max_candidates: budget.maxCandidates,
     max_identity_updates: budget.maxIdentityUpdates,
+    max_account_updates: budget.maxAccountUpdates,
     max_serialized_bytes: budget.maxSerializedBytes,
     max_drain_ms: budget.maxDrainMs,
     starting_cursor: cursor,

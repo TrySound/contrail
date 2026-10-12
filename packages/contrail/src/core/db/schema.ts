@@ -25,6 +25,7 @@ import {
   getSearchableFields,
 } from "../search";
 import { buildLabelsSchema } from "../labels/schema";
+import { buildModerationSchema, moderationPolicyStatements } from "../moderation";
 import {
   assertFreshChangeLogGeneration,
   buildChangeLogSchema,
@@ -37,7 +38,7 @@ import {
 } from "../types";
 import { getMeta, setMeta } from "./meta";
 
-export const CONTRAIL_SCHEMA_VERSION = 14;
+export const CONTRAIL_SCHEMA_VERSION = 15;
 const SCHEMA_FINGERPRINT_KEY = "schema_fingerprint";
 
 function getResolved(config: ContrailConfig): ResolvedMaps {
@@ -708,7 +709,9 @@ function schemaFingerprint(
     ...ddl.changes,
     canonicalChangeDefinitions(config),
     ...buildCountColumns(config),
-    ...(config.labels ? buildLabelsSchema(dialect) : []),
+    ...buildLabelsSchema(dialect),
+    ...buildModerationSchema(dialect),
+    JSON.stringify({ moderation: config.moderation, sources: config.labels?.sources }),
     JSON.stringify(MIGRATIONS),
   ]);
 }
@@ -769,11 +772,10 @@ export async function initSchema(
     await runIdempotentDdl(db, statement);
   }
 
-  if (config.labels) {
-    for (const statement of buildLabelsSchema(dialect)) {
-      await runIdempotentDdl(db, statement);
-    }
+  for (const statement of [...buildLabelsSchema(dialect), ...buildModerationSchema(dialect)]) {
+    await runIdempotentDdl(db, statement);
   }
+  await db.batch(moderationPolicyStatements(db, config));
 
   await runIdempotentDdl(db, cursorObservationsDdl);
   await applyFtsTables(db, config, dialect);

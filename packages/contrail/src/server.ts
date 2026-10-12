@@ -8,23 +8,27 @@ export interface CreateHandlerOptions {
   lexicons?: object[];
   /** Enable stable discovery and Lexicon routes for anonymous remote clients. */
   publicService?: PublicServiceOptions;
+  reportsDb?: Database;
 }
 
 /** Create a fetch handler, optionally accepting a per-request database binding. */
 export function createHandler(
   contrail: Contrail,
   options: CreateHandlerOptions = {},
-): (request: Request, db?: Database) => Promise<Response> {
+): (request: Request, db?: Database, reportsDb?: Database) => Promise<Response> {
   let cached: ((request: Request) => Promise<Response>) | null = null;
-  return (request: Request, db?: Database) => {
-    if (db) {
+  return (request: Request, db?: Database, reportsDb?: Database) => {
+    // Per-request bindings are never cached: a later request may pass others.
+    if (db || reportsDb) {
       return contrail.handler({
-        db,
+        ...(db ? { db } : {}),
+        reportsDb: reportsDb ?? options.reportsDb,
         lexicons: options.lexicons,
         publicService: options.publicService,
       })(request);
     }
     cached ??= contrail.handler({
+      reportsDb: options.reportsDb,
       lexicons: options.lexicons,
       publicService: options.publicService,
     });

@@ -90,8 +90,14 @@ export * from "./core/router/collection";
 export * from "./core/router/hydrate";
 export * from "./core/router/helpers";
 
+// Moderation and account lifecycle.
+export * from "./core/moderation";
+export * from "./core/moderation-sync";
+export { moderationActionLexicon } from "./lexicons/moderation";
+
 // Labels.
 export * from "./core/labels/types";
+export * from "./core/labels/self";
 export * from "./core/labels/hydrate";
 export * from "./core/labels/select";
 export * from "./core/labels/apply";

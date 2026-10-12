@@ -31,6 +31,9 @@ export function sqliteFtsContentExpression(
 }
 
 export interface SqlDialect {
+  /** Database engine. Optional for custom dialects; inferred from ftsStrategy. */
+  readonly engine?: "sqlite" | "postgres";
+
   /** json_extract(col, '$.field') or col->>'field' */
   jsonExtract(column: string, field: string): string;
 
@@ -56,7 +59,13 @@ export interface SqlDialect {
   indexExpression(expr: string): string;
 }
 
+/** Engine check for SQL that differs beyond FTS (views, locks, types). */
+export function isPostgresDialect(dialect: SqlDialect): boolean {
+  return (dialect.engine ?? (dialect.ftsStrategy === "generated-column" ? "postgres" : "sqlite")) === "postgres";
+}
+
 export const sqliteDialect: SqlDialect = {
+  engine: "sqlite",
   jsonExtract(column: string, field: string): string {
     assertSafeField(field);
     return `json_extract(${column}, '$.${field}')`;
@@ -77,6 +86,7 @@ export const sqliteDialect: SqlDialect = {
 };
 
 export const postgresDialect: SqlDialect = {
+  engine: "postgres",
   jsonExtract(column: string, field: string): string {
     assertSafeField(field);
     const parts = field.split(".");

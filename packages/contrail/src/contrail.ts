@@ -58,6 +58,10 @@ import {
   type PersistentLabelsOptions,
 } from "./core/labels/subscribe";
 import { createApp, type CreateAppOptions } from "./core/router";
+import {
+  runModerationCycle,
+  runPersistentModeration,
+} from "./core/moderation-sync";
 import type { Hono } from "hono";
 
 export interface ContrailOptions extends ContrailConfig {
@@ -135,6 +139,7 @@ export class Contrail {
    * retained candidates, and serialized bytes. */
   async ingest(options?: ScheduledIngestOptions, db?: Database): Promise<void> {
     const d = this.getDb(db);
+    await this.init(d);
     const budget = resolveScheduledIngestBudget(options);
     const tasks: Promise<void>[] = [
       runIngestCycle(d, this.config, budget, this._ingestState),
@@ -142,6 +147,11 @@ export class Contrail {
     if (this.config.labels) {
       tasks.push(runLabelIngestCycle(d, this.config, budget.maxDrainMs));
     }
+    // Moderator reconciliation, first-seen label backfill and visibility
+    // recounts (account lifecycle needs recounts even without labels).
+    tasks.push(
+      runModerationCycle(d, this.config, Date.now() + Math.min(budget.maxDrainMs, 10_000)).then(() => {}),
+    );
     await Promise.all(tasks);
   }
 
@@ -150,6 +160,7 @@ export class Contrail {
    *  Both honor the supplied `signal` and shut down cleanly together. */
   async runPersistent(options?: Omit<PersistentIngestOptions, 'logger'>, db?: Database): Promise<void> {
     const d = this.getDb(db);
+    await this.init(d);
     const tasks: Promise<void>[] = [
       runPersistentIngestion(d, this.config, {
         ...options,
@@ -166,6 +177,7 @@ export class Contrail {
         }),
       );
     }
+    tasks.push(runPersistentModeration(d, this.config, { signal: options?.signal }));
     await Promise.all(tasks);
   }
 

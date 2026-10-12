@@ -22,6 +22,7 @@ export interface LabelerResolveOverrides {
    *  guard when validating a resolved labeler endpoint. Match is exact,
    *  case-insensitive, port-agnostic. */
   additionalAllowedHosts?: string[];
+  signal?: AbortSignal;
 }
 
 /** Reject endpoint URLs that point to private/internal addresses or non-HTTPS.
@@ -51,7 +52,7 @@ export async function resolveLabelerEndpoint(
   if (!did.startsWith("did:plc:") && !did.startsWith("did:web:")) return null;
   const resolver = networkOverrides?.resolver ?? DEFAULT_DID_RESOLVER;
   try {
-    const doc = await resolver.resolve(did as Did<"plc"> | Did<"web">);
+    const doc = await resolver.resolve(did as Did<"plc"> | Did<"web">, { signal: networkOverrides?.signal ?? AbortSignal.timeout(5_000) });
     const endpoint = doc.service
       ?.find((s) => s.id === "#atproto_labeler")
       ?.serviceEndpoint?.toString();
@@ -97,6 +98,7 @@ export async function getLabelerState(
     .bind(did)
     .first<LabelerState>();
 
+  if (row) row.cursor = Number(row.cursor);
   let endpoint = endpointOverride ?? row?.endpoint ?? null;
   const stale =
     !row?.resolved_at || Date.now() - row.resolved_at > ENDPOINT_TTL_MS;

@@ -1,4 +1,4 @@
-import type { AtprotoAudience } from "@atcute/lexicons/syntax";
+import { isDid, type AtprotoAudience } from "@atcute/lexicons/syntax";
 import { parseServiceAudience } from "../service-auth-contract.js";
 import type { SqlDialect } from "./dialect";
 
@@ -306,7 +306,7 @@ export interface ChangeLogConfig {
   consumers: Record<string, ChangeConsumerConfig>;
 }
 
-export type AtprotoServiceAuthMethod = "getFeed" | "notifyOfUpdate";
+export type AtprotoServiceAuthMethod = "getFeed" | "notifyOfUpdate" | "createReport" | "listReports" | "resolveReport";
 
 export interface AtprotoServiceAuthConfig {
   /** Exact fragmented service reference used as the OAuth and JWT audience. */
@@ -355,6 +355,7 @@ export interface ContrailConfig {
    *  and hydrates `record.labels` onto `listRecords` / `getRecord` / profile
    *  responses gated by the caller's `atproto-accept-labelers` header. */
   labels?: import("./labels/types").LabelsConfig;
+  moderation?: import("./moderation").ModerationConfig;
   /** Constellation-backed reverse-follower lookup (default: enabled).
    *  When a DID is first seen producing a discoverable record, contrail
    *  queries Constellation for follow records pointing at that DID and
@@ -491,6 +492,13 @@ export function resolveConfig(config: ContrailConfig): ResolvedContrailConfig {
     ) {
       throw new TypeError("serviceAuth.methods must contain unique methods");
     }
+    if (config.serviceAuth.methods.some((m) => !["getFeed", "notifyOfUpdate", "createReport", "listReports", "resolveReport"].includes(m))) {
+      throw new TypeError("Unknown serviceAuth method");
+    }
+    if (config.serviceAuth.methods.some((m) => ["createReport", "listReports", "resolveReport"].includes(m)) &&
+        (!config.moderation || config.moderation.reports === false)) {
+      throw new TypeError("Report serviceAuth methods require moderation reports");
+    }
     if (
       config.serviceAuth.methods.includes("getFeed") &&
       (!config.feeds || Object.keys(config.feeds).length === 0)
@@ -511,6 +519,20 @@ export function resolveConfig(config: ContrailConfig): ResolvedContrailConfig {
         config.serviceAuth.maxTokenAgeSeconds <= 0)
     ) {
       throw new TypeError("serviceAuth.maxTokenAgeSeconds must be a positive integer");
+    }
+  }
+  if (config.moderation) {
+    if (!Array.isArray(config.moderation.moderators) ||
+        config.moderation.moderators.some((did) => !isDid(did) || !/^did:(plc|web):.+/.test(did)) ||
+        new Set(config.moderation.moderators).size !== config.moderation.moderators.length) {
+      throw new TypeError("moderation.moderators requires unique DIDs");
+    }
+    if (config.moderation.reports !== false && !config.serviceAuth) {
+      throw new TypeError("Moderation reports require serviceAuth.audience (or reports: false)");
+    }
+    if (config.serviceAuth && config.moderation.reports !== false) {
+      config = { ...config, serviceAuth: { ...config.serviceAuth,
+        methods: [...new Set<AtprotoServiceAuthMethod>([...config.serviceAuth.methods, "createReport", "listReports", "resolveReport"])] } };
     }
   }
   const profiles = (config.profiles ?? DEFAULT_PROFILES).map(
@@ -568,8 +590,33 @@ export function resolveConfig(config: ContrailConfig): ResolvedContrailConfig {
     }
   }
 
+  // Re-resolving a config must not retain records-backed trust from an old
+  // moderator list. Such sources are always derived from current policy.
+  let labels = config.labels ? { ...config.labels, sources: config.labels.sources.filter((s) => !s.records) } : undefined;
+  if (config.moderation) {
+    // A moderator's labels come only from its action records; a labeler stream
+    // for the same DID would be ignored, so reject rather than drop it.
+    const conflicting = labels?.sources.find((s) => config.moderation!.moderators.includes(s.did));
+    if (conflicting) {
+      throw new TypeError(`${conflicting.did} is a moderator and cannot also be a labels source`);
+    }
+    const sources = [...(labels?.sources ?? []),
+      ...config.moderation.moderators.map((did) => ({ did, records: true, enforce: true }))];
+    // Moderators are trusted operator policy: explicit defaults include them
+    // so their non-hide labels (e.g. !warn) are attached by default too.
+    const defaults = labels?.defaults
+      ? [...new Set([...labels.defaults, ...config.moderation.moderators])]
+      : undefined;
+    labels = { ...labels, sources, ...(defaults ? { defaults } : {}) };
+    const actionKey = Object.entries(collections).find(([, c]) => c.collection === "tools.atmo.moderation.action")?.[0] ?? "moderationAction";
+    if (collections[actionKey] && collections[actionKey].collection !== "tools.atmo.moderation.action") {
+      throw new TypeError("moderationAction is reserved for moderator records");
+    }
+    collections[actionKey] = { collection: "tools.atmo.moderation.action", methods: [], discover: false };
+  }
   const base = {
     ...config,
+    labels,
     collections,
     profiles,
     jetstreams: config.jetstreams ?? DEFAULT_JETSTREAMS,
@@ -954,7 +1001,7 @@ export function getCollectionNsids(config: ContrailConfig): string[] {
 
 export function getDependentShortNames(config: ContrailConfig): string[] {
   return Object.entries(config.collections)
-    .filter(([, c]) => c.discover === false)
+    .filter(([, c]) => c.discover === false && c.collection !== "tools.atmo.moderation.action")
     .map(([name]) => name);
 }
 
@@ -977,7 +1024,7 @@ export function getDiscoverableNsids(config: ContrailConfig): string[] {
 
 export function getDependentNsids(config: ContrailConfig): string[] {
   return Object.entries(config.collections)
-    .filter(([, c]) => c.discover === false)
+    .filter(([, c]) => c.discover === false && c.collection !== "tools.atmo.moderation.action")
     .map(([short, c]) => c.collection ?? short);
 }
 

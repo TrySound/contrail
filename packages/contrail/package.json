@@ -26,6 +26,10 @@
       "types": "./dist/public-client.d.ts",
       "import": "./dist/public-client.js"
     },
+    "./moderation": {
+      "types": "./dist/moderation-client.d.ts",
+      "import": "./dist/moderation-client.js"
+    },
     "./sqlite": {
       "types": "./dist/adapters/sqlite.d.ts",
       "import": "./dist/adapters/sqlite.js"

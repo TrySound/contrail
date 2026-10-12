@@ -10,6 +10,11 @@ export interface LabelerSource {
   /** Backfill from `cursor=0` on first sight. Defaults to true. Set false
    *  for "start from now" — useful for very chatty labelers. */
   backfill?: boolean;
+  /** Records-backed moderator source; never connect a labeler WebSocket. */
+  records?: boolean;
+  enforce?: boolean;
+  values?: string[];
+  subjects?: "known";
 }
 
 export interface LabelsConfig {

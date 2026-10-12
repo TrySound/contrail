@@ -8,6 +8,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { moderationLexicons } from "./moderation.js";
+import labelDefsLexicon from "./label-defs.json";
 import type {
   CollectionConfig,
   ContrailConfig,
@@ -128,6 +130,15 @@ function groupsForRelation(
   );
 }
 
+function selfLabelsProperty() {
+  return {
+    type: "array",
+    maxLength: 10,
+    description: "Author declarations on this record version, not trusted labeler claims",
+    items: { type: "ref", ref: "com.atproto.label.defs#selfLabel" },
+  };
+}
+
 function profileDefinitions(config: ContrailConfig, sourceDirs: string[]) {
   const profiles = config.profiles ?? [];
   if (profiles.length === 0) return {};
@@ -157,6 +168,7 @@ function profileDefinitions(config: ContrailConfig, sourceDirs: string[]) {
         value,
         collection: { type: "string", format: "nsid" },
         rkey: { type: "string" },
+        selfLabels: selfLabelsProperty(),
       },
     },
   };
@@ -178,6 +190,7 @@ function recordDefinition(
     collection: { type: "string", format: "nsid" },
     rkey: { type: "string" },
     time_us: { type: "integer" },
+    selfLabels: selfLabelsProperty(),
   };
   for (const relation of relations) {
     if (relation.count) {
@@ -229,6 +242,7 @@ function relatedRecordDefinition(sourceDirs: string[], collection: string) {
       collection: { type: "string", format: "nsid" },
       rkey: { type: "string" },
       time_us: { type: "integer" },
+      selfLabels: selfLabelsProperty(),
     },
   };
 }
@@ -470,6 +484,19 @@ function calculatePullNsids(
     }
   }
 
+  // All generated record/profile views expose author declarations, even
+  // without external labeler configuration.
+  values.add("com.atproto.label.defs");
+  if (config.moderation) {
+    // Contrail owns this record Lexicon; it is emitted locally, not resolved
+    // through the registry. Report unions depend on standard pinned documents.
+    values.delete("tools.atmo.moderation.action");
+    if (config.moderation.reports !== false) {
+      values.add("com.atproto.admin.defs");
+      values.add("com.atproto.repo.strongRef");
+      values.add("com.atproto.moderation.defs");
+    }
+  }
   // Custom and registry-pinned documents are deliberately immutable inputs.
   // Keep mutable `pulled` documents in Atcute's refresh list, but do not fetch
   // another copy of a source the project owns or has pinned by CID.
@@ -806,6 +833,19 @@ export function generateLexicons(
     log(`  ${nsid}`);
   };
 
+  // Keep core view contracts usable offline and complete for remote clients.
+  // A project-owned/pinned/pulled standard document takes precedence over this
+  // bundled copy; it remains in the pull set for normal upstream refreshes.
+  if (!findLexicon(sourceDirs, "com.atproto.label.defs")) {
+    emit("com.atproto.label.defs", labelDefsLexicon);
+  }
+  if (config.moderation) {
+    const docs = moderationLexicons(config.namespace);
+    for (const document of docs) {
+      const id = (document as { id: string }).id;
+      if (id === "tools.atmo.moderation.action" || config.moderation.reports !== false) emit(id, document);
+    }
+  }
   emit(`${config.namespace}.getCursor`, cursorLexicon(config));
   if ((config.profiles?.length ?? 0) > 0) {
     emit(`${config.namespace}.getProfile`, {
