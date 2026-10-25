@@ -105,17 +105,19 @@ export async function applyLabels(
   }
   let kept = 0;
   const hideSubjects = new Set<string>();
-  const maxCts = Math.floor(Date.now() / 1000) + MAX_CTS_SKEW_SEC;
+  const maxCts = Date.now() + MAX_CTS_SKEW_SEC * 1000;
   for (const l of valid) {
     if (source && !(l.neg && retractions.has(`${l.uri}\0${l.val}`))) {
       if (source.values && !source.values.includes(l.val)) continue;
       if (source.subjects === "known" && !known.has(subjectDid(l.uri)!))
         continue;
     }
-    const cts = isoToUnixSec(l.cts);
+    // Keep subsecond ordering: historical replay must not overwrite a later
+    // live assertion/retraction merely because both occurred in one second.
+    const cts = Date.parse(l.cts);
     // Overrides only suppress labels created before them, so a forward-dated
     // cts would make a label immune to moderator overrides.
-    if (cts == null || cts > maxCts) continue;
+    if (!Number.isFinite(cts) || cts > maxCts) continue;
     const exp = l.exp ? isoToUnixSec(l.exp) : null;
     if (l.exp !== undefined && exp === null) continue;
     stmts.push(

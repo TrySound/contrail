@@ -78,8 +78,68 @@ async function expectUnchanged(db: Database, config: ReturnType<typeof policy>) 
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+describe("scheduled label ingestion", () => {
+  it("pumps every external source each cycle and resumes cursor-only checkpoints", async () => {
+    const { db, config: initial } = await setup();
+    const second = "did:plc:second";
+    const config = resolveConfig({
+      ...initial,
+      moderation: { moderators: ["did:plc:moderator"], reports: false },
+      labels: { sources: [
+        ...initial.labels!.sources,
+        { did: second, endpoint: "https://second.example", enforce: true },
+      ] },
+    });
+    await initSchema(db, config);
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+
+    for (let cycle = 0; cycle < 2; cycle++) {
+      const work = runLabelIngestCycle(db, config, 25_000);
+      await vi.waitFor(() => expect(LabelSocket.instances).toHaveLength((cycle + 1) * 2));
+      const sockets = LabelSocket.instances.slice(cycle * 2);
+      expect(sockets.map((ws) => new URL(ws.url).hostname)).toEqual(["labels.example", "second.example"]);
+      if (cycle) {
+        expect(sockets.map((ws) => new URL(ws.url).searchParams.get("cursor"))).toEqual(["11", "11"]);
+      }
+      sockets.forEach((ws, index) => ws.frame({
+        seq: 11 + cycle,
+        labels: [{ ...label, src: index ? second : src }],
+      }));
+      // Neither server closes after catching up; both must get the deadline.
+      await vi.advanceTimersByTimeAsync(25_000);
+      await work;
+      expect(sockets.every((ws) => ws.closed)).toBe(true);
+    }
+
+    expect(await cursor(db)).toBe(12);
+    expect(Number((await db.prepare("SELECT cursor FROM labeler_cursors WHERE did = ?").bind(second).first<any>())?.cursor)).toBe(12);
+    expect((await db.prepare("SELECT DISTINCT src FROM labels ORDER BY src").all()).results)
+      .toEqual([{ src }, { src: second }]);
+    expect((await queryRecords(db, config, { collection: "event" })).records).toEqual([]);
+  });
+
+  it("does not let one failed source prevent another from ingesting", async () => {
+    const { db, config: initial } = await setup();
+    const config = resolveConfig({ ...initial, labels: { sources: [
+      ...initial.labels!.sources,
+      { did: "did:plc:second", endpoint: "https://second.example", enforce: true },
+    ] } });
+    await initSchema(db, config);
+    const work = runLabelIngestCycle(db, config, 1_000);
+    await vi.waitFor(() => expect(LabelSocket.instances).toHaveLength(2));
+    LabelSocket.instances[0]!.dispatchEvent(new Event("error"));
+    const ws = LabelSocket.instances[1]!;
+    ws.frame({ seq: 11, labels: [{ ...label, src: "did:plc:second" }] });
+    ws.close();
+    await work;
+    expect((await queryRecords(db, config, { collection: "event" })).records).toEqual([]);
+    expect(await cursor(db)).toBe(10);
+  });
 });
 
 describe("live label policy generations", () => {

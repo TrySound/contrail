@@ -30,6 +30,13 @@ const config = resolveConfig({
 });
 let db: Database;
 let time = 100;
+// Node 22's bundled SQLite lacks FTS5, unlike newer Node and D1.
+let hasFts = false;
+try {
+  await createTestDb().prepare("CREATE VIRTUAL TABLE __moderation_fts USING fts5(content)").run();
+  hasFts = true;
+} catch {}
+
 // Real-format CIDs: action subjectCid values are validated.
 const otherVersion = "bafyreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy";
 const post = makeEvent({ cid: "bafyreib2rxk3rybk3aobmv5cjuql3bm2twh4jo5uxgf5yvzh5lsjbsmwu4" });
@@ -541,7 +548,20 @@ describe("moderation enforcement", () => {
     ]);
     expect(await rows()).toHaveLength(0);
   });
-  it("hidden records do not consume search or pagination limits", async () => {
+  it("hidden records do not consume pagination limits", async () => {
+    await ingestRecords(db, [
+      makeEvent({
+        uri: "at://did:plc:ok/community.lexicon.calendar.event/a",
+        did: "did:plc:ok",
+        time_us: 2,
+      }),
+      action({ subject: actor, action: "!hide" }),
+    ], config);
+    const result = await queryRecords(db, config, { collection: "event", limit: 1 });
+    expect(result.records).toHaveLength(1);
+    expect(result.records[0].did).toBe("did:plc:ok");
+  });
+  it.skipIf(!hasFts)("hidden records do not consume search limits", async () => {
     const c = resolveConfig({
       ...config,
       collections: {

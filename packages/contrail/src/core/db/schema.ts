@@ -25,7 +25,7 @@ import {
   getSearchableFields,
 } from "../search";
 import { buildLabelsSchema } from "../labels/schema";
-import { buildModerationSchema } from "../moderation";
+import { buildModerationSchema, moderationLockStatements } from "../moderation";
 import { applyModerationPolicy, MODERATION_POLICY_META_KEYS } from "../moderation-policy";
 import {
   assertFreshChangeLogGeneration,
@@ -39,7 +39,7 @@ import {
 } from "../types";
 import { getMetaValues, setMeta } from "./meta";
 
-export const CONTRAIL_SCHEMA_VERSION = 16;
+export const CONTRAIL_SCHEMA_VERSION = 17;
 const SCHEMA_FINGERPRINT_KEY = "schema_fingerprint";
 
 function getResolved(config: ContrailConfig): ResolvedMaps {
@@ -716,6 +716,24 @@ function schemaFingerprint(
   ]);
 }
 
+/** Upgrade creation timestamps atomically and exactly once, including under
+ * concurrent initializers. Expiry/visibility boundaries remain unix seconds.
+ * The marker row lock gives PostgreSQL's following statements fresh snapshots;
+ * SQLite/D1 already serialize the write batch. */
+async function upgradeModerationCreationTimestamps(db: Database): Promise<void> {
+  const key = "moderation_cts_unit";
+  const pending = "EXISTS (SELECT 1 FROM _contrail_meta WHERE key = ? AND value = 'seconds')";
+  await db.batch([
+    db.prepare("INSERT INTO _contrail_meta (key, value) VALUES (?, 'seconds') ON CONFLICT(key) DO NOTHING").bind(key),
+    db.prepare("UPDATE _contrail_meta SET value = value WHERE key = ?").bind(key),
+    ...moderationLockStatements(db),
+    ...["labels", "moderation_actions", "moderation_overrides"].map((table) =>
+      db.prepare(`UPDATE ${table} SET cts = cts * 1000 WHERE ${pending}`).bind(key),
+    ),
+    db.prepare("UPDATE _contrail_meta SET value = 'milliseconds' WHERE key = ?").bind(key),
+  ]);
+}
+
 export async function initSchema(
   db: Database,
   config: ContrailConfig,
@@ -787,6 +805,7 @@ export async function initSchema(
   // Existing queues need the generation column before policy jobs can reset
   // them. CREATE TABLE IF NOT EXISTS only covers fresh databases.
   await addColumnIfNotExists(db, "label_backfill_queue", "generation", "INTEGER NOT NULL DEFAULT 0");
+  await upgradeModerationCreationTimestamps(db);
   await applyModerationPolicy(db, config);
 
   await runIdempotentDdl(db, cursorObservationsDdl);

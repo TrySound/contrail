@@ -123,7 +123,14 @@ export async function getLabelerState(
     };
   }
 
-  return row ?? { did, cursor: 0, endpoint, resolved_at: null };
+  // Cursor-only checkpoints need not persist an endpoint, and a configured
+  // override must take precedence over any previously resolved endpoint.
+  return {
+    did,
+    cursor: row?.cursor ?? 0,
+    endpoint,
+    resolved_at: row?.resolved_at ?? null,
+  };
 }
 
 /** Persist the highest seen seq number for a labeler. Idempotent;

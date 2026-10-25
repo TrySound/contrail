@@ -85,7 +85,7 @@ export async function hydrateLabels(
       src: row.src,
       uri: row.uri,
       val: row.val,
-      cts: tsToIso(row.cts),
+      cts: new Date(row.cts).toISOString(),
     };
     if (row.cid) label.cid = row.cid;
     if (row.exp != null) label.exp = tsToIso(row.exp);

@@ -624,7 +624,7 @@ export function actionProjectionStatements(
     stmts.push(...markModerationDirtyStatements(db, token, [a.subject]));
     // A forward-dated createdAt must not pre-empt labels issued before the
     // action was projected.
-    const cts = Math.floor(Math.min(Date.parse(a.createdAt), Date.now()) / 1000);
+    const cts = Math.min(Date.parse(a.createdAt), Date.now());
     const exp = a.expiresAt ? Math.floor(Date.parse(a.expiresAt) / 1000) : null;
     if (a.action === "override") {
       for (const val of new Set(a.labels ?? [""]))

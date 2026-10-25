@@ -68,6 +68,7 @@ export async function reconcileModeratorActions(
       const cursors = new Set<string>(resumed ? [resumed] : []);
       let pages = 0;
       let paused = false;
+      let resetCursor = false;
       do {
         if (
           Date.now() >= deadline ||
@@ -83,32 +84,48 @@ export async function reconcileModeratorActions(
         url.searchParams.set("collection", MODERATION_ACTION_NSID);
         url.searchParams.set("limit", "100");
         if (cursor) url.searchParams.set("cursor", cursor);
-        const response = await fetch(url, {
-          signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
-        });
-        if (!response.ok)
-          throw new Error(`Moderator listing HTTP ${response.status}`);
-        const data = (await response.json()) as {
-          records?: Array<{ uri: string; cid: string; value: unknown }>;
-          cursor?: string;
-        };
-        if (!Array.isArray(data.records) || data.records.length > 100)
-          throw new Error("Invalid moderator listing");
-        for (const r of data.records) {
-          if (
-            typeof r.uri !== "string" ||
-            !r.uri.startsWith(`at://${did}/${MODERATION_ACTION_NSID}/`) ||
-            !r.cid ||
-            !r.value
-          )
-            throw new Error("Invalid moderator record");
-          records.set(r.uri, r);
-        }
-        cursor = data.cursor;
-        if (cursor) {
-          if (typeof cursor !== "string" || cursors.has(cursor))
+        try {
+          const response = await fetch(url, {
+            signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+          });
+          if (!response.ok) {
+            // A rejected cursor may be stale. Timeouts, rate limits and server
+            // failures must keep the last successfully validated position.
+            resetCursor = !!cursor && response.status === 400;
+            throw new Error(`Moderator listing HTTP ${response.status}`);
+          }
+          const data = (await response.json()) as {
+            records?: Array<{ uri: string; cid: string; value: unknown }>;
+            cursor?: string;
+          };
+          if (!Array.isArray(data?.records) || data.records.length > 100)
+            throw new Error("Invalid moderator listing");
+          for (const r of data.records) {
+            if (
+              !r ||
+              typeof r.uri !== "string" ||
+              !r.uri.startsWith(`at://${did}/${MODERATION_ACTION_NSID}/`) ||
+              !r.cid ||
+              !r.value
+            )
+              throw new Error("Invalid moderator record");
+          }
+          if (data.cursor !== undefined &&
+              (typeof data.cursor !== "string" || !data.cursor || cursors.has(data.cursor))) {
+            resetCursor = true;
             throw new Error("Invalid moderator cursor");
-          cursors.add(cursor);
+          }
+          // Accept only whole validated pages. In particular, a malformed
+          // final page must never turn this into a complete deletion sweep.
+          for (const r of data.records) records.set(r.uri, r);
+          cursor = data.cursor;
+          if (cursor) cursors.add(cursor);
+        } catch (error) {
+          paused = true;
+          (config.logger ?? console).warn(
+            `[moderation] reconcile ${did} page failed: ${error}`,
+          );
+          break;
         }
       } while (cursor);
       // Deletions can only be inferred from one complete, fresh listing.
@@ -165,7 +182,9 @@ export async function reconcileModeratorActions(
           );
       // The sweep position commits with the changes it covers.
       const progress =
-        paused && cursor !== resumed
+        resetCursor
+          ? [db.prepare("DELETE FROM _contrail_meta WHERE key = ? AND value = ?").bind(cursorKey, resumed ?? "")]
+          : paused && cursor !== resumed
           ? [
               db
                 .prepare(
@@ -176,7 +195,8 @@ export async function reconcileModeratorActions(
           : !paused && resumed
             ? [db.prepare("DELETE FROM _contrail_meta WHERE key = ?").bind(cursorKey)]
             : [];
-      // One atomic listing: updates and missed deletions change labels together.
+      // Validated pages and their cursor commit together, even when a later
+      // page failed. Missed deletions still require a complete fresh listing.
       if (events.length)
         await ingestRecords(db, events, config, {
           phase: "historical",
@@ -184,13 +204,8 @@ export async function reconcileModeratorActions(
         });
       else if (progress.length) await db.batch(progress);
     } catch (error) {
-      // A stale or rejected resume cursor must not wedge the sweep: restart.
-      if (resumed)
-        await db
-          .prepare("DELETE FROM _contrail_meta WHERE key = ? AND value = ?")
-          .bind(cursorKey, resumed)
-          .run()
-          .catch(() => {});
+      // Resolution/storage failures leave durable progress untouched. Only
+      // an explicitly rejected or malformed pagination cursor resets a sweep.
       (config.logger ?? console).warn(
         `[moderation] reconcile ${did} failed: ${error}`,
       );

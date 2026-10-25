@@ -44,7 +44,7 @@ export interface LabelRow {
   neg: boolean;
   /** Expiry, unix seconds. Past this, hydration drops the row. */
   exp: number | null;
-  /** Creation timestamp, unix seconds — what we collapse on. */
+  /** Creation timestamp, unix milliseconds — what we collapse on. */
   cts: number;
   /** Raw signature bytes. Stored when present so we can re-emit later;
    *  not verified in v1. */

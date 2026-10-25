@@ -18,7 +18,7 @@ export default {
 };
 ```
 
-Normal `contrail backfill`, Worker cron ingestion, and `runPersistent()` include configured labelers automatically.
+Normal `contrail backfill`, Worker cron ingestion, and `runPersistent()` include configured labelers automatically. Scheduled cycles connect to all external labelers concurrently under a shared deadline, so an open or slow stream cannot starve later sources. An explicit source `endpoint` always takes precedence over the cached endpoint, including after cursor checkpoints.
 
 ## Author self-labels
 

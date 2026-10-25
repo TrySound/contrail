@@ -8,7 +8,34 @@ import {
 import {
   resolveLabelerEndpoint,
   validateEndpointUrl,
+  getLabelerState,
 } from "../src/index";
+import { createTestDbWithSchema } from "./helpers";
+
+describe("getLabelerState endpoint overrides", () => {
+  it.each(["https://old.example", null])("uses the override instead of cached endpoint %s", async (endpoint) => {
+    const db = await createTestDbWithSchema();
+    const resolvedAt = Date.now();
+    await db.prepare("INSERT INTO labeler_cursors (did, cursor, endpoint, resolved_at) VALUES (?, 42, ?, ?)")
+      .bind("did:plc:external", endpoint, resolvedAt).run();
+    const resolver = { resolve: vi.fn() };
+    const state = await getLabelerState(db, "did:plc:external", "https://new.example", { resolver });
+    expect(state).toEqual({
+      did: "did:plc:external", cursor: 42, endpoint: "https://new.example", resolved_at: resolvedAt,
+    });
+    expect(resolver.resolve).not.toHaveBeenCalled();
+    expect(await db.prepare("SELECT endpoint FROM labeler_cursors").first()).toEqual({ endpoint });
+  });
+
+  it("uses the override on a fresh database without resolving the DID", async () => {
+    const db = await createTestDbWithSchema();
+    const resolver = { resolve: vi.fn() };
+    expect(await getLabelerState(db, "did:plc:external", "https://new.example", { resolver })).toEqual({
+      did: "did:plc:external", cursor: 0, endpoint: "https://new.example", resolved_at: null,
+    });
+    expect(resolver.resolve).not.toHaveBeenCalled();
+  });
+});
 
 describe("validateEndpointUrl additionalAllowedHosts", () => {
   it("rejects pds.dev.svc.cluster.local without override (HTTP + private hostname)", () => {

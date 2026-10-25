@@ -84,7 +84,10 @@ last-attempt checkpoint rotates the next cycle's starting moderator so a slow or
 unavailable repository cannot starve the others. Incomplete listings, failed
 pages and timeouts never infer deletions. A listing larger than one cycle's
 budget (1000 actions or 10 pages) applies the creates/updates seen so far and
-resumes from a durable cursor in the next cycle. Such repositories converge on
+resumes from a durable cursor in the next cycle. Successfully validated pages
+and their cursor also commit if a later page times out or fails; transient
+failures retain resume progress, while rejected/invalid cursors restart the
+sweep. Incomplete listings never infer deletions. Such repositories converge on
 changes, but their missed deletions are only applied by live ingestion: a missed
 undo keeps the subject hidden (fail closed). Live actions enter the same source-ordering/projector as app records.
 Action records remain independent assertions in `moderation_actions` and are
@@ -109,6 +112,13 @@ policy also invalidates its earlier in-flight requests. Schema version 16 adds
 the queue generation column during initialization, before policy maintenance.
 The labeler must support the standard DID
 and trailing-`*` URI patterns; observe real results/pagination before rollout.
+
+Schema version 17 upgrades stored label, action and override creation timestamps
+from seconds to milliseconds in one guarded transaction. Concurrent/retried
+initializers cannot scale them twice. Stop older Contrail processes before
+upgrading: old readers/writers use the previous timestamp unit. Already-discarded
+subsecond history cannot be reconstructed by the migration; replay label history
+if that needs to be recovered.
 
 ### Policy changes
 
@@ -157,8 +167,9 @@ An override with `subjectCid` only suppresses labels pinned to that same CID;
 use an unpinned override for unpinned labels.
 Deleting/expiring the override restores still-active labels. Overrides affect
 hydration and enforcement, but **never** moderator labels or account state.
-Timestamps currently have label-pipeline second precision: same-second external
-labels are not considered older than an override.
+Creation timestamps retain millisecond precision, including when comparing an
+external label with an override in the same second. Expiry and visibility
+boundaries remain second-resolution.
 
 ## Account lifecycle
 

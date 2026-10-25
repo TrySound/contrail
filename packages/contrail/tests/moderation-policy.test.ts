@@ -17,11 +17,18 @@ import type { ContrailConfig, Database } from "../src/index";
 const moderator = "did:plc:moderator";
 const external = "did:plc:external";
 const actors = ["did:plc:a1", "did:plc:a2", "did:plc:a3", "did:plc:a4", "did:plc:a5"];
+// CI's Node 22 SQLite lacks FTS5; policy coverage must still run there.
+let hasFts = false;
+try {
+  await createTestDb().prepare("CREATE VIRTUAL TABLE __moderation_policy_fts USING fts5(content)").run();
+  hasFts = true;
+} catch {}
+
 const base = {
   ...TEST_CONFIG,
   collections: {
     ...TEST_CONFIG.collections,
-    event: { ...TEST_CONFIG.collections.event, searchable: ["name"] },
+    event: { ...TEST_CONFIG.collections.event, searchable: hasFts ? ["name"] : false },
   },
 };
 const trusted = resolveConfig({ ...base, moderation: { moderators: [moderator], reports: false } });

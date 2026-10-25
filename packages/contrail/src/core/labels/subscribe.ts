@@ -23,10 +23,10 @@ function getLogger(config: ContrailConfig): Logger {
   return config.logger ?? console;
 }
 
-/** One catch-up cycle for every configured labeler. Designed to fit inside a
- *  Cloudflare Workers cron tick — we drain frames until the labeler has no
- *  more buffered events for us, or `timeoutMs` is reached, then save cursor
- *  and disconnect. Mirrors the shape of `runIngestCycle` for jetstream. */
+/** One catch-up cycle for every configured labeler. Pump sources concurrently
+ * under a shared deadline: subscribeLabels sockets normally stay open even
+ * after catching up, so sequential pumps would starve all later sources.
+ * Each source saves its own cursor before disconnecting. */
 export async function runLabelIngestCycle(
   db: Database,
   config: ContrailConfig,
@@ -36,28 +36,26 @@ export async function runLabelIngestCycle(
   const log = getLogger(config);
   const deadline = Date.now() + timeoutMs;
 
-  for (const source of config.labels.sources) {
-    if (source.records) continue;
-    if (Date.now() >= deadline) {
-      log.log(`[labels] cycle deadline hit before processing ${source.did}`);
-      break;
-    }
-    const remaining = Math.max(2_000, deadline - Date.now());
-    try {
-      await pumpOneLabeler(
-        db,
-        source,
-        log,
-        remaining,
-        /* persistent */ false,
-        {},
-        config,
-      );
-    } catch (err) {
-      if (err instanceof ObsoleteLabelPolicyError) break;
-      log.warn(`[labels] cycle for ${source.did} failed: ${err}`);
-    }
-  }
+  await Promise.all(
+    config.labels.sources.filter((source) => !source.records).map(async (source) => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return;
+      try {
+        await pumpOneLabeler(
+          db,
+          source,
+          log,
+          remaining,
+          /* persistent */ false,
+          {},
+          config,
+        );
+      } catch (err) {
+        if (err instanceof ObsoleteLabelPolicyError) return;
+        log.warn(`[labels] cycle for ${source.did} failed: ${err}`);
+      }
+    }),
+  );
 }
 
 export interface PersistentLabelsOptions {
@@ -142,6 +140,7 @@ async function pumpOneLabeler(
   pumpOpts: PumpOptions,
   config: ContrailConfig,
 ): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   // Capture before any endpoint resolution/network I/O. The nonce also rejects
   // a buffered batch from before a policy change that was subsequently reverted.
   const policyGeneration = await getModerationPolicyGeneration(db, config);
@@ -150,7 +149,14 @@ async function pumpOneLabeler(
     sql: moderationPolicyGenerationSql(),
     bindings: [policyGeneration],
   };
-  const state = await getLabelerState(db, source.did, source.endpoint, config.networkOverrides);
+  if (Date.now() >= deadline) return;
+  const state = await getLabelerState(db, source.did, source.endpoint, {
+    ...config.networkOverrides,
+    ...(Number.isFinite(deadline)
+      ? { signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())) }
+      : {}),
+  });
+  if (Date.now() >= deadline) return;
   if (!state) {
     log.warn(`[labels] could not resolve labeler endpoint for ${source.did}; skipping`);
     return;
@@ -256,7 +262,7 @@ async function pumpOneLabeler(
       log.log(`[labels] ${source.did} cycle deadline reached, closing`);
       cleanup();
       flush().then(resolveDone, rejectDone);
-    }, timeoutMs);
+    }, Math.max(0, deadline - Date.now()));
   }
 
   ws.addEventListener("error", (ev) => {
