@@ -33,7 +33,7 @@ import {
   type RuntimeCpuUsageProcess,
 } from "./runtime-telemetry";
 
-import { accountUpdateStatements, MODERATION_ACTION_NSID, type AccountUpdate } from "./moderation";
+import { accountUpdateStatements, knownAccountDids, MODERATION_ACTION_NSID, type AccountUpdate } from "./moderation";
 
 const BATCH_SIZE = 50;
 
@@ -93,6 +93,8 @@ export interface ScheduledIngestCollectionStats {
   retainedCandidates: number;
   retainedIdentityUpdates: number;
   identityUpdatesOmitted: number;
+  /** Account events for actors this instance holds no data for. */
+  accountUpdatesFiltered: number;
   exactDuplicatesDropped: number;
   cursorBoundaryDuplicatesDropped: number;
   resumeOverlapDropped: number;
@@ -405,6 +407,10 @@ export async function ingestEvents(
   budgetInput: ScheduledIngestOptions | ScheduledIngestBudget | number =
     DEFAULT_SCHEDULED_INGEST_BUDGET,
   knownDids?: Set<string>,
+  /** Resolves which account-event actors this instance holds data for. When
+   * set, network-wide account traffic for unknown actors is dropped before it
+   * spends the `maxAccountUpdates` budget. */
+  knownAccounts?: (dids: string[]) => Promise<Set<string>>,
 ): Promise<{
   events: IngestEvent[];
   lastCursor: number | null;
@@ -428,6 +434,28 @@ export async function ingestEvents(
   const identityUpdates = new Map<string, string>();
   // Latest event per actor: the stored state only depends on the newest one.
   const accountUpdates = new Map<string, AccountUpdate>();
+  // Actors with retained commits this drain; their records commit before the
+  // account statements, so their lifecycle events are kept unresolved.
+  const commitDids = new Set<string>();
+  // Account events awaiting a batched known-actor lookup.
+  const unresolvedAccounts = new Map<string, AccountUpdate>();
+  const retainAccount = (update: AccountUpdate) => {
+    const prior = accountUpdates.get(update.did);
+    if (prior && prior.cursor >= update.cursor) return;
+    accountUpdates.delete(update.did);
+    accountUpdates.set(update.did, update);
+    stats.serializedCandidateBytes += SCHEDULED_INGEST_METADATA_BYTES;
+  };
+  const resolveAccounts = async () => {
+    if (!unresolvedAccounts.size) return;
+    const batch = [...unresolvedAccounts.values()];
+    unresolvedAccounts.clear();
+    const known = await knownAccounts!(batch.map((u) => u.did));
+    for (const update of batch) {
+      if (known.has(update.did) || commitDids.has(update.did)) retainAccount(update);
+      else stats.accountUpdatesFiltered++;
+    }
+  };
   const stats: ScheduledIngestCollectionStats = {
     observedSourceItems: 0,
     commitObservations: 0,
@@ -435,6 +463,7 @@ export async function ingestEvents(
     retainedCandidates: 0,
     retainedIdentityUpdates: 0,
     identityUpdatesOmitted: 0,
+    accountUpdatesFiltered: 0,
     exactDuplicatesDropped: 0,
     cursorBoundaryDuplicatesDropped: 0,
     resumeOverlapDropped: 0,
@@ -579,6 +608,7 @@ export async function ingestEvents(
         },
       });
       collected.push(candidate);
+      commitDids.add(event.did);
       stats.retainedCandidates++;
       stats.serializedCandidateBytes +=
         SCHEDULED_INGEST_METADATA_BYTES +
@@ -600,9 +630,19 @@ export async function ingestEvents(
       }
     } else if (event.kind === "account") {
       if (accountSourceItem(event)) return;
-      accountUpdates.delete(event.did);
-      accountUpdates.set(event.did, { did: event.did, active: event.account.active, status: event.account.status, timeUs: event.time_us, cursor: event.seq });
-      stats.serializedCandidateBytes += SCHEDULED_INGEST_METADATA_BYTES;
+      const update: AccountUpdate = { did: event.did, active: event.account.active, status: event.account.status, timeUs: event.time_us, cursor: event.seq };
+      if (
+        !knownAccounts ||
+        accountUpdates.has(event.did) ||
+        commitDids.has(event.did) ||
+        knownDids?.has(event.did)
+      ) {
+        retainAccount(update);
+        return;
+      }
+      unresolvedAccounts.delete(event.did);
+      unresolvedAccounts.set(event.did, update);
+      if (unresolvedAccounts.size >= 100) await resolveAccounts();
     }
   };
 
@@ -655,6 +695,9 @@ export async function ingestEvents(
     subscriptionAbort.abort();
     Promise.resolve(iterator.return?.()).catch(() => {});
   }
+  // Every accounted seq's account event is either retained or known to be a
+  // no-op before the drain's cursor can be saved.
+  await resolveAccounts();
 
   // Never read the transport cursor again here: it may have moved when a frame
   // was buffered but not yielded. The constructor cursor captured above and the
@@ -761,6 +804,7 @@ export async function runIngestCycle(
     cursor,
     budget,
     knownDids,
+    (dids) => knownAccountDids(db, config, dids),
   );
 
   const accepted: IngestEvent[] = [];
@@ -951,6 +995,7 @@ export async function runIngestCycle(
     commit_observations: stats.commitObservations,
     identity_observations: stats.identityObservations,
     retained_account_updates: accountUpdates.length,
+    account_updates_filtered: stats.accountUpdatesFiltered,
     retained_candidates: stats.retainedCandidates,
     retained_identity_updates: stats.retainedIdentityUpdates,
     identity_updates_omitted: stats.identityUpdatesOmitted,

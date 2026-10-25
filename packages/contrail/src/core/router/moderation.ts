@@ -8,7 +8,12 @@ import {
   normalizeProfileConfig,
 } from "../types";
 import type { ServiceAuthGate } from "../service-auth";
-import { MODERATION_ACTION_NSID, subjectDid, activeHiddenSql } from "../moderation";
+import {
+  MODERATION_ACTION_NSID,
+  subjectDid,
+  activeHiddenSql,
+  knownAccountDids,
+} from "../moderation";
 import { hydrateLabels } from "../labels/hydrate";
 import { formatRecord } from "./helpers";
 import { REPORT_REASON_TYPES } from "../../moderation-contract";
@@ -77,6 +82,26 @@ function subject(row: ReportRow) {
         cid: row.subject_cid,
       }
     : { $type: "com.atproto.admin.defs#repoRef", did: row.subject_did };
+}
+
+/** Reports are limited to subjects this instance indexes, so arbitrary DIDs
+ * and URIs cannot fill the private inbox. Hidden subjects remain reportable. */
+async function isIndexedSubject(
+  db: Database,
+  config: ContrailConfig,
+  uri: string,
+  did: string,
+): Promise<boolean> {
+  if (!uri.startsWith("at://"))
+    return (await knownAccountDids(db, config, [did])).has(did);
+  const key = resolveCollectionKey(config, parseResourceUri(uri).collection!);
+  return (
+    !!key &&
+    !!(await db
+      .prepare(`SELECT 1 FROM ${recordsTableName(key)} WHERE uri = ?`)
+      .bind(uri)
+      .first())
+  );
 }
 
 /** Never use the public pipeline for moderator previews: moderators need the
@@ -189,47 +214,70 @@ export function registerModerationRoutes(
     ) {
       return c.json({ error: "InvalidRequest" }, 400);
     }
-    // Safe JSON integer, no clock/sequence collision across concurrent Workers.
-    const bytes = crypto.getRandomValues(new Uint8Array(6));
-    const id = bytes.reduce((n, b) => n * 256 + b, 0);
+    if (!(await isIndexedSubject(projectionDb, config, uri, did!)))
+      return c.json(
+        {
+          error: "InvalidRequest",
+          message: "subject is not indexed by this service",
+        },
+        400,
+      );
     const now = Date.now();
-    await db.batch([
-      db
-        .prepare(
-          `INSERT INTO moderation_report_limits (reporter, window_start, used, last_id) VALUES (?, ?, 1, ?)
-        ON CONFLICT(reporter) DO UPDATE SET
-          window_start = CASE WHEN moderation_report_limits.window_start <= ? THEN excluded.window_start ELSE moderation_report_limits.window_start END,
-          used = CASE WHEN moderation_report_limits.window_start <= ? THEN 1 ELSE moderation_report_limits.used + 1 END,
-          last_id = excluded.last_id
-        WHERE moderation_report_limits.window_start <= ? OR moderation_report_limits.used < 10`,
-        )
-        .bind(
-          a.did,
-          now,
-          String(id),
-          now - 3_600_000,
-          now - 3_600_000,
-          now - 3_600_000,
-        ),
-      db
-        .prepare(
-          `INSERT INTO moderation_reports (id, reporter, subject_uri, subject_did, subject_cid, reason_type, reason, created_at)
-        SELECT ?, ?, ?, ?, ?, ?, ?, CAST(? AS BIGINT) WHERE EXISTS
-        (SELECT 1 FROM moderation_report_limits WHERE reporter = ? AND last_id = ?)`,
-        )
-        .bind(
-          String(id),
-          a.did,
-          uri,
-          did,
-          cid,
-          body.reasonType,
-          body.reason ?? null,
-          now,
-          a.did,
-          String(id),
-        ),
-    ]);
+    let id = 0;
+    for (let attempt = 0; ; attempt++) {
+      // Safe JSON integer, no clock/sequence collision across concurrent Workers.
+      const bytes = crypto.getRandomValues(new Uint8Array(6));
+      id = bytes.reduce((n, b) => n * 256 + b, 0);
+      try {
+        await db.batch([
+          db
+            .prepare(
+              `INSERT INTO moderation_report_limits (reporter, window_start, used, last_id) VALUES (?, ?, 1, ?)
+            ON CONFLICT(reporter) DO UPDATE SET
+              window_start = CASE WHEN moderation_report_limits.window_start <= ? THEN excluded.window_start ELSE moderation_report_limits.window_start END,
+              used = CASE WHEN moderation_report_limits.window_start <= ? THEN 1 ELSE moderation_report_limits.used + 1 END,
+              last_id = excluded.last_id
+            WHERE moderation_report_limits.window_start <= ? OR moderation_report_limits.used < 10`,
+            )
+            .bind(
+              a.did,
+              now,
+              String(id),
+              now - 3_600_000,
+              now - 3_600_000,
+              now - 3_600_000,
+            ),
+          db
+            .prepare(
+              `INSERT INTO moderation_reports (id, reporter, subject_uri, subject_did, subject_cid, reason_type, reason, created_at)
+            SELECT ?, ?, ?, ?, ?, ?, ?, CAST(? AS BIGINT) WHERE EXISTS
+            (SELECT 1 FROM moderation_report_limits WHERE reporter = ? AND last_id = ?)`,
+            )
+            .bind(
+              String(id),
+              a.did,
+              uri,
+              did,
+              cid,
+              body.reasonType,
+              body.reason ?? null,
+              now,
+              a.did,
+              String(id),
+            ),
+        ]);
+        break;
+      } catch (error) {
+        // A random ID collision fails the whole transaction, quota included.
+        // Retry with a fresh ID; anything else is a real storage failure.
+        const taken = await db
+          .prepare("SELECT 1 FROM moderation_reports WHERE id = ?")
+          .bind(String(id))
+          .first()
+          .catch(() => null);
+        if (!taken || attempt >= 2) throw error;
+      }
+    }
     const stored = await db
       .prepare("SELECT id FROM moderation_reports WHERE id = ?")
       .bind(String(id))

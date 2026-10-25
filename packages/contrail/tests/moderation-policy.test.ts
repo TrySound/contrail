@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { createTestDb, makeEvent, TEST_CONFIG } from "./helpers";
 import {
+  applyLabels,
   applyModerationPolicy,
   getMeta,
   ingestRecords,
@@ -110,6 +111,143 @@ describe("moderation policy changes", () => {
     expect(await getMeta(db, "moderation_policy_job")).toBeNull();
     expect(await getMeta(db, "moderation_policy_applied")).toBe(
       moderationPolicyFingerprint(untrusted),
+    );
+  });
+
+  function externalPolicy(enforce: boolean, values?: string[]) {
+    return resolveConfig({
+      ...base,
+      labels: { sources: [{ did: external, subjects: "known", enforce, values }] },
+    });
+  }
+
+  async function enforceExternalLabels() {
+    const config = externalPolicy(true);
+    await initSchema(db, config);
+    // Isolate label enforcement: unrelated moderator actions would cause an
+    // extra subject scan and accidentally mask missing label recomputation.
+    await db.prepare("DELETE FROM moderation_actions").run();
+    await applyLabels(
+      db,
+      actors.map((uri) => ({ src: external, uri, val: "!hide", cts: "2026-01-01T00:00:00Z" })),
+      { config },
+    );
+    expect(await visible(config)).toBe(0);
+    return config;
+  }
+
+  it.each(["disable", "remove"])(
+    "restores external hiding after partially applying a source %s and reverting",
+    async (change) => {
+      const enabled = await enforceExternalLabels();
+      const changed = change === "disable" ? externalPolicy(false) : resolveConfig(base);
+      await applyModerationPolicy(db, changed, { maxPages: 1, pageSize: 2 });
+      expect(await visible(enabled)).toBe(2);
+
+      await applyModerationPolicy(db, enabled);
+      expect(await visible(enabled)).toBe(0);
+      expect(await getMeta(db, "moderation_policy_job")).toBeNull();
+      expect(await getMeta(db, "moderation_policy_applied")).toBe(
+        moderationPolicyFingerprint(enabled),
+      );
+    },
+  );
+
+  it("requeues known-source backfill after reverting partially pruned values", async () => {
+    const enabled = await enforceExternalLabels();
+    await db.prepare("UPDATE label_backfill_queue SET completed = 1").run();
+    await applyModerationPolicy(db, externalPolicy(true, ["custom"]), { maxPages: 1, pageSize: 2 });
+    expect((await db.prepare("SELECT * FROM labels").all()).results).toHaveLength(3);
+
+    await applyModerationPolicy(db, enabled);
+    expect(
+      (await db.prepare("SELECT * FROM label_backfill_queue WHERE completed = 0").all()).results,
+    ).toHaveLength(actors.length);
+    expect(await getMeta(db, "moderation_policy_job")).toBeNull();
+  });
+
+  it.each([
+    ["pruning labels", "DELETE FROM labels"],
+    ["recomputing hiding", "INSERT INTO moderation_dirty"],
+    ["resetting backfill", "UPDATE label_backfill_queue"],
+    ["enqueueing backfill", "INSERT INTO label_backfill_queue"],
+    ["recording backfill policy", "INSERT INTO label_backfill_sources"],
+    ["completing the job", "INSERT INTO _contrail_meta (key, value) SELECT"],
+  ])("a superseded worker cannot mutate state while %s", async (_name, mutation) => {
+    const enabled = await enforceExternalLabels();
+    await applyLabels(db, [
+      { src: external, uri: actors[0]!, val: "custom", cts: "2026-01-01T00:00:00Z" },
+    ], { config: enabled });
+    await db.prepare("UPDATE label_backfill_queue SET completed = 1, retries = 3").run();
+    await db.prepare("DELETE FROM label_backfill_queue WHERE did = ?").bind(actors.at(-1)).run();
+    const restricted = externalPolicy(true, ["!hide"]);
+    await applyModerationPolicy(db, restricted, { maxPages: 0 });
+
+    const snapshot = async () => ({
+      labels: (await db.prepare("SELECT * FROM labels ORDER BY src, uri, val, cts").all()).results,
+      hidden: (await db.prepare("SELECT * FROM moderation_hidden ORDER BY subject, kind, cid").all()).results,
+      queue: (await db.prepare("SELECT * FROM label_backfill_queue ORDER BY src, did").all()).results,
+      sources: (await db.prepare("SELECT * FROM label_backfill_sources ORDER BY src").all()).results,
+      recounts: (await db.prepare("SELECT * FROM moderation_recount_queue ORDER BY subject, due_at").all()).results,
+      trust: (await db.prepare("SELECT * FROM moderation_sources ORDER BY did").all()).results,
+      job: await getMeta(db, "moderation_policy_job"),
+      applied: await getMeta(db, "moderation_policy_applied"),
+    });
+    let before: Awaited<ReturnType<typeof snapshot>> | undefined;
+    let prepared = false;
+    const racing: Database = {
+      dialect: db.dialect,
+      prepare(sql) {
+        if (sql.startsWith(mutation)) prepared = true;
+        return db.prepare(sql);
+      },
+      async batch(statements) {
+        if (prepared && !before) {
+          // Another deployment replaces this job after the page was prepared,
+          // but before its transaction begins. Removed sources must not have
+          // their labels, hiding or backfill state changed by the old runner.
+          await applyModerationPolicy(db, resolveConfig(base), { maxPages: 0 });
+          before = await snapshot();
+        }
+        return db.batch(statements);
+      },
+    };
+    await runModerationPolicyJob(racing, restricted);
+    expect(before).toBeDefined();
+    expect(await snapshot()).toEqual(before);
+    expect((await db.prepare("SELECT * FROM moderation_dirty").all()).results).toEqual([]);
+  });
+
+  it("a stale page cannot reset backfill completed by another runner of the same job", async () => {
+    await enforceExternalLabels();
+    const restricted = externalPolicy(true, ["!hide"]);
+    await applyModerationPolicy(db, restricted, { maxPages: 0 });
+    let prepared = false;
+    let completed = false;
+    const racing: Database = {
+      dialect: db.dialect,
+      prepare(sql) {
+        if (sql.startsWith("UPDATE label_backfill_queue")) prepared = true;
+        return db.prepare(sql);
+      },
+      async batch(statements) {
+        if (prepared && !completed) {
+          completed = true;
+          await runModerationPolicyJob(db, restricted);
+          // Simulate a backfill consumer finishing the freshly requeued work.
+          await db.prepare("UPDATE label_backfill_queue SET completed = 1, retries = 3").run();
+        }
+        return db.batch(statements);
+      },
+    };
+    await runModerationPolicyJob(racing, restricted);
+    expect(completed).toBe(true);
+    expect(
+      (await db.prepare("SELECT * FROM label_backfill_queue WHERE completed = 1 AND retries = 3").all()).results,
+    ).toHaveLength(actors.length);
+    expect(await getMeta(db, "moderation_policy_job")).toBeNull();
+    expect(await getMeta(db, "moderation_policy_applied")).toBe(
+      moderationPolicyFingerprint(restricted),
     );
   });
 

@@ -30,7 +30,9 @@ const config = resolveConfig({
 });
 let db: Database;
 let time = 100;
-const post = makeEvent();
+// Real-format CIDs: action subjectCid values are validated.
+const otherVersion = "bafyreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy";
+const post = makeEvent({ cid: "bafyreib2rxk3rybk3aobmv5cjuql3bm2twh4jo5uxgf5yvzh5lsjbsmwu4" });
 function action(
   value: any,
   rkey = "action",
@@ -105,6 +107,9 @@ describe("moderation enforcement", () => {
   it("rejects ambiguous override label lists and retracts an override edited into one", async () => {
     expect(parseModerationAction({ subject: actor, action: "override", labels: [], createdAt: "2026-01-01T00:00:00Z" })).toBeNull();
     expect(parseModerationAction({ subject: actor, action: "override", labels: [""], createdAt: "2026-01-01T00:00:00Z" })).toBeNull();
+    for (const subjectCid of ["not a cid", "bafy" + "a".repeat(300)])
+      expect(parseModerationAction({ subject: post.uri, subjectCid, action: "!hide", createdAt: "2026-01-01T00:00:00Z" })).toBeNull();
+    expect(parseModerationAction({ subject: post.uri, subjectCid: otherVersion, action: "!hide", createdAt: "2026-01-01T00:00:00Z" })).not.toBeNull();
     expect(moderationActionLexicon.defs.main.record.properties.labels).toMatchObject({
       minLength: 1,
       items: { minLength: 1 },
@@ -171,7 +176,7 @@ describe("moderation enforcement", () => {
     async (createdAt) => {
       await ingestRecords(db, [
         action({ subject: post.uri, action: "!hide", createdAt: "2025-01-01T00:00:00Z" }, "a"),
-        action({ subject: post.uri, subjectCid: "other-version", action: "!hide", createdAt }, "b"),
+        action({ subject: post.uri, subjectCid: otherVersion, action: "!hide", createdAt }, "b"),
       ], config);
       expect(await rows()).toHaveLength(0);
       const cids = new Map([[post.uri, post.cid]]);
@@ -181,19 +186,19 @@ describe("moderation enforcement", () => {
       await ingestRecords(db, [action(null, "a", moderator, "delete")], config);
       expect(await rows()).toHaveLength(1);
       expect(await hydrateLabels(db, [post.uri], [moderator], cids)).toEqual({});
-      await ingestRecords(db, [makeEvent({ operation: "update", cid: "other-version", time_us: 2_000_000 })], config);
+      await ingestRecords(db, [makeEvent({ operation: "update", cid: otherVersion, time_us: 2_000_000 })], config);
       expect(await rows()).toHaveLength(0);
-      expect((await hydrateLabels(db, [post.uri], [moderator], new Map([[post.uri, "other-version"]])))[post.uri]).toHaveLength(1);
+      expect((await hydrateLabels(db, [post.uri], [moderator], new Map([[post.uri, otherVersion]])))[post.uri]).toHaveLength(1);
     },
   );
   it("retains same-second actions pinned to distinct versions", async () => {
     await ingestRecords(db, [
       action({ subject: post.uri, subjectCid: post.cid, action: "!hide" }, "a"),
-      action({ subject: post.uri, subjectCid: "other-version", action: "!hide" }, "b"),
+      action({ subject: post.uri, subjectCid: otherVersion, action: "!hide" }, "b"),
     ], config);
     expect(await rows()).toHaveLength(0);
     expect((await hydrateLabels(db, [post.uri], [moderator], new Map([[post.uri, post.cid]])))[post.uri][0].cid).toBe(post.cid);
-    await ingestRecords(db, [makeEvent({ operation: "update", cid: "other-version", time_us: 2_000_000 })], config);
+    await ingestRecords(db, [makeEvent({ operation: "update", cid: otherVersion, time_us: 2_000_000 })], config);
     expect(await rows()).toHaveLength(0);
     await ingestRecords(db, [action(null, "b", moderator, "delete")], config);
     expect(await rows()).toHaveLength(1);
@@ -447,6 +452,39 @@ describe("moderation enforcement", () => {
     await ingestRecords(db, [rsvp("did:plc:other")], config);
     // The second RSVP's recount already excludes the hidden actor.
     expect((await rows())[0].counts?.rsvp).toBe(1);
+  });
+  it("queues recounts only when a subject's visibility actually changes", async () => {
+    const rsvp = makeEvent({
+      uri: "at://did:plc:rsvp/community.lexicon.calendar.rsvp/a",
+      did: "did:plc:rsvp",
+      collection: "community.lexicon.calendar.rsvp",
+      record: { subject: { uri: post.uri }, status: "community.lexicon.calendar.rsvp#going" },
+    });
+    await ingestRecords(db, [rsvp], config);
+    const queue = async () =>
+      (await db.prepare("SELECT subject FROM moderation_recount_queue").all()).results;
+    const update = (cursor: number, active: boolean) =>
+      db.batch(accountUpdateStatements(
+        db,
+        [{ did: rsvp.did, active, ...(active ? {} : { status: "deactivated" }), timeUs: cursor, cursor }],
+        config,
+      ));
+    // Routine active event for a visible actor: nothing to recount.
+    await update(1, true);
+    expect(await queue()).toEqual([]);
+    await update(2, false);
+    expect(await queue()).toEqual([{ subject: rsvp.did }]);
+    await runModerationRecounts(db, config);
+    // A second hide reason for an already hidden actor changes nothing.
+    await ingestRecords(db, [action({ subject: rsvp.did, action: "!takedown" })], config);
+    await update(3, false);
+    expect(await queue()).toEqual([]);
+    // Lifting one of two reasons keeps the actor hidden.
+    await update(4, true);
+    expect(await queue()).toEqual([]);
+    expect(
+      (await db.prepare("SELECT * FROM moderation_hidden_snapshot").all()).results,
+    ).toEqual([]);
   });
   it("queues recounts at future visibility boundaries", async () => {
     const rsvp = makeEvent({
@@ -861,6 +899,77 @@ describe("label admission and recovery", () => {
     } finally {
       mock.mockRestore();
       clock.mockRestore();
+    }
+  });
+  it("resumes listings that exceed the cycle budget without inferring deletions", async () => {
+    const stale = action({ subject: actor, action: "!hide" }, "stale");
+    await ingestRecords(db, [stale], config);
+    await db
+      .prepare("INSERT INTO identities (did, pds, resolved_at) VALUES (?, ?, ?)")
+      .bind(moderator, "https://pds.example", Date.now())
+      .run();
+    // Twelve remote actions, one per page; `stale` was deleted remotely.
+    const remote = Array.from({ length: 12 }, (_, i) => ({
+      uri: `at://${moderator}/${MODERATION_ACTION_NSID}/r${String(i).padStart(2, "0")}`,
+      cid: `remote${i}`,
+      value: {
+        $type: MODERATION_ACTION_NSID,
+        subject: `did:plc:remote${i}`,
+        action: "!hide",
+        createdAt: "2026-01-01T00:00:00Z",
+      },
+    }));
+    const requestedCursors: Array<string | null> = [];
+    const mock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const cursor = new URL(String(input)).searchParams.get("cursor");
+      requestedCursors.push(cursor);
+      const index = cursor ? Number(cursor) : 0;
+      return Response.json({
+        records: [remote[index]],
+        ...(index + 1 < remote.length ? { cursor: String(index + 1) } : {}),
+      });
+    });
+    const actions = async () =>
+      (await db.prepare("SELECT uri FROM moderation_actions ORDER BY uri").all<{ uri: string }>())
+        .results.map((r) => r.uri);
+    try {
+      await reconcileModeratorActions(db, config);
+      expect(requestedCursors).toEqual([null, ...Array.from({ length: 9 }, (_, i) => String(i + 1))]);
+      expect(await actions()).toEqual([...remote.slice(0, 10).map((r) => r.uri), stale.uri]);
+      await reconcileModeratorActions(db, config);
+      expect(requestedCursors.slice(10)).toEqual(["10", "11"]);
+      // The resumed sweep saw every change but cannot prove `stale` is gone.
+      expect(await actions()).toEqual([...remote.map((r) => r.uri), stale.uri]);
+      expect(
+        await db
+          .prepare("SELECT 1 FROM _contrail_meta WHERE key LIKE 'moderation_reconcile_cursor:%'")
+          .first(),
+      ).toBeNull();
+    } finally {
+      mock.mockRestore();
+    }
+  });
+  it("restarts a sweep whose resume cursor is rejected", async () => {
+    await db
+      .prepare("INSERT INTO identities (did, pds, resolved_at) VALUES (?, ?, ?)")
+      .bind(moderator, "https://pds.example", Date.now())
+      .run();
+    await db
+      .prepare("INSERT INTO _contrail_meta (key, value) VALUES (?, ?)")
+      .bind(`moderation_reconcile_cursor:${moderator}`, "expired")
+      .run();
+    const mock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response("bad cursor", { status: 400 }));
+    try {
+      await reconcileModeratorActions(db, config);
+      expect(
+        await db
+          .prepare("SELECT 1 FROM _contrail_meta WHERE key LIKE 'moderation_reconcile_cursor:%'")
+          .first(),
+      ).toBeNull();
+    } finally {
+      mock.mockRestore();
     }
   });
   it("reconciles unchanged actions without any database writes", async () => {

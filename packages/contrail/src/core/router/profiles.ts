@@ -47,6 +47,32 @@ export function collectDids(
   return [...dids];
 }
 
+/** Profile-URI hides are distinct from account hides. Include unpinned hides
+ * even without a cached record, and match CID pins only to the indexed version.
+ * Used before read-through so hidden profiles are not treated as cache misses. */
+export async function hiddenProfileUris(
+  db: Database,
+  config: ContrailConfig,
+  dids: string[],
+): Promise<Set<string>> {
+  const profiles = (config.profiles ?? []).map(normalizeProfileConfig);
+  const uris = profiles.flatMap((p) =>
+    dids.map((did) => `at://${did}/${p.collection}/${p.rkey ?? "self"}`),
+  );
+  const hidden = await hiddenSubjects(db, uris);
+  for (const pc of profiles) {
+    const rows = await batchedInQuery<{ uri: string }>(
+      db,
+      `SELECT uri FROM ${recordsTableName(pc.shortName ?? pc.collection)} r
+       WHERE uri IN (__IN__) AND NOT (${visibleRecordSql("r")})`,
+      [],
+      dids.map((did) => `at://${did}/${pc.collection}/${pc.rkey ?? "self"}`),
+    );
+    for (const row of rows) hidden.add(row.uri);
+  }
+  return hidden;
+}
+
 export async function resolveProfiles(
   db: Database,
   config: ContrailConfig,
@@ -62,6 +88,11 @@ export async function resolveProfiles(
   const profileConfigs = config.profiles.map(normalizeProfileConfig);
   const result: Record<string, ProfileEntry[]> = {};
   const indexedUris = new Set<string>();
+  const hiddenUris = await hiddenProfileUris(db, config, dids);
+  dids = dids.filter((did) => !profileConfigs.every((p) =>
+    hiddenUris.has(`at://${did}/${p.collection}/${p.rkey ?? "self"}`),
+  ));
+  if (!dids.length) return {};
 
   // Batch-lookup profile records for each configured profile collection
   for (const pc of profileConfigs) {
@@ -93,7 +124,7 @@ export async function resolveProfiles(
     profileConfigs.flatMap((profile) => {
       const rkey = profile.rkey ?? "self";
       const uri = `at://${did}/${profile.collection}/${rkey}`;
-      return indexedUris.has(uri) ? [] : [{ did, profile }];
+      return indexedUris.has(uri) || hiddenUris.has(uri) ? [] : [{ did, profile }];
     }),
   );
   if (missingProfiles.length > 0) {
@@ -107,6 +138,13 @@ export async function resolveProfiles(
   // Recheck after network enrichment: moderation may have changed in flight.
   for (const did of await hiddenSubjects(db, dids)) { hiddenDids.add(did); delete result[did]; }
   dids = dids.filter((did) => !hiddenDids.has(did));
+  const currentHiddenUris = await hiddenProfileUris(db, config, dids);
+  for (const did of dids) {
+    if (result[did]) {
+      result[did] = result[did].filter((p) => !p.uri || !currentHiddenUris.has(p.uri));
+      if (!result[did].length) delete result[did];
+    }
+  }
   // Fill in handles and create entries for DIDs without profile records
   for (const did of dids) {
     const identity = identities.get(did);
@@ -116,7 +154,11 @@ export async function resolveProfiles(
       for (const entry of result[did]) {
         entry.handle = handle;
       }
-    } else {
+    } else if (!profileConfigs.some((p) =>
+      currentHiddenUris.has(`at://${did}/${p.collection}/${p.rkey ?? "self"}`),
+    )) {
+      // A genuinely absent profile may use an identity-only fallback, but a
+      // hidden profile must stay absent (getProfile then returns 404).
       result[did] = [{ did, handle }];
     }
   }

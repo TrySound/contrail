@@ -10,7 +10,7 @@ import { getStatusOverview, registerCursorRoute } from "./diagnostics";
 import { registerCollectionRoutes } from "./collection";
 import { registerFeedRoutes } from "./feed";
 import { registerNotifyRoute } from "./notify";
-import { resolveProfiles } from "./profiles";
+import { hiddenProfileUris, resolveProfiles } from "./profiles";
 import { createServiceAuthGate } from "../service-auth";
 import { isAccountHidden } from "../moderation";
 import { registerModerationRoutes } from "./moderation";
@@ -151,7 +151,13 @@ export function createApp(
     if (!did) return c.json({ error: "Could not resolve actor" }, 400);
 
     if (await isAccountHidden(db, did)) return c.json({ error: "Profile not found" }, 404);
-    for (const profile of (config.profiles ?? []).map(normalizeProfileConfig)) {
+    const profilesToLoad = (config.profiles ?? []).map(normalizeProfileConfig);
+    const hiddenUris = await hiddenProfileUris(db, config, [did]);
+    if (profilesToLoad.length && profilesToLoad.every((p) =>
+      hiddenUris.has(`at://${did}/${p.collection}/${p.rkey ?? "self"}`),
+    )) return c.json({ error: "Profile not found" }, 404);
+    for (const profile of profilesToLoad) {
+      if (hiddenUris.has(`at://${did}/${profile.collection}/${profile.rkey ?? "self"}`)) continue;
       await backfillUser(
         db,
         did,

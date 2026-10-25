@@ -264,6 +264,11 @@ describe("moderation client against Contrail routes", () => {
     });
     const db = createTestDb();
     await initSchema(db, config);
+    // Reports are only accepted for subjects the instance indexes.
+    await db
+      .prepare("INSERT INTO identities (did, pds, resolved_at) VALUES (?, ?, ?)")
+      .bind(subject.did, "https://pds.example", Date.now())
+      .run();
     const app = createApp(db, config);
     const fetch = (async (url: URL, init?: RequestInit) =>
       app.request(url.pathname + url.search, init)) as typeof globalThis.fetch;

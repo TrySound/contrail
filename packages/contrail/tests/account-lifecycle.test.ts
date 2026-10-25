@@ -87,6 +87,67 @@ describe("live lifecycle checkpoints", () => {
     expect(result.lastCursor).toBe(2);
     expect(result.stats.stopReason).toBe("count");
   });
+  it("network-wide account traffic for unknown actors does not spend the account budget", async () => {
+    const db = await setup();
+    events = [
+      ...Array.from({ length: 150 }, (_, i) =>
+        account(i + 1, false, "deactivated", `did:plc:stranger${i}`),
+      ),
+      account(151, false, "suspended"),
+    ];
+    const result = await ingestEvents(
+      TEST_CONFIG,
+      0,
+      { maxAccountUpdates: 2 },
+      undefined,
+      async (dids) => new Set(dids.filter((d) => d === did)),
+    );
+    expect(result.accountUpdates).toEqual([
+      expect.objectContaining({ did, cursor: 151 }),
+    ]);
+    expect(result.stats.accountUpdatesFiltered).toBe(150);
+    expect(result.stats.stopReason).toBe("idle");
+    expect(result.lastCursor).toBe(151);
+
+    await runIngestCycle(db, TEST_CONFIG, { maxAccountUpdates: 2 });
+    expect(await getLastCursor(db)).toBe(151);
+    expect(
+      (await db.prepare("SELECT did FROM account_state").all()).results,
+    ).toEqual([{ did }]);
+  });
+  it("persistent ingestion drops unknown actors' account events before SQL", async () => {
+    const db = await setup();
+    const statements: string[] = [];
+    const tracing: Database = {
+      dialect: db.dialect,
+      prepare(query) {
+        statements.push(query);
+        return db.prepare(query);
+      },
+      batch: (stmts) => db.batch(stmts),
+    };
+    const controller = new AbortController();
+    await runPersistent(tracing, TEST_CONFIG, {
+      signal: controller.signal,
+      batchSize: 1,
+      flushIntervalMs: 1_000,
+      createSubscription: () => ({
+        async *[Symbol.asyncIterator]() {
+          yield account(1, false, "deactivated", "did:plc:stranger");
+          yield account(2, false, "suspended");
+          controller.abort();
+        },
+      }),
+      logger: { log() {}, warn() {}, error() {} },
+    });
+    expect(await getLastCursor(db)).toBe(2);
+    expect(
+      statements.filter((s) => s.includes("INSERT INTO account_state")),
+    ).toHaveLength(1);
+    expect(
+      (await db.prepare("SELECT did FROM account_state").all()).results,
+    ).toEqual([{ did }]);
+  });
   it("retains only the newest account event per actor", async () => {
     events = [account(1, false), account(2, true), account(3, false, "takendown")];
     const result = await ingestEvents(TEST_CONFIG, 0, { maxAccountUpdates: 2 });
@@ -162,7 +223,7 @@ describe("live lifecycle checkpoints", () => {
     const controller = new AbortController();
     const lifecycle = account(10, false, "suspended");
     let subscriptions = 0;
-    const timer = setTimeout(() => controller.abort(), 50);
+    const timer = setTimeout(() => controller.abort(), 1_000);
     await runPersistent(failAccountOnce(db), TEST_CONFIG, {
       signal: controller.signal,
       batchSize: 1,
@@ -171,6 +232,9 @@ describe("live lifecycle checkpoints", () => {
         async *[Symbol.asyncIterator]() {
           subscriptions++;
           yield lifecycle;
+          // Account events flush on the timer: the first attempt fails and a
+          // later tick must retry the retained buffer.
+          await new Promise((resolve) => setTimeout(resolve, 100));
           controller.abort();
         },
       }),

@@ -39,7 +39,7 @@ import {
 } from "../types";
 import { getMetaValues, setMeta } from "./meta";
 
-export const CONTRAIL_SCHEMA_VERSION = 15;
+export const CONTRAIL_SCHEMA_VERSION = 16;
 const SCHEMA_FINGERPRINT_KEY = "schema_fingerprint";
 
 function getResolved(config: ContrailConfig): ResolvedMaps {
@@ -784,6 +784,9 @@ export async function initSchema(
   for (const statement of [...buildLabelsSchema(dialect), ...buildModerationSchema(dialect)]) {
     await runIdempotentDdl(db, statement);
   }
+  // Existing queues need the generation column before policy jobs can reset
+  // them. CREATE TABLE IF NOT EXISTS only covers fresh databases.
+  await addColumnIfNotExists(db, "label_backfill_queue", "generation", "INTEGER NOT NULL DEFAULT 0");
   await applyModerationPolicy(db, config);
 
   await runIdempotentDdl(db, cursorObservationsDdl);

@@ -10,8 +10,10 @@ import {
 const POLICY_APPLIED_KEY = "moderation_policy_applied";
 /** Pending paged job for the current policy, if any. */
 const POLICY_JOB_KEY = "moderation_policy_job";
+const POLICY_GENERATION_KEY = "moderation_policy_generation";
+const JOB_IS_CURRENT_SQL = "EXISTS (SELECT 1 FROM _contrail_meta WHERE key = ? AND value = ?)";
 /** Meta keys `applyModerationPolicy` reads; callers may preload them. */
-export const MODERATION_POLICY_META_KEYS = [POLICY_APPLIED_KEY, POLICY_JOB_KEY];
+export const MODERATION_POLICY_META_KEYS = [POLICY_APPLIED_KEY, POLICY_JOB_KEY, POLICY_GENERATION_KEY];
 const DEFAULT_PAGE_SIZE = 250;
 
 interface NormalizedPolicy {
@@ -44,6 +46,7 @@ interface PolicyTask {
     db: Database,
     cursor: string | null,
     pageSize: number,
+    current: string,
   ): Promise<{ statements: Statement[]; next: string | null }>;
 }
 
@@ -75,6 +78,28 @@ function normalizePolicy(config: ContrailConfig): NormalizedPolicy {
  * schema fingerprint so policy edits never rerun DDL or rebuild FTS. */
 export function moderationPolicyFingerprint(config: ContrailConfig): string {
   return JSON.stringify(normalizePolicy(config));
+}
+
+/** A persistent row serializes policy replacement, paged resets and backfill
+ * commits on PostgreSQL. Unlike the job row, it survives job completion. */
+export function lockModerationPolicyStatement(db: Database): Statement {
+  return db.prepare("UPDATE _contrail_meta SET value = value WHERE key = ?")
+    .bind(POLICY_GENERATION_KEY);
+}
+
+/** Opaque generation, including a nonce so a policy revert cannot admit an
+ * old response. A worker with an obsolete config must not start new requests. */
+export async function getModerationPolicyGeneration(
+  db: Database,
+  config: ContrailConfig,
+): Promise<string | null> {
+  const value = await getMeta(db, POLICY_GENERATION_KEY);
+  if (!value) return null;
+  return JSON.parse(value).fp === moderationPolicyFingerprint(config) ? value : null;
+}
+
+export function moderationPolicyGenerationSql(): string {
+  return `EXISTS (SELECT 1 FROM _contrail_meta WHERE key = '${POLICY_GENERATION_KEY}' AND value = ?)`;
 }
 
 function backfillPolicy(values: string[] | null | undefined): string {
@@ -125,10 +150,20 @@ async function pageRange(
   };
 }
 
+/** Hold the job row for the whole write batch on PostgreSQL. Subsequent
+ * statements then see a fresh READ COMMITTED snapshot after any previous
+ * runner/replacement commits. SQLite and D1 already serialize write batches.
+ * Policy replacement takes this same lock before changing source trust. */
+function lockPolicyJobStatement(db: Database): Statement {
+  return db
+    .prepare("UPDATE _contrail_meta SET value = value WHERE key = ?")
+    .bind(POLICY_JOB_KEY);
+}
+
 /** Delete a source's stored labels, optionally only values outside `values`. */
 function pruneTask(src: string, values: string[] | null): PolicyTask {
   return {
-    async page(db, cursor, pageSize) {
+    async page(db, cursor, pageSize, current) {
       const r = await pageRange(db, "labels", "uri", "src = ?", [src], cursor, pageSize);
       if (r.upper === null) return { statements: [], next: null };
       const filter = values?.length
@@ -137,8 +172,8 @@ function pruneTask(src: string, values: string[] | null): PolicyTask {
       return {
         statements: [
           db
-            .prepare(`DELETE FROM labels WHERE src = ? AND uri > ? AND uri <= ?${filter}`)
-            .bind(src, r.lower, r.upper, ...(values?.length ? values : [])),
+            .prepare(`DELETE FROM labels WHERE src = ? AND uri > ? AND uri <= ?${filter} AND ${JOB_IS_CURRENT_SQL}`)
+            .bind(src, r.lower, r.upper, ...(values?.length ? values : []), POLICY_JOB_KEY, current),
         ],
         next: r.full ? r.upper : null,
       };
@@ -158,7 +193,7 @@ function recomputeTask(
   markFilter = "",
 ): PolicyTask {
   return {
-    async page(db, cursor, pageSize) {
+    async page(db, cursor, pageSize, current) {
       const r = await pageRange(db, table, key, filter, args, cursor, pageSize);
       if (r.upper === null) return { statements: [], next: null };
       const token = moderationDirtyToken();
@@ -169,9 +204,12 @@ function recomputeTask(
               `INSERT INTO moderation_dirty (token, subject)
               SELECT DISTINCT CAST(? AS TEXT), ${subject} FROM ${table}
               WHERE ${filter ? `${filter} AND ` : ""}${key} > ? AND ${key} <= ?${markFilter}
+                AND ${JOB_IS_CURRENT_SQL}
               ON CONFLICT(token, subject) DO NOTHING`,
             )
-            .bind(token, ...args, r.lower, r.upper),
+            .bind(token, ...args, r.lower, r.upper, POLICY_JOB_KEY, current),
+          // A stale page inserts no dirty subjects. The token-scoped flush
+          // therefore cannot change hidden state or enqueue recounts either.
           ...flushModerationDirtyStatements(db, config, token),
         ],
         next: r.full ? r.upper : null,
@@ -186,7 +224,7 @@ function recomputeTask(
 function requeueTask(src: string, values: string[] | null): PolicyTask {
   const policy = backfillPolicy(values);
   return {
-    async page(db, cursor, pageSize) {
+    async page(db, cursor, pageSize, current) {
       let phase = 0;
       let position: string | null = null;
       if (cursor === null) {
@@ -205,10 +243,11 @@ function requeueTask(src: string, values: string[] | null): PolicyTask {
               : [
                   db
                     .prepare(
-                      `UPDATE label_backfill_queue SET completed = 0, cursor = NULL, retries = 0, next_attempt_at = 0
-                      WHERE src = ? AND did > ? AND did <= ?`,
+                      `UPDATE label_backfill_queue SET completed = 0, cursor = NULL, retries = 0, next_attempt_at = 0,
+                        generation = generation + 1
+                      WHERE src = ? AND did > ? AND did <= ? AND ${JOB_IS_CURRENT_SQL}`,
                     )
-                    .bind(src, r.lower, r.upper),
+                    .bind(src, r.lower, r.upper, POLICY_JOB_KEY, current),
                 ],
           next: JSON.stringify(r.full ? [0, r.upper] : [1, ""]),
         };
@@ -222,17 +261,20 @@ function requeueTask(src: string, values: string[] | null): PolicyTask {
                 .prepare(
                   `INSERT INTO label_backfill_queue (src, did)
                   SELECT CAST(? AS TEXT), did FROM identities WHERE did > ? AND did <= ?
+                    AND ${JOB_IS_CURRENT_SQL}
                   ON CONFLICT(src, did) DO NOTHING`,
                 )
-                .bind(src, r.lower, r.upper),
+                .bind(src, r.lower, r.upper, POLICY_JOB_KEY, current),
             ];
       if (r.full) return { statements, next: JSON.stringify([1, r.upper]) };
       statements.push(
         db
           .prepare(
-            "INSERT INTO label_backfill_sources (src, policy) VALUES (?, ?) ON CONFLICT(src) DO UPDATE SET policy = excluded.policy",
+            `INSERT INTO label_backfill_sources (src, policy)
+            SELECT CAST(? AS TEXT), CAST(? AS TEXT) WHERE ${JOB_IS_CURRENT_SQL}
+            ON CONFLICT(src) DO UPDATE SET policy = excluded.policy`,
           )
-          .bind(src, policy),
+          .bind(src, policy, POLICY_JOB_KEY, current),
       );
       return { statements, next: null };
     },
@@ -276,13 +318,17 @@ export async function applyModerationPolicy(
   const meta = options.meta ?? (await getMetaValues(db, MODERATION_POLICY_META_KEYS));
   const applied = meta.get(POLICY_APPLIED_KEY) ?? null;
   const job = parseJob(meta.get(POLICY_JOB_KEY) ?? null);
-  if (!job && applied === fp) return;
-  if (job?.fp !== fp) {
+  if (!job && applied === fp && meta.has(POLICY_GENERATION_KEY)) return;
+  if (job?.fp !== fp || !meta.has(POLICY_GENERATION_KEY)) {
     const policy = normalizePolicy(config);
-    const previous = parseApplied(applied);
-    const before = new Map(previous?.sources.map((s) => [s.did, s]));
+    // An unfinished job may already have changed materialized hiding or
+    // pruned labels. A source is unchanged only relative to BOTH the last
+    // completed policy and the interrupted one, including on a revert.
+    const predecessors = [parseApplied(applied)];
+    if (job) predecessors.push(parseApplied(job.fp));
+    const before = predecessors.map((p) => new Map(p?.sources.map((s) => [s.did, s])));
     const unchanged = (did: string, test: (s: NormalizedPolicy["sources"][number]) => boolean) =>
-      !!previous && before.has(did) && test(before.get(did)!);
+      before.every((sources) => sources.has(did) && test(sources.get(did)!));
     const oldModerators = (
       await db
         .prepare("SELECT did FROM moderation_sources WHERE moderator = 1")
@@ -315,6 +361,12 @@ export async function applyModerationPolicy(
       sources.set(did, { moderator: 1, enforced: 1 });
     const known = policy.sources.filter((s) => s.known).map((s) => s.did);
     await db.batch([
+      // Acquire the permanent policy lock and invalidate in-flight backfills
+      // before changing trust or starting any paged queue resets.
+      db.prepare(
+        "INSERT INTO _contrail_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      ).bind(POLICY_GENERATION_KEY, JSON.stringify({ fp, token: crypto.randomUUID() })),
+      lockPolicyJobStatement(db),
       db.prepare("DELETE FROM moderation_sources"),
       ...[...sources].map(([did, s]) =>
         db
@@ -326,6 +378,11 @@ export async function applyModerationPolicy(
             .prepare(`DELETE FROM label_backfill_sources WHERE src NOT IN (${known.map(() => "?").join(",")})`)
             .bind(...known)
         : db.prepare("DELETE FROM label_backfill_sources"),
+      // Pruning may already have removed labels even if a replacement reverts
+      // to the completed policy. Force known-source backfill to recover them.
+      ...known
+        .filter((src) => next.prune.includes(src) || next.purge.includes(src))
+        .map((src) => db.prepare("DELETE FROM label_backfill_sources WHERE src = ?").bind(src)),
       db
         .prepare(
           "INSERT INTO _contrail_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -341,8 +398,9 @@ export async function applyModerationPolicy(
 }
 
 /** Advance the pending policy job by bounded pages. Each page's work and the
- * job checkpoint commit together; a compare-and-set checkpoint stops a runner
- * whose job was replaced by a newer policy. Returns the pages committed. */
+ * job checkpoint commit together. Every mutation is conditional on owning the
+ * current checkpoint, under the job row lock, so superseded/concurrent runners
+ * cannot commit stale work. Returns the pages attempted. */
 export async function runModerationPolicyJob(
   db: Database,
   config: ContrailConfig,
@@ -361,6 +419,8 @@ export async function runModerationPolicyJob(
   while (pages < maxPages && Date.now() < deadline) {
     if (job.task >= tasks.length) {
       await db.batch([
+        lockModerationPolicyStatement(db),
+        lockPolicyJobStatement(db),
         db
           .prepare(
             `INSERT INTO _contrail_meta (key, value) SELECT CAST(? AS TEXT), CAST(? AS TEXT)
@@ -374,13 +434,15 @@ export async function runModerationPolicyJob(
       ]);
       break;
     }
-    const { statements, next } = await tasks[job.task]!.page(db, job.cursor, pageSize);
+    const { statements, next } = await tasks[job.task]!.page(db, job.cursor, pageSize, current);
     const advanced: PolicyJob =
       next === null
         ? { ...job, task: job.task + 1, cursor: null }
         : { ...job, cursor: next };
     const serialized = JSON.stringify(advanced);
     await db.batch([
+      lockModerationPolicyStatement(db),
+      lockPolicyJobStatement(db),
       ...statements,
       db
         .prepare("UPDATE _contrail_meta SET value = ? WHERE key = ? AND value = ?")

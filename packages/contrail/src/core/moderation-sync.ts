@@ -3,21 +3,33 @@ import { parseResourceUri } from "@atcute/lexicons/syntax";
 import type { ContrailConfig, Database, IngestEvent } from "./types";
 import { recordsTableName, resolveCollectionKey } from "./types";
 import { getPDS } from "./client";
-import { MODERATION_ACTION_NSID, parseModerationAction } from "./moderation";
+import { MODERATION_ACTION_NSID, moderationLockStatements, parseModerationAction } from "./moderation";
 import { createIngestEvent, ingestRecords } from "./ingest";
 import { childRecountStatements } from "./db/records";
 import { getMeta, setMeta } from "./db/meta";
 import { getLabelerState } from "./labels/resolve";
 import { applyLabels, type IncomingLabel } from "./labels/apply";
-import { runModerationPolicyJob } from "./moderation-policy";
+import {
+  getModerationPolicyGeneration,
+  lockModerationPolicyStatement,
+  moderationPolicyGenerationSql,
+  runModerationPolicyJob,
+} from "./moderation-policy";
 
 const LAST_RECONCILED_MODERATOR_KEY = "moderation_last_attempted_moderator";
+/** Per-moderator listRecords cursor of a sweep paused by its budget. */
+const RECONCILE_CURSOR_PREFIX = "moderation_reconcile_cursor:";
+const MAX_RECONCILE_RECORDS = 1000;
+const MAX_RECONCILE_PAGES = 10;
 
-/** Small moderator repositories are reconciled from a COMPLETE listing only.
- * A partial page, timeout or malformed response never retracts local actions.
- * Pagination and total work are bounded; large repos need a dedicated source.
- * Persist the last attempt so timeouts cannot starve later moderators, even
- * across scheduled invocations in different Worker isolates. */
+/** Missed deletions are retracted only from a COMPLETE listing fetched within
+ * one cycle. A partial page, timeout or malformed response never retracts
+ * local actions. Pagination and work per cycle are bounded: a listing that
+ * exceeds the budget applies the creates/updates seen so far and resumes from
+ * a durable cursor next cycle, so large repos still converge on changes (their
+ * deletions rely on live ingestion and fail closed). Persist the last attempt
+ * so timeouts cannot starve later moderators, even across scheduled
+ * invocations in different Worker isolates. */
 export async function reconcileModeratorActions(
   db: Database,
   config: ContrailConfig,
@@ -36,7 +48,10 @@ export async function reconcileModeratorActions(
     // A single moderator needs no scheduling metadata writes.
     if (moderators.length > 1)
       await setMeta(db, LAST_RECONCILED_MODERATOR_KEY, did);
+    const cursorKey = `${RECONCILE_CURSOR_PREFIX}${did}`;
+    let resumed: string | undefined;
     try {
+      resumed = (await getMeta(db, cursorKey)) ?? undefined;
       const timeUs = Date.now() * 1000;
       const pds = await getPDS(
         did as Did,
@@ -49,11 +64,20 @@ export async function reconcileModeratorActions(
         string,
         { uri: string; cid: string; value: unknown }
       >();
-      let cursor: string | undefined;
-      const cursors = new Set<string>();
+      let cursor = resumed;
+      const cursors = new Set<string>(resumed ? [resumed] : []);
+      let pages = 0;
+      let paused = false;
       do {
-        if (Date.now() >= deadline || records.size >= 1000)
-          throw new Error("Moderator listing budget exceeded");
+        if (
+          Date.now() >= deadline ||
+          records.size >= MAX_RECONCILE_RECORDS ||
+          pages >= MAX_RECONCILE_PAGES
+        ) {
+          paused = true;
+          break;
+        }
+        pages++;
         const url = new URL("/xrpc/com.atproto.repo.listRecords", pds);
         url.searchParams.set("repo", did);
         url.searchParams.set("collection", MODERATION_ACTION_NSID);
@@ -85,10 +109,14 @@ export async function reconcileModeratorActions(
           if (typeof cursor !== "string" || cursors.has(cursor))
             throw new Error("Invalid moderator cursor");
           cursors.add(cursor);
-          if (cursors.size >= 10)
-            throw new Error("Moderator listing page budget exceeded");
         }
       } while (cursor);
+      // Deletions can only be inferred from one complete, fresh listing.
+      const complete = !paused && !resumed;
+      if (paused && !resumed && records.size >= MAX_RECONCILE_RECORDS)
+        (config.logger ?? console).warn(
+          `[moderation] ${did} has more than ${MAX_RECONCILE_RECORDS} actions; reconciling across cycles. Missed deletions are only applied from live ingestion.`,
+        );
       // Only send what differs from local state: unchanged actions cost no
       // writes, so a frequent reconcile stays cheap.
       const table = recordsTableName(
@@ -122,7 +150,7 @@ export async function reconcileModeratorActions(
           }),
         );
       }
-      for (const uri of local.keys())
+      if (complete) for (const uri of local.keys())
         if (!records.has(uri))
           events.push(
             createIngestEvent({
@@ -135,15 +163,47 @@ export async function reconcileModeratorActions(
               source: { id: "pds-moderation", time_us: timeUs },
             }),
           );
+      // The sweep position commits with the changes it covers.
+      const progress =
+        paused && cursor !== resumed
+          ? [
+              db
+                .prepare(
+                  "INSERT INTO _contrail_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                )
+                .bind(cursorKey, cursor),
+            ]
+          : !paused && resumed
+            ? [db.prepare("DELETE FROM _contrail_meta WHERE key = ?").bind(cursorKey)]
+            : [];
       // One atomic listing: updates and missed deletions change labels together.
       if (events.length)
-        await ingestRecords(db, events, config, { phase: "historical" });
+        await ingestRecords(db, events, config, {
+          phase: "historical",
+          trailingStatements: progress,
+        });
+      else if (progress.length) await db.batch(progress);
     } catch (error) {
+      // A stale or rejected resume cursor must not wedge the sweep: restart.
+      if (resumed)
+        await db
+          .prepare("DELETE FROM _contrail_meta WHERE key = ? AND value = ?")
+          .bind(cursorKey, resumed)
+          .run()
+          .catch(() => {});
       (config.logger ?? console).warn(
         `[moderation] reconcile ${did} failed: ${error}`,
       );
     }
   }
+}
+
+interface LabelBackfillRow {
+  src: string;
+  did: string;
+  cursor: string | null;
+  retries: number;
+  generation: number;
 }
 
 /** One queryLabels page per queue item, fetched with bounded concurrency
@@ -162,26 +222,23 @@ export async function runLabelBackfillQueue(
       .map((s) => [s.did, s]),
   );
   if (!sources.size) return 0;
+  const policyGeneration = await getModerationPolicyGeneration(db, config);
+  if (!policyGeneration) return 0;
   const rows = await db
     .prepare(
-      `SELECT src, did, cursor, retries FROM label_backfill_queue
+      `SELECT src, did, cursor, retries, generation FROM label_backfill_queue
     WHERE completed = 0 AND next_attempt_at <= ? AND src IN (${[...sources].map(() => "?").join(",")})
     ORDER BY next_attempt_at, src, did LIMIT ?`,
     )
     .bind(Date.now(), ...sources.keys(), maxItems)
-    .all<{
-      src: string;
-      did: string;
-      cursor: string | null;
-      retries: number;
-    }>();
+    .all<LabelBackfillRow>();
   const queue = [...rows.results];
   let attempted = 0;
   const worker = async () => {
     for (let row = queue.shift(); row; row = queue.shift()) {
       if (Date.now() >= deadline) return;
       attempted++;
-      await backfillOne(db, config, sources.get(row.src)!, row, deadline);
+      await backfillOne(db, config, sources.get(row.src)!, row, policyGeneration, deadline);
     }
   };
   await Promise.all(
@@ -194,9 +251,26 @@ async function backfillOne(
   db: Database,
   config: ContrailConfig,
   source: NonNullable<ContrailConfig["labels"]>["sources"][number],
-  row: { src: string; did: string; cursor: string | null; retries: number },
+  row: LabelBackfillRow,
+  policyGeneration: string,
   deadline: number,
 ): Promise<void> {
+  const queueGuard = `src = ? AND did = ? AND generation = ? AND completed = 0
+    AND ${moderationPolicyGenerationSql()}`;
+  const guardArgs = [row.src, row.did, row.generation, policyGeneration];
+  const writeGuard = {
+    sql: `EXISTS (SELECT 1 FROM label_backfill_queue WHERE ${queueGuard})`,
+    bindings: guardArgs,
+  };
+  // Consistent lock order: policy -> moderation -> queue. Each following
+  // statement gets a fresh PostgreSQL snapshot; SQLite/D1 serialize batches.
+  // The queue lock also serializes first-identity resets with this commit.
+  const locks = () => [
+    lockModerationPolicyStatement(db),
+    ...moderationLockStatements(db),
+    db.prepare("UPDATE label_backfill_queue SET generation = generation WHERE src = ? AND did = ?")
+      .bind(row.src, row.did),
+  ];
   try {
     const state = await getLabelerState(db, row.src, source.endpoint, {
       ...config.networkOverrides,
@@ -235,25 +309,28 @@ async function backfillOne(
       source,
       config,
       knownDids: new Set([row.did]),
+      leadingStatements: locks(),
+      writeGuard,
       trailingStatements: [
         db
           .prepare(
-            "UPDATE label_backfill_queue SET cursor = ?, completed = ?, retries = 0, next_attempt_at = 0 WHERE src = ? AND did = ?",
+            `UPDATE label_backfill_queue SET cursor = ?, completed = ?, retries = 0, next_attempt_at = 0,
+              generation = generation + 1 WHERE ${queueGuard}`,
           )
-          .bind(data.cursor ?? null, data.cursor ? 0 : 1, row.src, row.did),
+          .bind(data.cursor ?? null, data.cursor ? 0 : 1, ...guardArgs),
       ],
     });
   } catch (error) {
-    await db
-      .prepare(
-        "UPDATE label_backfill_queue SET retries = retries + 1, next_attempt_at = ? WHERE src = ? AND did = ?",
-      )
-      .bind(
+    await db.batch([
+      ...locks(),
+      db.prepare(
+        `UPDATE label_backfill_queue SET retries = retries + 1, next_attempt_at = ?,
+          generation = generation + 1 WHERE ${queueGuard}`,
+      ).bind(
         Date.now() + Math.min(3_600_000, 30_000 * 2 ** Math.min(row.retries, 7)),
-        row.src,
-        row.did,
-      )
-      .run();
+        ...guardArgs,
+      ),
+    ]);
     (config.logger ?? console).warn(
       `[labels] first-seen backfill ${row.did} failed: ${error}`,
     );

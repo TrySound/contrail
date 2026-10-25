@@ -82,7 +82,11 @@ Only actions whose CID differs from the indexed one, and missed deletions, are
 written: unchanged actions cost reads only. With multiple moderators, a durable
 last-attempt checkpoint rotates the next cycle's starting moderator so a slow or
 unavailable repository cannot starve the others. Incomplete listings, failed
-pages and timeouts never infer deletions. Live actions enter the same source-ordering/projector as app records.
+pages and timeouts never infer deletions. A listing larger than one cycle's
+budget (1000 actions or 10 pages) applies the creates/updates seen so far and
+resumes from a durable cursor in the next cycle. Such repositories converge on
+changes, but their missed deletions are only applied by live ingestion: a missed
+undo keeps the subject hidden (fail closed). Live actions enter the same source-ordering/projector as app records.
 Action records remain independent assertions in `moderation_actions` and are
 exposed as labels through `moderation_effective_labels`. CID pins and expiry
 are evaluated per action: a newer expired or differently pinned action cannot
@@ -98,7 +102,12 @@ identity at that rate. The first identity write rechecks an earlier record-only
 backfill; routine refreshes do not restart completed work. Changing a source's
 value allowlist resets its historical query checkpoints and drops stored values
 no longer admitted. Labels and each page checkpoint commit together, with
-bounded work and durable retries. The labeler must support the standard DID
+bounded work and durable retries. Policy and queue generations are checked
+inside that transaction: an old response cannot reinsert a pruned value, complete
+a newly reset backfill, or overwrite another worker's progress. Reverting a
+policy also invalidates its earlier in-flight requests. Schema version 16 adds
+the queue generation column during initialization, before policy maintenance.
+The labeler must support the standard DID
 and trailing-`*` URI patterns; observe real results/pagination before rollout.
 
 ### Policy changes
@@ -113,6 +122,20 @@ finish in the following moderation cycles. Until then, materialized hiding can
 lag: content of a removed moderator or no-longer-enforced value stays hidden,
 and stored hide labels of a newly enforced source are not yet applied. A
 newer policy, including a revert, replaces an unfinished job.
+
+Live label subscriptions also capture the policy generation before connecting.
+Their label writes, hidden-state updates and cursor checkpoints (including
+cursor resets) check that generation in the same transaction. An obsolete
+subscription closes without advancing the cursor and does not reconnect under
+its old configuration. A fresh subscription can replay from the saved cursor;
+a policy revert still invalidates sockets opened before the change.
+
+`ingest()` and `runPersistent()` initialize, and so apply policy, once per
+`Contrail` instance and database, not on every tick. Contrail cannot tell a
+revert from an older deployment, so the last process to start wins. During a
+gradual rollout that changes moderation policy, old and new versions replace
+each other's job whenever an instance or isolate starts. Finish such rollouts
+promptly; trust can flip between the two policies until they do.
 
 ### Overrides
 
@@ -145,15 +168,17 @@ record). Both active and inactive events for such an actor store state and
 ordering checkpoints, so a delayed inactive event cannot undo a newer initial
 active event. Later events update the stored row. Network-wide account traffic
 for unknown DIDs writes
-nothing. An actor that is already inactive cannot publish new records; the
+nothing, and is dropped before it spends ingest budgets: scheduled drains look
+up unseen actors in batches of 100, and persistent ingestion filters each flush
+with one lookup and flushes account events on its timer. An actor that is already inactive cannot publish new records; the
 remaining gap is a repo backfilled later from a PDS that still serves it.
 `active: false` hides the actor, including unknown inactive status values.
 `deleted`, `deactivated`, `takendown`, and `suspended` are hidden states.
 Duplicate/stale events cannot undo newer state. Lifecycle state and the live
 source checkpoint commit in the same transaction, including account-only
 batches and retrying persistent flushes. Scheduled drains keep the newest event
-per actor and stop at `maxAccountUpdates` distinct actors (default 500), which
-is separate from the record `maxCandidates` budget.
+per actor and stop at `maxAccountUpdates` distinct known actors (default 500),
+which is separate from the record `maxCandidates` budget.
 
 Reactivation restores retained data unless another action/label still hides it.
 Deletion currently retains data invisibly; it is **not** interpreted as an
@@ -177,7 +202,9 @@ Time is stored rather than swept: each row hides only while
 needs no cron. Visibility checks are indexed point lookups per returned row.
 
 Stored relation counts are public counts: they exclude hidden children whenever
-a parent is recounted. When a subject's visibility changes, or reaches a stored
+a parent is recounted. Recomputing a subject without changing its visible
+hidden rows (a routine active event, a second hide reason, a policy recheck)
+queues nothing. When a subject's visibility changes, or reaches a stored
 `starts_at`/`exp` boundary, its affected parents are queued in
 `moderation_recount_queue` and recounted in bounded pages by the moderation
 cycle. Counts, count filters, sorts and cursors all use the same stored columns
@@ -186,7 +213,10 @@ and stay mutually consistent. They can lag a takedown by one cycle.
 Built-in queries and pipeline queries enforce policy. Custom raw-SQL handlers
 must include `visibleRecordSql(alias)`; Contrail cannot rewrite arbitrary
 application SQL. A hidden getRecord/getProfile returns the same 404 as a missing
-subject.
+subject. A record-scoped hide on a configured profile URI suppresses PDS
+read-through and identity-only fallback entries; other visible profile
+collections may still be returned. CID-pinned hides match only the indexed
+profile version.
 
 ## Private reports
 
@@ -195,6 +225,9 @@ fragmented audience:
 
 - `com.atproto.moderation.createReport`: standard repoRef/strongRef subject and
   standard reason types. Request bodies have byte and read-time limits.
+  The subject must be indexed by the instance: a known account, or a record in
+  a configured collection (hidden subjects stay reportable). Anything else is
+  rejected without spending quota.
   Ten reports per reporter per one-hour quota window.
   Bounded request bodies and notes. Returns a standard integer report ID.
 - `<namespace>.moderation.listReports`: moderator-only, open/resolved filtering,
@@ -294,7 +327,11 @@ old protection. No account action should be published without operator review.
 
 Purge app-owned image, OG-image and CDN caches when hiding a subject. The
 record-only transactional change log does not currently emit lifecycle or
-external-label changes; do not treat it as a complete purge signal. Configure
+external-label changes; do not treat it as a complete purge signal. Change
+delivery and current-state bootstrap are **not** moderation-filtered either:
+consumers still receive new and edited records of hidden actors and records.
+A consumer that republishes content (search, feeds, mirrors) must apply its own
+visibility check before serving it. Configure
 app purge hooks/short cache lifetimes until dedicated moderation notifications
 are available. Illegal content may require deletion, PDS/operator escalation
 and reporting to the appropriate authorities, not just a UI hide. Do not keep

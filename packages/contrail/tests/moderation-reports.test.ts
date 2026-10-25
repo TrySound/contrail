@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { Secp256k1PrivateKeyExportable } from "@atcute/crypto";
 import { createServiceJwt } from "@atcute/xrpc-server/auth";
 import type { AtprotoAudience, Did, Nsid } from "@atcute/lexicons/syntax";
@@ -48,6 +48,11 @@ async function setup() {
   });
   const db = createTestDb();
   await initSchema(db, config);
+  // Reports are only accepted for subjects the instance indexes.
+  await db
+    .prepare("INSERT INTO identities (did, pds, resolved_at) VALUES (?, ?, ?)")
+    .bind(reporter, "https://pds.example", Date.now())
+    .run();
   return { config, db, app: createApp(db, config) };
 }
 async function request(
@@ -301,6 +306,45 @@ describe("private moderation reports", () => {
     expect(
       (await db.prepare("SELECT * FROM moderation_reports").all()).results,
     ).toHaveLength(10);
+  });
+  it("rejects subjects this instance does not index without consuming quota", async () => {
+    const { app, db } = await setup();
+    for (const subject of [
+      { $type: "com.atproto.admin.defs#repoRef", did: "did:plc:cccccccccccccccccccccccc" },
+      {
+        $type: "com.atproto.repo.strongRef",
+        uri: `at://${reporter}/com.example.unindexed/a`,
+        cid: "bafyreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy",
+      },
+    ]) {
+      const response = await request(app, "com.atproto.moderation.createReport", reporter, {
+        ...report,
+        subject,
+      });
+      expect(response.status).toBe(400);
+    }
+    expect((await db.prepare("SELECT * FROM moderation_report_limits").all()).results).toEqual([]);
+  });
+  it("retries a colliding random report ID instead of failing", async () => {
+    const { app, db } = await setup();
+    const random = crypto.getRandomValues.bind(crypto);
+    let calls = 0;
+    const spy = vi.spyOn(crypto, "getRandomValues").mockImplementation(((array: Uint8Array) => {
+      // Report IDs use 6-byte arrays; the first two reports draw the same ID.
+      if (array.length !== 6) return random(array);
+      array.fill(calls++ < 2 ? 1 : 2);
+      return array;
+    }) as typeof crypto.getRandomValues);
+    try {
+      for (let i = 0; i < 2; i++)
+        expect((await request(app, "com.atproto.moderation.createReport", reporter, report)).status).toBe(200);
+    } finally {
+      spy.mockRestore();
+    }
+    expect((await db.prepare("SELECT * FROM moderation_reports").all()).results).toHaveLength(2);
+    expect(
+      (await db.prepare("SELECT used FROM moderation_report_limits").first<{ used: number }>())!.used,
+    ).toBe(2);
   });
   it("paginates stable equal-time reports and rejects bad cursor/unknown resolution", async () => {
     const { app, db } = await setup();

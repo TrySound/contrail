@@ -23,7 +23,7 @@ import {
   maybeOptimize,
 } from "./jetstream";
 import type { IngestState } from "./jetstream";
-import { accountUpdateStatements, type AccountUpdate } from "./moderation";
+import { accountUpdateStatements, knownAccountDids, type AccountUpdate } from "./moderation";
 
 /** How often the long-lived persistent loop runs a bounded feed sweep. The
  *  process stays resident, so this in-memory throttle is reliable here (unlike
@@ -184,7 +184,29 @@ async function streamAndFlush(
   }
 
   const buffer: IngestEvent[] = [];
-  const accountBuffer: AccountUpdate[] = [];
+  // Newest account event per actor; stored state only depends on the newest.
+  const accountBuffer = new Map<string, AccountUpdate>();
+  const bufferAccount = (update: AccountUpdate) => {
+    const prior = accountBuffer.get(update.did);
+    if (prior && prior.cursor >= update.cursor) return;
+    accountBuffer.delete(update.did);
+    accountBuffer.set(update.did, update);
+  };
+  /** Drop network-wide account traffic for actors this instance holds no data
+   * for before it costs SQL. Batch authors stay: their records commit first. */
+  const relevantAccounts = async (
+    updates: AccountUpdate[],
+    batch: IngestEvent[],
+  ): Promise<AccountUpdate[]> => {
+    const local = new Set(batch.map((event) => event.did));
+    const unresolved = updates
+      .map((u) => u.did)
+      .filter((did) => !local.has(did) && !knownDids?.has(did));
+    const known = await knownAccountDids(db, config, unresolved);
+    return updates.filter(
+      (u) => local.has(u.did) || knownDids?.has(u.did) || known.has(u.did),
+    );
+  };
   // Highest fully handled v2 seq not yet committed. This includes identity
   // events, so a commit-quiet stream still advances and does not replay global
   // identity traffic forever after restart.
@@ -197,20 +219,22 @@ async function streamAndFlush(
   const flushWork = async () => {
     const checkpoint = pendingCursor;
     if (checkpoint !== null) pendingCursor = null;
-    if (buffer.length > 0 || accountBuffer.length > 0) {
+    if (buffer.length > 0 || accountBuffer.size > 0) {
       const batch = buffer.splice(0);
-      const accountBatch = accountBuffer.splice(0);
+      const accountBatch = [...accountBuffer.values()];
+      accountBuffer.clear();
       const lastCursor = Math.max(
         checkpoint ?? 0,
         ...batch.map((event) => Number(event.source?.cursor)),
       );
       let ingestResult: Awaited<ReturnType<typeof ingestRecords>>;
       try {
+        const accounts = await relevantAccounts(accountBatch, batch);
         ingestResult = await ingestRecords(db, batch, config, {
           phase: "live",
           knownDids,
           trailingStatements: [
-            ...accountUpdateStatements(db, accountBatch, config),
+            ...accountUpdateStatements(db, accounts, config),
             saveJetstreamCursorStatement(db, lastCursor),
             ...(config.orderedSource
               ? [
@@ -228,7 +252,7 @@ async function streamAndFlush(
         // The cursor transaction failed, so keep this exact batch at the front
         // for the timer's next attempt rather than losing it in memory.
         buffer.unshift(...batch);
-        accountBuffer.unshift(...accountBatch);
+        for (const update of accountBatch) bufferAccount(update);
         pendingCursor = Math.max(pendingCursor ?? 0, lastCursor);
         throw error;
       }
@@ -408,7 +432,7 @@ async function streamAndFlush(
           }),
         );
       } else if (event.kind === "account") {
-        accountBuffer.push({
+        bufferAccount({
           did: event.did,
           active: event.account.active,
           status: event.account.status,
@@ -428,7 +452,9 @@ async function streamAndFlush(
 
       pendingCursor = Math.max(pendingCursor ?? 0, event.seq);
 
-      if (buffer.length + accountBuffer.length >= batchSize) {
+      // Account events are mostly unrelated network traffic; flush them on the
+      // timer unless enough distinct actors accumulate to bound memory.
+      if (buffer.length >= batchSize || accountBuffer.size >= batchSize * 10) {
         await flush();
       }
     }

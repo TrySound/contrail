@@ -1,4 +1,4 @@
-import { isDid, parseResourceUri } from "@atcute/lexicons/syntax";
+import { isCid, isDid, parseResourceUri } from "@atcute/lexicons/syntax";
 import type {
   ContrailConfig,
   Database,
@@ -82,7 +82,10 @@ export function parseModerationAction(value: unknown): ModerationAction | null {
     return null;
   if (
     r.subjectCid !== undefined &&
-    (typeof r.subjectCid !== "string" || !r.subject.startsWith("at://"))
+    (typeof r.subjectCid !== "string" ||
+      r.subjectCid.length > 256 ||
+      !isCid(r.subjectCid) ||
+      !r.subject.startsWith("at://"))
   )
     return null;
   if (
@@ -116,6 +119,20 @@ const HIDDEN_ACCOUNT_SQL = `(active = 0 OR status IN (${HIDDEN_ACCOUNT_STATUSES.
 /** Serializes PostgreSQL hidden-state recomputation (SQLite/D1 batches are
  * already serialized). */
 const PG_MODERATION_LOCK = 0x6d6f64;
+
+/** Acquire before queue-row locks as well as hidden-state writes, matching
+ * action projection's moderation-lock -> enqueue order on PostgreSQL. */
+export function moderationLockStatements(db: Database): Statement[] {
+  return isPostgresDialect(getDialect(db))
+    ? [db.prepare(`SELECT pg_advisory_xact_lock(${PG_MODERATION_LOCK})`)]
+    : [];
+}
+
+/** SQL predicate evaluated inside the same write transaction as its writes. */
+export interface ModerationWriteGuard {
+  sql: string;
+  bindings: unknown[];
+}
 
 export function buildModerationSchema(d: SqlDialect): string[] {
   const pg = isPostgresDialect(d);
@@ -167,6 +184,13 @@ export function buildModerationSchema(d: SqlDialect): string[] {
     `CREATE TABLE IF NOT EXISTS moderation_dirty (
       token TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY (token, subject)
     )`,
+    // Pre-recompute hidden rows of dirty subjects, cleared in the same batch.
+    // Only subjects whose visibility actually changed are recounted.
+    `CREATE TABLE IF NOT EXISTS moderation_hidden_snapshot (
+      token TEXT NOT NULL, subject TEXT NOT NULL, cid TEXT NOT NULL,
+      starts_at ${d.bigintType}, exp ${d.bigintType}
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_moderation_hidden_snapshot_token ON moderation_hidden_snapshot(token)`,
     // Stored relation counts exclude hidden children; visibility changes
     // (including future expiry boundaries) recount affected parents here.
     `CREATE TABLE IF NOT EXISTS moderation_recount_queue (
@@ -185,6 +209,7 @@ export function buildModerationSchema(d: SqlDialect): string[] {
     `CREATE TABLE IF NOT EXISTS label_backfill_queue (
       src TEXT NOT NULL, did TEXT NOT NULL, cursor TEXT, completed INTEGER NOT NULL DEFAULT 0,
       retries INTEGER NOT NULL DEFAULT 0, next_attempt_at ${d.bigintType} NOT NULL DEFAULT 0,
+      generation INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (src, did)
     )`,
     `CREATE INDEX IF NOT EXISTS idx_label_backfill_pending ON label_backfill_queue(completed, next_attempt_at)`,
@@ -288,6 +313,7 @@ export function markModerationDirtyStatements(
   db: Database,
   token: string,
   subjects: Iterable<string>,
+  guard?: ModerationWriteGuard,
 ): Statement[] {
   const unique = [...new Set(subjects)];
   const out: Statement[] = [];
@@ -296,10 +322,11 @@ export function markModerationDirtyStatements(
     out.push(
       db
         .prepare(
-          `INSERT INTO moderation_dirty (token, subject) VALUES ${chunk.map(() => "(?, ?)").join(", ")}
+          `INSERT INTO moderation_dirty (token, subject)
+          ${guard ? "SELECT * FROM (" : ""}VALUES ${chunk.map(() => "(?, ?)").join(", ")}${guard ? `) AS dirty_subjects WHERE ${guard.sql}` : ""}
           ON CONFLICT(token, subject) DO NOTHING`,
         )
-        .bind(...chunk.flatMap((subject) => [token, subject])),
+        .bind(...chunk.flatMap((subject) => [token, subject]), ...(guard?.bindings ?? [])),
     );
   }
   return out;
@@ -314,17 +341,23 @@ export function flushModerationDirtyStatements(
   config: ContrailConfig | undefined,
   token: string,
 ): Statement[] {
-  const d = getDialect(db);
   const now = nowSeconds();
   const dirty = (column: string) =>
     `${column} IN (SELECT subject FROM moderation_dirty WHERE token = ?)`;
   const suppressing = `FROM moderation_overrides o
     JOIN moderation_sources m ON m.did = o.moderator AND m.moderator = 1
     WHERE ${overrideSuppressesSql("o", "l")} AND s.moderator = 0`;
-  const statements: Statement[] = [];
-  if (isPostgresDialect(d))
+  const statements = moderationLockStatements(db);
+  const recount = !!config && hasCountedRelations(config);
+  if (recount)
     statements.push(
-      db.prepare(`SELECT pg_advisory_xact_lock(${PG_MODERATION_LOCK})`),
+      db
+        .prepare(
+          `INSERT INTO moderation_hidden_snapshot (token, subject, cid, starts_at, exp)
+          SELECT CAST(? AS TEXT), subject, cid, starts_at, exp FROM moderation_hidden
+          WHERE ${dirty("subject")}`,
+        )
+        .bind(token, token),
     );
   statements.push(
     db.prepare(`DELETE FROM moderation_hidden WHERE ${dirty("subject")}`).bind(token),
@@ -361,15 +394,36 @@ export function flushModerationDirtyStatements(
       )
       .bind(token),
   );
-  if (config && hasCountedRelations(config)) {
+  if (recount) {
+    // Kinds collapse: only the set of (cid, time bounds) affects visibility.
+    // Unchanged subjects (routine account events, policy rechecks) would
+    // otherwise page through every child record for nothing.
+    const changed = `${token}:changed`;
+    const rows = (from: string, where: string) =>
+      `SELECT subject, cid, starts_at, exp FROM ${from} WHERE ${where}`;
     statements.push(
+      db
+        .prepare(
+          `INSERT INTO moderation_dirty (token, subject)
+          SELECT CAST(? AS TEXT), subject FROM (
+            ${rows("moderation_hidden", dirty("subject"))}
+            EXCEPT ${rows("moderation_hidden_snapshot", "token = ?")}
+          ) AS added WHERE true
+          UNION
+          SELECT CAST(? AS TEXT), subject FROM (
+            ${rows("moderation_hidden_snapshot", "token = ?")}
+            EXCEPT ${rows("moderation_hidden", dirty("subject"))}
+          ) AS removed WHERE true
+          ON CONFLICT(token, subject) DO NOTHING`,
+        )
+        .bind(changed, token, token, changed, token, token),
       db
         .prepare(
           `INSERT INTO moderation_recount_queue (subject, due_at, cursor)
           SELECT subject, 0, NULL FROM moderation_dirty WHERE token = ?
           ON CONFLICT(subject, due_at) DO UPDATE SET cursor = NULL`,
         )
-        .bind(token),
+        .bind(changed),
     );
     for (const column of ["starts_at", "exp"])
       statements.push(
@@ -380,8 +434,12 @@ export function flushModerationDirtyStatements(
             WHERE ${column} > ? AND ${dirty("subject")}
             ON CONFLICT(subject, due_at) DO NOTHING`,
           )
-          .bind(now, token),
+          .bind(now, changed),
       );
+    statements.push(
+      db.prepare("DELETE FROM moderation_hidden_snapshot WHERE token = ?").bind(token),
+      db.prepare("DELETE FROM moderation_dirty WHERE token = ?").bind(changed),
+    );
   }
   statements.push(
     db.prepare("DELETE FROM moderation_dirty WHERE token = ?").bind(token),
@@ -394,12 +452,13 @@ export function recomputeModerationStatements(
   db: Database,
   config: ContrailConfig | undefined,
   subjects: Iterable<string>,
+  guard?: ModerationWriteGuard,
 ): Statement[] {
   const marks = [...new Set(subjects)];
   if (!marks.length) return [];
   const token = moderationDirtyToken();
   return [
-    ...markModerationDirtyStatements(db, token, marks),
+    ...markModerationDirtyStatements(db, token, marks, guard),
     ...flushModerationDirtyStatements(db, config, token),
   ];
 }
@@ -421,7 +480,8 @@ export function labelBackfillEnqueueStatements(
           `INSERT INTO label_backfill_queue (src, did) VALUES (?, ?) ON CONFLICT(src, did)
             ${
               identityDiscovery
-                ? `DO UPDATE SET completed = 0, cursor = NULL, retries = 0, next_attempt_at = 0
+                ? `DO UPDATE SET completed = 0, cursor = NULL, retries = 0, next_attempt_at = 0,
+                  generation = label_backfill_queue.generation + 1
               WHERE NOT EXISTS (SELECT 1 FROM identities WHERE did = excluded.did)`
                 : "DO NOTHING"
             }`,
@@ -429,6 +489,35 @@ export function labelBackfillEnqueueStatements(
         .bind(s.did, did),
     ),
   );
+}
+
+/** The subset of `dids` whose account events `accountUpdateStatements` would
+ * store. Lets ingestion drop network-wide account traffic before it consumes
+ * buffer/budget or SQL. The statements keep the same check authoritatively. */
+export async function knownAccountDids(
+  db: Database,
+  config: ContrailConfig,
+  dids: Iterable<string>,
+): Promise<Set<string>> {
+  const known = new Set<string>();
+  let pending = [...new Set(dids)];
+  const tables = [
+    "account_state",
+    "identities",
+    ...Object.keys(config.collections).map(recordsTableName),
+  ];
+  for (const table of tables) {
+    if (!pending.length) break;
+    const rows = await batchedInQuery<{ did: string }>(
+      db,
+      `SELECT DISTINCT did FROM ${table} WHERE did IN (__IN__)`,
+      [],
+      pending,
+    );
+    for (const row of rows) known.add(row.did);
+    pending = pending.filter((did) => !known.has(did));
+  }
+  return known;
 }
 
 /** Account state and the source checkpoint are committed in the same batch.
