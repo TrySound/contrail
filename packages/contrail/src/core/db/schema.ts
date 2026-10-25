@@ -25,7 +25,8 @@ import {
   getSearchableFields,
 } from "../search";
 import { buildLabelsSchema } from "../labels/schema";
-import { buildModerationSchema, moderationPolicyStatements } from "../moderation";
+import { buildModerationSchema } from "../moderation";
+import { applyModerationPolicy, MODERATION_POLICY_META_KEYS } from "../moderation-policy";
 import {
   assertFreshChangeLogGeneration,
   buildChangeLogSchema,
@@ -36,7 +37,7 @@ import {
   canonicalChangeDefinitions,
   changesEnabled,
 } from "../types";
-import { getMeta, setMeta } from "./meta";
+import { getMetaValues, setMeta } from "./meta";
 
 export const CONTRAIL_SCHEMA_VERSION = 15;
 const SCHEMA_FINGERPRINT_KEY = "schema_fingerprint";
@@ -711,7 +712,6 @@ function schemaFingerprint(
     ...buildCountColumns(config),
     ...buildLabelsSchema(dialect),
     ...buildModerationSchema(dialect),
-    JSON.stringify({ moderation: config.moderation, sources: config.labels?.sources }),
     JSON.stringify(MIGRATIONS),
   ]);
 }
@@ -745,9 +745,17 @@ export async function initSchema(
     observation TEXT NOT NULL,
     PRIMARY KEY (time_us, observation)
   )`;
-  const storedFingerprint = await getMeta(db, SCHEMA_FINGERPRINT_KEY);
+  // One steady-state read covers the schema and moderation policy gates.
+  const meta = await getMetaValues(db, [
+    SCHEMA_FINGERPRINT_KEY,
+    ...MODERATION_POLICY_META_KEYS,
+  ]);
+  const storedFingerprint = meta.get(SCHEMA_FINGERPRINT_KEY) ?? null;
 
   if (storedFingerprint === fingerprint) {
+    // Moderation policy has its own fingerprint: editing moderators or label
+    // sources must not rerun DDL or rebuild FTS.
+    await applyModerationPolicy(db, config, { meta });
     for (const apply of options.extraSchemas ?? []) await apply(db);
     return;
   }
@@ -756,6 +764,7 @@ export async function initSchema(
     // deployment through the FTS rebuild path. Upgrade the prior fingerprint
     // directly after its idempotent DDL succeeds.
     await runIdempotentDdl(db, cursorObservationsDdl);
+    await applyModerationPolicy(db, config, { meta });
     for (const apply of options.extraSchemas ?? []) await apply(db);
     await setMeta(db, SCHEMA_FINGERPRINT_KEY, fingerprint);
     return;
@@ -775,7 +784,7 @@ export async function initSchema(
   for (const statement of [...buildLabelsSchema(dialect), ...buildModerationSchema(dialect)]) {
     await runIdempotentDdl(db, statement);
   }
-  await db.batch(moderationPolicyStatements(db, config));
+  await applyModerationPolicy(db, config);
 
   await runIdempotentDdl(db, cursorObservationsDdl);
   await applyFtsTables(db, config, dialect);

@@ -96,8 +96,9 @@ export function parseModerationAction(value: unknown): ModerationAction | null {
   if (
     r.labels !== undefined &&
     (!Array.isArray(r.labels) ||
+      !r.labels.length ||
       r.labels.length > 128 ||
-      r.labels.some((v) => typeof v !== "string" || v.length > 128))
+      r.labels.some((v) => typeof v !== "string" || !v || v.length > 128))
   )
     return null;
   if (
@@ -110,7 +111,7 @@ export function parseModerationAction(value: unknown): ModerationAction | null {
 
 export const HIDE_LABEL_VALUES = ["!hide", "!takedown"] as const;
 const HIDDEN_ACCOUNT_STATUSES = ["deleted", "deactivated", "takendown", "suspended"];
-const HIDE_VALUES_SQL = HIDE_LABEL_VALUES.map((v) => `'${v}'`).join(", ");
+export const HIDE_VALUES_SQL = HIDE_LABEL_VALUES.map((v) => `'${v}'`).join(", ");
 const HIDDEN_ACCOUNT_SQL = `(active = 0 OR status IN (${HIDDEN_ACCOUNT_STATUSES.map((v) => `'${v}'`).join(", ")}))`;
 /** Serializes PostgreSQL hidden-state recomputation (SQLite/D1 batches are
  * already serialized). */
@@ -428,97 +429,6 @@ export function labelBackfillEnqueueStatements(
         .bind(s.did, did),
     ),
   );
-}
-
-export function moderationPolicyStatements(
-  db: Database,
-  config: ContrailConfig,
-): Statement[] {
-  const sources = new Map<string, { moderator: number; enforced: number }>();
-  for (const s of config.labels?.sources ?? [])
-    sources.set(s.did, { moderator: 0, enforced: s.enforce ? 1 : 0 });
-  for (const did of config.moderation?.moderators ?? [])
-    sources.set(did, { moderator: 1, enforced: 1 });
-  const knownSources = (config.labels?.sources ?? []).filter(
-    (s) => s.subjects === "known" && !s.records,
-  );
-  const statements = [
-    // Clean up label summaries written by earlier action projections, including
-    // removed moderators. Actions now supply labels through the effective view.
-    db.prepare("DELETE FROM labels WHERE src IN (SELECT did FROM moderation_sources WHERE moderator = 1)"),
-    ...[...sources].filter(([, s]) => s.moderator).map(([did]) =>
-      db.prepare("DELETE FROM labels WHERE src = ?").bind(did),
-    ),
-    db.prepare("DELETE FROM moderation_sources"),
-    ...[...sources].map(([did, s]) =>
-      db
-        .prepare(
-          "INSERT INTO moderation_sources (did, moderator, enforced) VALUES (?, ?, ?)",
-        )
-        .bind(did, s.moderator, s.enforced),
-    ),
-  ];
-  for (const s of config.labels?.sources ?? []) {
-    if (!s.records && s.values)
-      statements.push(
-        db
-          .prepare(
-            `DELETE FROM labels WHERE src = ?${s.values.length ? ` AND val NOT IN (${s.values.map(() => "?").join(",")})` : ""}`,
-          )
-          .bind(s.did, ...s.values),
-      );
-  }
-  statements.push(
-    knownSources.length
-      ? db
-          .prepare(
-            `DELETE FROM label_backfill_sources WHERE src NOT IN (${knownSources.map(() => "?").join(",")})`,
-          )
-          .bind(...knownSources.map((s) => s.did))
-      : db.prepare("DELETE FROM label_backfill_sources"),
-  );
-  for (const s of knownSources) {
-    const policy = JSON.stringify({
-      values: s.values ? [...s.values].sort() : null,
-    });
-    statements.push(
-      db
-        .prepare(
-          `UPDATE label_backfill_queue SET completed = 0, cursor = NULL, retries = 0, next_attempt_at = 0
-        WHERE src = ? AND NOT EXISTS (SELECT 1 FROM label_backfill_sources WHERE src = ? AND policy = ?)`,
-        )
-        .bind(s.did, s.did, policy),
-      db
-        .prepare(
-          "INSERT INTO label_backfill_sources (src, policy) VALUES (?, ?) ON CONFLICT(src) DO UPDATE SET policy = excluded.policy",
-        )
-        .bind(s.did, policy),
-      db
-        .prepare(
-          "INSERT INTO label_backfill_queue (src, did) SELECT CAST(? AS TEXT), did FROM identities WHERE 1 = 1 ON CONFLICT(src, did) DO NOTHING",
-        )
-        .bind(s.did),
-    );
-  }
-  // Source trust or admitted values changed: recompute every subject that is
-  // or could become hidden. Runs only when the schema fingerprint changes.
-  const token = moderationDirtyToken();
-  for (const select of [
-    "SELECT DISTINCT CAST(? AS TEXT), subject FROM moderation_hidden WHERE 1 = 1",
-    `SELECT DISTINCT CAST(? AS TEXT), uri FROM labels WHERE val IN (${HIDE_VALUES_SQL})`,
-    `SELECT DISTINCT CAST(? AS TEXT), subject FROM moderation_actions WHERE action IN (${HIDE_VALUES_SQL})`,
-    `SELECT DISTINCT CAST(? AS TEXT), did FROM account_state WHERE ${HIDDEN_ACCOUNT_SQL}`,
-  ])
-    statements.push(
-      db
-        .prepare(
-          `INSERT INTO moderation_dirty (token, subject) ${select}
-          ON CONFLICT(token, subject) DO NOTHING`,
-        )
-        .bind(token),
-    );
-  statements.push(...flushModerationDirtyStatements(db, config, token));
-  return statements;
 }
 
 /** Account state and the source checkpoint are committed in the same batch.

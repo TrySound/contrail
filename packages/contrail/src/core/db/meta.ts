@@ -23,6 +23,25 @@ export async function getMeta(db: Database, key: string): Promise<string | null>
   }
 }
 
+/** Read several keys in one query. Tolerant like `getMeta`: any failure
+ * resolves to an empty map. */
+export async function getMetaValues(
+  db: Database,
+  keys: string[]
+): Promise<Map<string, string>> {
+  try {
+    const rows = await db
+      .prepare(
+        `SELECT key, value FROM _contrail_meta WHERE key IN (${keys.map(() => "?").join(", ")})`
+      )
+      .bind(...keys)
+      .all<{ key: string; value: string }>();
+    return new Map(rows.results.map((r) => [r.key, r.value]));
+  } catch {
+    return new Map();
+  }
+}
+
 export async function setMeta(
   db: Database,
   key: string,

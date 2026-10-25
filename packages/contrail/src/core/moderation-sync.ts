@@ -6,19 +6,36 @@ import { getPDS } from "./client";
 import { MODERATION_ACTION_NSID, parseModerationAction } from "./moderation";
 import { createIngestEvent, ingestRecords } from "./ingest";
 import { childRecountStatements } from "./db/records";
+import { getMeta, setMeta } from "./db/meta";
 import { getLabelerState } from "./labels/resolve";
 import { applyLabels, type IncomingLabel } from "./labels/apply";
+import { runModerationPolicyJob } from "./moderation-policy";
+
+const LAST_RECONCILED_MODERATOR_KEY = "moderation_last_attempted_moderator";
 
 /** Small moderator repositories are reconciled from a COMPLETE listing only.
  * A partial page, timeout or malformed response never retracts local actions.
- * Pagination and total work are bounded; large repos need a dedicated source. */
+ * Pagination and total work are bounded; large repos need a dedicated source.
+ * Persist the last attempt so timeouts cannot starve later moderators, even
+ * across scheduled invocations in different Worker isolates. */
 export async function reconcileModeratorActions(
   db: Database,
   config: ContrailConfig,
   deadline = Date.now() + 10_000,
 ): Promise<void> {
-  for (const did of config.moderation?.moderators ?? []) {
+  const moderators = config.moderation?.moderators ?? [];
+  if (!moderators.length || Date.now() >= deadline) return;
+  const last = moderators.length > 1
+    ? await getMeta(db, LAST_RECONCILED_MODERATOR_KEY)
+    : null;
+  const start = (moderators.indexOf(last ?? "") + 1) % moderators.length;
+  for (let offset = 0; offset < moderators.length; offset++) {
     if (Date.now() >= deadline) break;
+    const did = moderators[(start + offset) % moderators.length]!;
+    // Advance before network I/O so failed/interrupted listings rotate too.
+    // A single moderator needs no scheduling metadata writes.
+    if (moderators.length > 1)
+      await setMeta(db, LAST_RECONCILED_MODERATOR_KEY, did);
     try {
       const timeUs = Date.now() * 1000;
       const pds = await getPDS(
@@ -345,16 +362,23 @@ export async function runModerationRecounts(
   return pages;
 }
 
-/** Bounded moderation maintenance for one scheduled tick: moderator action
- * reconciliation, first-seen label backfill and visibility recounts. */
+/** Bounded moderation maintenance for one scheduled tick: pending policy
+ * changes, moderator action reconciliation, first-seen label backfill and
+ * visibility recounts. */
 export async function runModerationCycle(
   db: Database,
   config: ContrailConfig,
   deadline = Date.now() + 10_000,
   options: { reconcile?: boolean } = {},
-): Promise<{ backfilled: number; recountPages: number }> {
+): Promise<{ policyPages: number; backfilled: number; recountPages: number }> {
   const log = config.logger ?? console;
   const step = (ms: number) => Math.min(deadline, Date.now() + ms);
+  let policyPages = 0;
+  try {
+    policyPages = await runModerationPolicyJob(db, config, { deadline: step(3_000) });
+  } catch (error) {
+    log.warn(`[moderation] policy job failed: ${error}`);
+  }
   if (options.reconcile !== false)
     await reconcileModeratorActions(db, config, step(3_000));
   let backfilled = 0;
@@ -369,7 +393,7 @@ export async function runModerationCycle(
   } catch (error) {
     log.warn(`[moderation] recount cycle failed: ${error}`);
   }
-  return { backfilled, recountPages };
+  return { policyPages, backfilled, recountPages };
 }
 
 /** Long-lived equivalent of `runModerationCycle`. Loops immediately while
@@ -385,13 +409,13 @@ export async function runPersistentModeration(
   while (!signal?.aborted) {
     const reconcile = Date.now() - lastReconcile >= idleMs;
     if (reconcile) lastReconcile = Date.now();
-    const { backfilled, recountPages } = await runModerationCycle(
+    const { policyPages, backfilled, recountPages } = await runModerationCycle(
       db,
       config,
       Date.now() + 10_000,
       { reconcile },
     );
-    if (backfilled || recountPages) continue;
+    if (policyPages || backfilled || recountPages) continue;
     await new Promise<void>((resolve) => {
       const finish = () => {
         clearTimeout(timer);

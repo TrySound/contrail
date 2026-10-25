@@ -79,7 +79,9 @@ public at that point. Use the private report inbox for those fields.
 `contrail.ingest()` and `contrail.runPersistent()` reconcile a bounded complete
 PDS listing for each moderator (each cron tick; every 30 s when persistent).
 Only actions whose CID differs from the indexed one, and missed deletions, are
-written: an unchanged repository costs reads only. Incomplete listings, failed
+written: unchanged actions cost reads only. With multiple moderators, a durable
+last-attempt checkpoint rotates the next cycle's starting moderator so a slow or
+unavailable repository cannot starve the others. Incomplete listings, failed
 pages and timeouts never infer deletions. Live actions enter the same source-ordering/projector as app records.
 Action records remain independent assertions in `moderation_actions` and are
 exposed as labels through `moderation_effective_labels`. CID pins and expiry
@@ -99,6 +101,19 @@ no longer admitted. Labels and each page checkpoint commit together, with
 bounded work and durable retries. The labeler must support the standard DID
 and trailing-`*` URI patterns; observe real results/pagination before rollout.
 
+### Policy changes
+
+Moderators and label-source trust (`enforce`, `values`, `subjects`) have their
+own fingerprint, separate from the schema: editing them never reruns DDL or
+rebuilds search indexes. `init()` rewrites the source trust table at once and
+starts a durable paged job that prunes no-longer-admitted labels, recomputes
+hidden state and requeues changed known-subject backfill. `init()` runs a
+short bounded slice inline, so small instances finish immediately; larger ones
+finish in the following moderation cycles. Until then, materialized hiding can
+lag: content of a removed moderator or no-longer-enforced value stays hidden,
+and stored hide labels of a newly enforced source are not yet applied. A
+newer policy, including a revert, replaces an unfinished job.
+
 ### Overrides
 
 ```json
@@ -113,7 +128,8 @@ and trailing-`*` URI patterns; observe real results/pagination before rollout.
 ```
 
 An override suppresses older external labels on that exact subject. Omit `labels`
-for all values, or `src` for all external labelers. Later labels apply again.
+for all values, or `src` for all external labelers; an empty `labels` list or
+empty value is invalid and ignored. Later labels apply again.
 An override with `subjectCid` only suppresses labels pinned to that same CID;
 use an unpinned override for unpinned labels.
 Deleting/expiring the override restores still-active labels. Overrides affect

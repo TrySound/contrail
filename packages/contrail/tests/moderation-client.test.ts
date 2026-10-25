@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { Secp256k1PrivateKeyExportable } from "@atcute/crypto";
 import { createServiceJwt } from "@atcute/xrpc-server/auth";
 import type { Client } from "@atcute/client";
@@ -67,10 +67,46 @@ describe("moderation client", () => {
     expect((options.headers as Record<string, string>).authorization).toBe(
       "Bearer service-token",
     );
-    expect(options.redirect).toBe("error");
+    expect(options.redirect).toBe("manual");
     // Server runtimes get no browser-only options (some reject them).
     expect(options.credentials).toBeUndefined();
     expect(JSON.parse(options.body as string).reason).toBe("private");
+  });
+
+  it.each([301, 302, 303, 307, 308])(
+    "rejects HTTP %s redirects without parsing the body or following them",
+    async (status) => {
+      const { client } = fakeClient();
+      const response = new Response("<html>redirect</html>", {
+        status,
+        headers: { location: "https://elsewhere.example" },
+      });
+      const json = vi.spyOn(response, "json");
+      const fetch = vi.fn(async (_url, init: RequestInit | undefined) => {
+        expect(init?.redirect).toBe("manual");
+        return response;
+      });
+      await expect(listReports({ client, service, fetch })).rejects.toMatchObject({
+        status,
+        error: "RedirectNotAllowed",
+      });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(json).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects opaque browser redirects before reading their inaccessible body", async () => {
+    const { client } = fakeClient();
+    const response = new Response();
+    Object.defineProperties(response, {
+      type: { value: "opaqueredirect" },
+      status: { value: 0 },
+    });
+    const json = vi.spyOn(response, "json");
+    await expect(listReports({
+      client, service, fetch: async () => response,
+    })).rejects.toMatchObject({ status: 0, error: "RedirectNotAllowed" });
+    expect(json).not.toHaveBeenCalled();
   });
 
   it("omits cookies and caching in browsers", async () => {
@@ -151,6 +187,17 @@ describe("moderation client", () => {
       // Extra fields a caller might spread in from a report.
       ...({ reason: "must not leak", notes: "private" } as object),
     });
+    for (const labels of [[], [""]])
+      await expect(
+        createModerationAction({
+          client,
+          did: subject.did,
+          subject: subject.did,
+          action: "override",
+          labels,
+        }),
+      ).rejects.toThrow("Override labels must be nonempty");
+    expect(calls).toHaveLength(1);
     const record = calls[0]!.options.input.record;
     expect(record.reason).toBeUndefined();
     expect(record.notes).toBeUndefined();

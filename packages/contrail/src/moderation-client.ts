@@ -138,7 +138,8 @@ async function call<T>(
   const response = await (options.fetch ?? globalThis.fetch)(url, {
     ...(browserOnly as RequestInit),
     method: options.input === undefined ? "GET" : "POST",
-    redirect: "error",
+    // workerd supports manual/follow only; manual also protects browser JWTs.
+    redirect: "manual",
     headers: {
       authorization: `Bearer ${token.data.token}`,
       ...(options.input === undefined
@@ -150,6 +151,19 @@ async function call<T>(
       : { body: JSON.stringify(options.input) }),
     signal: options.signal,
   });
+  // Browsers expose manual cross-origin redirects as opaque responses (not
+  // included in workerd's Response.type typings). Reject before parsing:
+  // redirect bodies may be HTML or unreadable.
+  if (
+    (response.type as string) === "opaqueredirect" ||
+    (response.status >= 300 && response.status < 400)
+  ) {
+    throw new ModerationRequestError(
+      response.status,
+      "RedirectNotAllowed",
+      "Moderation service redirects are not allowed",
+    );
+  }
   const body = await response.json();
   if (!response.ok) {
     const failure = body as { error?: string; message?: string };
@@ -303,6 +317,9 @@ export async function createModerationAction(options: {
     !options.subject.startsWith("at://did:")
   ) {
     throw new TypeError("Expected a DID or DID-authority record URI");
+  }
+  if (options.labels && (!options.labels.length || options.labels.some((v) => !v))) {
+    throw new TypeError("Override labels must be nonempty; omit them for all values");
   }
   const result = await options.client.post("com.atproto.repo.createRecord", {
     input: {
