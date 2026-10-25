@@ -1,7 +1,7 @@
 import type { Hono } from "hono";
 import type { Database, ContrailConfig, IngestEvent } from "../types";
 import type { ServiceAuthGate } from "../service-auth";
-import { shortNameForNsid, getFeedMutatingNsids } from "../types";
+import { shortNameForNsid } from "../types";
 import { lookupExistingRecords } from "../db/records";
 import { createIngestEvent, ingestRecords, recordTimeUs } from "../ingest";
 import { runGatedFeedPrune } from "../jetstream";
@@ -263,14 +263,10 @@ export async function processNotifyUris(
   // deployment (no jetstream loop) would never sweep. Run the recovery-aware
   // gate on every call, not only when records changed: a notify-only deployment
   // that receives no-op notifications (a same-CID re-notify produces no events)
-  // must still be able to advance an overdue recovery pass. `feedTouched` is
-  // true only when this call actually applied a feed-mutating record.
+  // must still be able to advance an overdue recovery pass. Only the feeds this
+  // call's applied records grew are pruned outside that pass.
   if (config.feeds) {
-    const feedMutatingNsids = getFeedMutatingNsids(config);
-    const feedTouched = appliedEvents.some((e) =>
-      feedMutatingNsids.has(e.collection),
-    );
-    await runGatedFeedPrune(db, config, feedTouched);
+    await runGatedFeedPrune(db, config, appliedEvents);
   }
 
   return {

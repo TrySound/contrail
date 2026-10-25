@@ -10,10 +10,12 @@ import {
   getFeedPruneCursor,
   saveFeedPruneCursor,
 } from "../src/index";
-import { runGatedFeedPrune } from "../src/index";
+import { runGatedFeedPrune, pruneGrownFeeds } from "../src/index";
+import type { IngestEvent, Statement } from "../src/index";
 
 const EVENT = "community.lexicon.calendar.event";
 const RSVP = "community.lexicon.calendar.rsvp";
+const FOLLOW = "app.bsky.graph.follow";
 
 // Feeds config: event capped at 2 per actor, rsvp at 3. resolveConfig
 // auto-adds the `follow` collection, so initSchema builds feed_items, the
@@ -78,6 +80,43 @@ async function rows(
     .bind(actor, collection)
     .all<{ time_us: number }>();
   return (res.results ?? []).map((r) => Number(r.time_us));
+}
+
+async function follow(follower: string, subject: string): Promise<void> {
+  await db
+    .prepare(
+      "INSERT INTO records_follow (uri, did, rkey, cid, record, time_us, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind(
+      `at://${follower}/${FOLLOW}/${subject}`,
+      follower,
+      subject,
+      "bafyfollow",
+      JSON.stringify({ subject }),
+      1000,
+      1000
+    )
+    .run();
+}
+
+/** An applied ingest event, as the ingest paths hand it to the prune. */
+function applied(
+  did: string,
+  collection: string,
+  operation: "create" | "update" | "delete",
+  record?: object
+): IngestEvent {
+  return {
+    uri: `at://${did}/${collection}/r1`,
+    did,
+    collection,
+    rkey: "r1",
+    cid: operation === "delete" ? null : "bafy",
+    record: record ? JSON.stringify(record) : null,
+    time_us: 9000,
+    indexed_at: 9000,
+    operation,
+  };
 }
 
 beforeEach(async () => {
@@ -189,29 +228,112 @@ describe("pruneFeedItems (full recovery loop)", () => {
   });
 });
 
+describe("pruneGrownFeeds", () => {
+  it("prunes the author's followers for the collections the batch wrote, and no one else", async () => {
+    await follow("alice", "bob");
+    await follow("carol", "bob");
+    await seed("alice", EVENT, 5);
+    await seed("alice", RSVP, 5); // bob wrote no rsvp this batch
+    await seed("carol", EVENT, 5);
+    await seed("dave", EVENT, 5); // over cap, but follows no one in the batch
+
+    const res = await pruneGrownFeeds(db, CONFIG, [applied("bob", EVENT, "create")], 100);
+
+    expect(res).toEqual({ pruned: 6, overflow: false });
+    expect(await rows("alice", EVENT)).toEqual([1004, 1003]);
+    expect(await rows("carol", EVENT)).toHaveLength(2);
+    expect(await rows("alice", RSVP)).toHaveLength(5);
+    expect(await rows("dave", EVENT)).toHaveLength(5);
+  });
+
+  it("prunes a new follower's feed for every target", async () => {
+    await seed("erin", EVENT, 5);
+    await seed("erin", RSVP, 6);
+    const res = await pruneGrownFeeds(
+      db,
+      CONFIG,
+      [applied("erin", FOLLOW, "create", { subject: "bob" })],
+      100
+    );
+    expect(res).toEqual({ pruned: 3 + 3, overflow: false });
+    expect(await rows("erin", EVENT)).toHaveLength(2);
+    expect(await rows("erin", RSVP)).toHaveLength(3);
+  });
+
+  it("issues no statements for a batch that grew no feed", async () => {
+    await follow("alice", "bob");
+    await seed("alice", EVENT, 5);
+    const sqls: string[] = [];
+    const recording: Database = {
+      prepare(sql: string): Statement {
+        sqls.push(sql);
+        return db.prepare(sql);
+      },
+      batch: (stmts) => db.batch(stmts),
+      dialect: db.dialect,
+    };
+
+    // Deletes only shrink feeds.
+    const res = await pruneGrownFeeds(
+      recording,
+      CONFIG,
+      [applied("bob", EVENT, "delete"), applied("alice", FOLLOW, "delete")],
+      100
+    );
+
+    expect(res).toEqual({ pruned: 0, overflow: false });
+    expect(sqls).toEqual([]);
+    expect(await rows("alice", EVENT)).toHaveLength(5);
+  });
+
+  it("prunes at most `limit` feeds and reports overflow", async () => {
+    for (const f of ["f1", "f2", "f3"]) {
+      await follow(f, "bob");
+      await seed(f, EVENT, 5);
+    }
+    const res = await pruneGrownFeeds(db, CONFIG, [applied("bob", EVENT, "create")], 2);
+    expect(res).toEqual({ pruned: 2 * 3, overflow: true });
+    const lengths = await Promise.all(["f1", "f2", "f3"].map(async (f) => (await rows(f, EVENT)).length));
+    expect(lengths.sort()).toEqual([2, 2, 5]);
+  });
+});
+
 describe("runGatedFeedPrune (recovery gate)", () => {
-  it("sweeps when a full pass is overdue, even with feedTouched=false", async () => {
+  it("sweeps when a full pass is overdue, even with nothing applied", async () => {
     // The persisted recovery clock is unset (0), so a pass is overdue. This is
     // the path a no-op notify call or an idle stream relies on to make progress.
     await seed("alice", EVENT, 5); // cap 2
-    await runGatedFeedPrune(db, CONFIG, false);
+    await runGatedFeedPrune(db, CONFIG, []);
     expect(await rows("alice", EVENT)).toHaveLength(2);
   });
 
-  it("is a no-op when not feed-touched and recovery is not yet due", async () => {
+  it("is a no-op when nothing was applied and recovery is not yet due", async () => {
     // First call completes a pass and stamps the recovery clock to ~now.
-    await runGatedFeedPrune(db, CONFIG, false);
+    await runGatedFeedPrune(db, CONFIG, []);
     // A fresh over-cap actor is left alone: recovery isn't due and nothing was
     // ingested this call.
     await seed("bob", EVENT, 5);
-    await runGatedFeedPrune(db, CONFIG, false);
+    await runGatedFeedPrune(db, CONFIG, []);
     expect(await rows("bob", EVENT)).toHaveLength(5);
   });
 
-  it("sweeps on feedTouched even when recovery is not due", async () => {
-    await runGatedFeedPrune(db, CONFIG, false); // stamp the recovery clock
-    await seed("bob", EVENT, 5);
-    await runGatedFeedPrune(db, CONFIG, true);
-    expect(await rows("bob", EVENT)).toHaveLength(2);
+  it("prunes only the feeds the batch grew when recovery is not due", async () => {
+    await runGatedFeedPrune(db, CONFIG, []); // stamp the recovery clock
+    await follow("alice", "bob");
+    await seed("alice", EVENT, 5);
+    await seed("dave", EVENT, 5);
+    await runGatedFeedPrune(db, CONFIG, [applied("bob", EVENT, "create")]);
+    expect(await rows("alice", EVENT)).toHaveLength(2);
+    expect(await rows("dave", EVENT)).toHaveLength(5); // waits for recovery
+  });
+
+  it("falls back to a sweep slice when the fan-out overflows the budget", async () => {
+    await runGatedFeedPrune(db, CONFIG, []); // stamp the recovery clock
+    // A bystander first in actor order, so the sweep slice reaches it.
+    await seed("a-bystander", EVENT, 5);
+    // More followers than the budget: 500 actors x 2 capped collections.
+    for (let i = 0; i <= 1000; i++) await follow(`f-${String(i).padStart(4, "0")}`, "bob");
+    await runGatedFeedPrune(db, CONFIG, [applied("bob", EVENT, "create")]);
+    expect(await rows("a-bystander", EVENT)).toHaveLength(2);
   });
 });

@@ -8,7 +8,6 @@ import {
   getCollectionNsids,
   getDependentNsids,
   buildFeedTargetCaps,
-  getFeedMutatingNsids,
   jetstreamService,
   resolveConfig,
 } from "./types";
@@ -19,6 +18,7 @@ import { backfillFollowersFromConstellation } from "./constellation";
 import {
   createIngestState,
   runFeedPruneSlice,
+  runGrownFeedPrune,
   FEED_PRUNE_RECOVERY_INTERVAL_MS,
   maybeOptimize,
 } from "./jetstream";
@@ -240,12 +240,17 @@ async function streamAndFlush(
           }
         }
 
-        // A feed can only go over cap right after a feed-mutating record is
-        // applied, so remember whether this batch had one. The sweep below uses
-        // it to prune promptly (see the cron path in jetstream.ts).
+        // A feed can only go over cap right after this batch's fan-out or follow
+        // backfill, so prune exactly the feeds it grew (see the cron path in
+        // jetstream.ts). If the fan-out overflowed the budget or the prune
+        // failed, the sweep below picks up the rest.
         if (config.feeds) {
-          const feedMutatingNsids = getFeedMutatingNsids(config);
-          if (accepted.some((e) => feedMutatingNsids.has(e.collection))) {
+          try {
+            if (await runGrownFeedPrune(db, config, accepted)) {
+              state.feedDirty = true;
+            }
+          } catch (err) {
+            log.warn(`Grown-feed prune failed: ${err}`);
             state.feedDirty = true;
           }
         }
@@ -300,9 +305,10 @@ async function streamAndFlush(
       }
 
       // Bounded, cursored feed prune (see sweepFeedItems / runFeedPruneSlice).
-      // Runs whether or not this tick had events: ingest-dirty windows prune
-      // promptly (throttled by the sweep interval), and the recovery interval
-      // still fires on a fully idle stream — the timer drives this flush, and
+      // Runs whether or not this tick had events: a batch whose grown-feed prune
+      // overflowed or failed is swept promptly (throttled by the sweep
+      // interval), and the recovery interval still fires on a fully idle
+      // stream — the timer drives this flush, and
       // the old "return early when the buffer is empty" path starved recovery,
       // so over-cap rows from a lowered cap or a bulk import never drained while
       // the stream was quiet. The recovery clock tracks the last *completed*
@@ -325,7 +331,7 @@ async function streamAndFlush(
             }
             if (pruned > 0) {
               log.log(
-                `Pruned ${pruned} feed items (sweep, reason=${dirtyDue ? "ingest" : "recovery"})`
+                `Pruned ${pruned} feed items (sweep, reason=${dirtyDue ? "overflow" : "recovery"})`
               );
             }
           }

@@ -10,12 +10,11 @@ import {
   getDependentNsids,
   jetstreamService,
   buildFeedTargetCaps,
-  getFeedMutatingNsids,
   optimizeEnabled,
   optimizeIntervalMs,
   optimizeAnalysisLimit,
 } from "./types";
-import { assertJetstreamServiceCompatibility, assertServingSourceCompatibility, initSchema, getLastCursor, loadKnownActorDids, saveJetstreamCursor, saveJetstreamCursorStatement, saveJetstreamCursorObservationStatements, saveOrderedSourcePositionStatement, sweepFeedItems, getFeedPruneCursor, saveFeedPruneCursor, getMetaNumber, setMeta, optimizeDatabase } from "./db";
+import { assertJetstreamServiceCompatibility, assertServingSourceCompatibility, initSchema, getLastCursor, loadKnownActorDids, saveJetstreamCursor, saveJetstreamCursorStatement, saveJetstreamCursorObservationStatements, saveOrderedSourcePositionStatement, sweepFeedItems, pruneGrownFeeds, getFeedPruneCursor, saveFeedPruneCursor, getMetaNumber, setMeta, optimizeDatabase } from "./db";
 import {
   createIngestEvent,
   ingestRecords,
@@ -217,39 +216,60 @@ export async function runFeedPruneSlice(
   return { pruned, done };
 }
 
-/** Gate and run one feed-prune slice against the *persisted* recovery clock —
- *  shared by the recycling cron isolate and the stateless `notifyOfUpdate` path
- *  (the long-lived persistent loop uses its in-memory clocks instead). Slices
- *  when `feedTouched` (a feed-mutating record was just ingested) or when a full
- *  pass is overdue, and records pass completion so the recovery clock measures
- *  from a real drain (one slice per tick until the cursor wraps) rather than
- *  resetting on a single slice.
+/** Prune the feeds an applied batch grew (see pruneGrownFeeds), within the
+ *  statement budget of one sweep slice: {@link FEED_PRUNE_SWEEP_ACTORS} actors
+ *  times each capped collection. Returns true when the batch's fan-out
+ *  overflowed that budget, which the caller answers with a sweep slice. No
+ *  queries at all for a batch that grew no feed. */
+export async function runGrownFeedPrune(
+  db: Database,
+  config: ContrailConfig,
+  applied: readonly IngestEvent[]
+): Promise<boolean> {
+  const caps = buildFeedTargetCaps(config);
+  if (caps.size === 0) return false;
+  const { pruned, overflow } = await pruneGrownFeeds(
+    db,
+    config,
+    applied,
+    FEED_PRUNE_SWEEP_ACTORS * caps.size
+  );
+  if (pruned > 0) {
+    getLogger(config).log(`Pruned ${pruned} feed items (grown feeds)`);
+  }
+  return overflow;
+}
+
+/** Prune after an ingest batch against the *persisted* recovery clock — shared
+ *  by the recycling cron isolate and the stateless `notifyOfUpdate` path (the
+ *  long-lived persistent loop uses its in-memory clocks instead).
  *
- *  The slice advances the shared rolling cursor, which is NOT necessarily the
- *  actor the mutation touched: a fan-out follower the cursor has already passed
- *  is pruned by the next pass, up to about one recovery interval later, not
- *  instantly. That is
- *  the deliberate trade for a per-tick cost bounded by `FEED_PRUNE_SWEEP_ACTORS`
- *  rather than by fan-out size (a popular author has unboundedly many followers).
- *  feed_items is a soft cache, so a follower sitting a few rows over cap until
- *  the next slice is harmless. No-op when feeds are unconfigured. */
+ *  The feeds `applied` grew are pruned directly ({@link runGrownFeedPrune}). A
+ *  sweep slice runs only when a full pass is overdue or the batch's fan-out
+ *  overflowed the grown-feed budget, and records pass completion so the
+ *  recovery clock measures from a real drain (one slice per tick until the
+ *  cursor wraps) rather than resetting on a single slice. The recovery pass
+ *  remains the safety net for anything the grown-feed prune doesn't see: a
+ *  lowered cap, a bulk import, a follower past the budget. No-op when feeds are
+ *  unconfigured. */
 export async function runGatedFeedPrune(
   db: Database,
   config: ContrailConfig,
-  feedTouched: boolean
+  applied: readonly IngestEvent[]
 ): Promise<void> {
   if (!config.feeds) return;
   if (buildFeedTargetCaps(config).size === 0) return;
+  const overflow = await runGrownFeedPrune(db, config, applied);
   const nowMs = Date.now();
   const lastFullPassMs =
     (await getMetaNumber(db, FEED_PRUNE_LAST_FULL_PASS_META)) ?? 0;
   const recoveryDue = nowMs - lastFullPassMs >= FEED_PRUNE_RECOVERY_INTERVAL_MS;
-  if (!feedTouched && !recoveryDue) return;
+  if (!overflow && !recoveryDue) return;
   const { pruned, done } = await runFeedPruneSlice(db, config);
   if (done) await setMeta(db, FEED_PRUNE_LAST_FULL_PASS_META, String(nowMs));
   if (pruned > 0) {
     getLogger(config).log(
-      `Pruned ${pruned} feed items (sweep, reason=${feedTouched ? "ingest" : "recovery"})`
+      `Pruned ${pruned} feed items (sweep, reason=${overflow ? "overflow" : "recovery"})`
     );
   }
 }
@@ -269,10 +289,10 @@ export interface IngestState {
    *  The cron isolate persists the equivalent in
    *  `_contrail_meta`. */
   lastFullFeedPassMs: number;
-  /** Set by the persistent loop when a flushed batch ingested a feed-mutating
-   *  record, so the next sweep window knows there may be prune work. Cleared
-   *  when the sweep runs. The cron path makes the same decision per-tick from
-   *  its `events` array and doesn't need the flag. */
+  /** Set by the persistent loop when a flushed batch's fan-out overflowed the
+   *  grown-feed prune's budget, so the next sweep window runs a slice. Cleared
+   *  when the sweep runs. The cron path makes the same decision per-tick and
+   *  doesn't need the flag. */
   feedDirty: boolean;
 }
 
@@ -889,28 +909,23 @@ export async function runIngestCycle(
     }
   }
 
-  // Prune feed_items to per-collection caps with a bounded, cursored sweep.
-  // Every statement is index-backed and O(cap) (see sweepFeedItems), so it can
-  // never exhaust D1's per-query CPU budget and reset the shared DO — unlike
-  // the old global window+anti-join. The cron isolate recycles each tick, so the
-  // sweep cursor and the recovery clock both live in the DB.
+  // Prune feed_items to per-collection caps. Every statement is index-backed and
+  // O(cap) (see sweepFeedItems), so it can never exhaust D1's per-query CPU
+  // budget and reset the shared DO — unlike the old global window+anti-join.
   //
   // A feed only goes over cap right after a row is inserted, and rows are only
-  // inserted for feed-mutating collections (event fan-out, follow backfill). So
-  // we skip the sweep entirely on ticks that ingested nothing feed-relevant —
-  // the overwhelming majority — and otherwise advance one bounded slice.
+  // inserted by this batch's fan-out and follow backfill. So we prune exactly
+  // the feeds this batch grew, and nothing on ticks that ingested nothing
+  // feed-relevant — the overwhelming majority.
   //
-  // The recovery clock tracks when a *full pass* over every actor last
-  // completed, not the last slice: while a pass is overdue we keep slicing every
-  // tick (bounded cost) until the cursor wraps, then reset the clock. That bounds
-  // the worst-case time an over-cap feed waits to be revisited — a feed touched
-  // just after the cursor passed it, a lowered cap, or a bulk import all drain
-  // within one recovery interval plus the pass's lap time, instead of stalling
-  // for many intervals (one slice per interval) as a per-slice clock would.
+  // The cron isolate recycles each tick, so the recovery sweep's cursor and
+  // clock live in the DB. The clock tracks when a *full pass* over every actor
+  // last completed, not the last slice: while a pass is overdue we keep slicing
+  // every tick (bounded cost) until the cursor wraps, then reset the clock. So a
+  // feed the grown-feed prune didn't reach, a lowered cap, or a bulk import all
+  // drain within one recovery interval plus the pass's lap time.
   if (config.feeds) {
-    const feedMutatingNsids = getFeedMutatingNsids(config);
-    const feedTouched = accepted.some((e) => feedMutatingNsids.has(e.collection));
-    await runGatedFeedPrune(db, config, feedTouched);
+    await runGatedFeedPrune(db, config, accepted);
   }
 
   // Opt-in planner-stat maintenance (gated + persisted cadence; no-op unless
