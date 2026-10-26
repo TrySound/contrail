@@ -64,6 +64,13 @@ import {
 } from "./core/moderation-sync";
 import type { Hono } from "hono";
 
+export interface ContrailInitOptions {
+  /** Leave a changed moderation policy's paged job (label pruning, hidden
+   * state, backfill requeues) to `ingest()`/`runPersistent()` instead of
+   * running a bounded slice inline. Trust changes still apply immediately. */
+  deferModerationPolicyJob?: boolean;
+}
+
 export interface ContrailOptions extends ContrailConfig {
   db?: Database;
   /** Exact generated/pinned runtime Lexicon bundle used by collections with
@@ -104,11 +111,11 @@ export class Contrail {
   }
 
   /** Initialize the database schema. */
-  async init(db?: Database): Promise<void> {
+  async init(db?: Database, options: ContrailInitOptions = {}): Promise<void> {
     const database = this.getDb(db);
     const ready = (async () => {
       prepareRecordValidation(this.config);
-      await initSchema(database, this.config);
+      await initSchema(database, this.config, options);
       await assertServingSourceCompatibility(
         database,
         this.config.orderedSource,
@@ -158,6 +165,8 @@ export class Contrail {
   async ingest(options?: ScheduledIngestOptions, db?: Database): Promise<void> {
     const d = this.getDb(db);
     await this.ensureInitialized(d);
+    // The cycle would otherwise initialize the schema a second time.
+    this._ingestState.schemaInitialized = true;
     const budget = resolveScheduledIngestBudget(options);
     const tasks: Promise<void>[] = [
       runIngestCycle(d, this.config, budget, this._ingestState),

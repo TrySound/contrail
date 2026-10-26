@@ -48,6 +48,7 @@ function failAccountOnce(db: Database): Database {
   const sql = new WeakMap<object, string>();
   let failed = false;
   return {
+    dialect: db.dialect,
     prepare(query) {
       const s = db.prepare(query);
       sql.set(s, query);

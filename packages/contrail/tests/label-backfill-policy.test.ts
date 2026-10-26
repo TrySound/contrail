@@ -243,6 +243,62 @@ describe("label backfill policy and queue generations", () => {
     expect(await visible(db, config)).toBe(0);
   });
 
+  it("restarts a rejected cursor and recovers historical hide labels", async () => {
+    const { db, config } = await setup(["!hide"]);
+    await db.prepare("UPDATE label_backfill_queue SET cursor = 'expired'").run();
+    const before = await queue(db);
+    const cursors: Array<string | null> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const cursor = new URL(String(input)).searchParams.get("cursor");
+      cursors.push(cursor);
+      return cursor === "expired"
+        ? Response.json({ error: "InvalidCursor" }, { status: 400 })
+        : Response.json({ labels: [label] });
+    });
+    await runLabelBackfillQueue(db, config);
+    expect(await queue(db)).toMatchObject({
+      cursor: null, completed: 0, retries: 1, generation: before.generation + 1,
+    });
+    expect((await queue(db)).next_attempt_at).toBeGreaterThan(Date.now());
+    expect(await storedLabels(db)).toEqual([]);
+    await db.prepare("UPDATE label_backfill_queue SET next_attempt_at = 0").run();
+    await runLabelBackfillQueue(db, config);
+    expect(cursors).toEqual(["expired", null]);
+    expect(await queue(db)).toMatchObject({ cursor: null, completed: 1, retries: 0 });
+    expect(await visible(db, config)).toBe(0);
+  });
+
+  it.each([
+    [429, "RateLimitExceeded"],
+    [500, "InternalServerError"],
+    [500, "InvalidCursor"],
+    [400, "InvalidRequest"],
+    [400, null],
+  ] as const)("retains a cursor for other HTTP failures (%s, %s)", async (status, error) => {
+    const { db, config } = await setup(["!hide"]);
+    await db.prepare("UPDATE label_backfill_queue SET cursor = 'page2'").run();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => error
+      ? Response.json({ error }, { status })
+      : new Response("not JSON", { status }));
+    await runLabelBackfillQueue(db, config);
+    expect(await queue(db)).toMatchObject({ cursor: "page2", completed: 0, retries: 1 });
+    expect((await queue(db)).next_attempt_at).toBeGreaterThan(Date.now());
+  });
+
+  it.each(["policy", "pending-policy", "worker"])("does not reset a newer %s checkpoint for a stale invalid cursor", async (changedBy) => {
+    const { db, config } = await setup(["!hide"]);
+    await db.prepare("UPDATE label_backfill_queue SET cursor = 'expired'").run();
+    const delayed = delayedFetch();
+    const oldWork = runLabelBackfillQueue(db, config);
+    await delayed.started;
+    if (changedBy === "worker") await runLabelBackfillQueue(db, config);
+    else await applyModerationPolicy(db, policy(["spam"]), changedBy === "pending-policy" ? { maxPages: 0 } : {});
+    const advanced = await queue(db);
+    delayed.response.resolve(Response.json({ error: "InvalidCursor" }, { status: 400 }));
+    await oldWork;
+    expect(await queue(db)).toEqual(advanced);
+  });
+
   it("adds a generation to pre-existing queues before policy maintenance", async () => {
     const db = createTestDb();
     await db.prepare(`CREATE TABLE label_backfill_queue (

@@ -648,6 +648,10 @@ export type SchemaModule = (db: Database) => Promise<void>;
 
 export interface InitSchemaOptions {
   extraSchemas?: SchemaModule[];
+  /** Apply moderation policy trust immediately but leave its paged job to
+   * moderation cycles. Use on request paths, so a large policy change never
+   * delays a response. */
+  deferModerationPolicyJob?: boolean;
 }
 
 /**
@@ -773,7 +777,7 @@ export async function initSchema(
   if (storedFingerprint === fingerprint) {
     // Moderation policy has its own fingerprint: editing moderators or label
     // sources must not rerun DDL or rebuild FTS.
-    await applyModerationPolicy(db, config, { meta });
+    await applyModerationPolicy(db, config, { meta, ...(options.deferModerationPolicyJob ? { maxPages: 0 } : {}) });
     for (const apply of options.extraSchemas ?? []) await apply(db);
     return;
   }
@@ -782,7 +786,7 @@ export async function initSchema(
     // deployment through the FTS rebuild path. Upgrade the prior fingerprint
     // directly after its idempotent DDL succeeds.
     await runIdempotentDdl(db, cursorObservationsDdl);
-    await applyModerationPolicy(db, config, { meta });
+    await applyModerationPolicy(db, config, { meta, ...(options.deferModerationPolicyJob ? { maxPages: 0 } : {}) });
     for (const apply of options.extraSchemas ?? []) await apply(db);
     await setMeta(db, SCHEMA_FINGERPRINT_KEY, fingerprint);
     return;
@@ -806,7 +810,7 @@ export async function initSchema(
   // them. CREATE TABLE IF NOT EXISTS only covers fresh databases.
   await addColumnIfNotExists(db, "label_backfill_queue", "generation", "INTEGER NOT NULL DEFAULT 0");
   await upgradeModerationCreationTimestamps(db);
-  await applyModerationPolicy(db, config);
+  await applyModerationPolicy(db, config, { ...(options.deferModerationPolicyJob ? { maxPages: 0 } : {}) });
 
   await runIdempotentDdl(db, cursorObservationsDdl);
   await applyFtsTables(db, config, dialect);

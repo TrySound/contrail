@@ -98,6 +98,38 @@ describe("moderation policy changes", () => {
     );
   });
 
+  it("prunes against allowlists larger than the bound-parameter limit", async () => {
+    const source = (values?: string[]) => resolveConfig({
+      ...base,
+      moderation: { moderators: [], reports: false },
+      labels: { sources: [{ did: external, ...(values ? { values } : {}) }] },
+    });
+    const open = source();
+    await applyModerationPolicy(db, open);
+    await applyLabels(
+      db,
+      ["keep", "drop"].map((val) => ({ src: external, uri: actors[0]!, val, cts: new Date().toISOString() })),
+      { source: open.labels!.sources[0], config: open },
+    );
+    const values = ["keep", ...Array.from({ length: 149 }, (_, i) => `value-${i}`)];
+    await applyModerationPolicy(db, source(values));
+    expect((await db.prepare("SELECT val FROM labels WHERE src = ?").bind(external).all()).results)
+      .toEqual([{ val: "keep" }]);
+  });
+
+  it("can leave the paged job to moderation cycles on request paths", async () => {
+    await initSchema(db, untrusted, { deferModerationPolicyJob: true });
+    // Trust changed immediately; materialized hiding catches up in the job.
+    expect(
+      (await db.prepare("SELECT * FROM moderation_sources WHERE moderator = 1").all()).results,
+    ).toEqual([]);
+    expect(await visible(untrusted)).toBe(0);
+    expect(await getMeta(db, "moderation_policy_job")).not.toBeNull();
+    expect(await runModerationPolicyJob(db, untrusted)).toBeGreaterThan(0);
+    expect(await visible(untrusted)).toBe(actors.length);
+    expect(await getMeta(db, "moderation_policy_job")).toBeNull();
+  });
+
   it("apply in bounded, resumable pages", async () => {
     await applyModerationPolicy(db, untrusted, { maxPages: 1, pageSize: 2 });
     // Trust is rewritten immediately; materialized state catches up in pages.

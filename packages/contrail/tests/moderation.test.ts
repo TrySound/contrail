@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createTestDb, makeEvent, TEST_CONFIG } from "./helpers";
+import { createTestDb, makeEvent, TEST_CONFIG, TEST_POSTGRES } from "./helpers";
 import {
   resolveConfig,
   initSchema,
@@ -517,7 +517,8 @@ describe("moderation enforcement", () => {
       (await db.prepare("SELECT * FROM moderation_recount_queue").all()).results,
     ).toHaveLength(1);
   });
-  it("enforcement lookups are indexed, never a scan of labels or account state", async () => {
+  // EXPLAIN QUERY PLAN is SQLite syntax.
+  it.skipIf(TEST_POSTGRES)("enforcement lookups are indexed, never a scan of labels or account state", async () => {
     const plan = await db
       .prepare(
         `EXPLAIN QUERY PLAN SELECT uri FROM records_event r WHERE ${visibleRecordSql("r")}`,
@@ -547,6 +548,22 @@ describe("moderation enforcement", () => {
       { src: external, uri: actor, val: "!hide", cts: new Date(Date.now() + 5_000).toISOString() },
     ]);
     expect(await rows()).toHaveLength(0);
+  });
+  it("clamps forward-dated actions to their source observation time, stably", async () => {
+    const observedUs = (Date.now() - 60_000) * 1000;
+    const event = {
+      ...action({ subject: actor, action: "override", createdAt: "2999-01-01T00:00:00Z" }),
+      source: { id: "jetstream", time_us: observedUs, revision: null, cursor: null },
+    };
+    const cts = async () =>
+      Number((await db.prepare("SELECT cts FROM moderation_overrides").first<{ cts: number }>())!.cts);
+    await ingestRecords(db, [event], config);
+    expect(await cts()).toBe(observedUs / 1000);
+    // Re-projecting the same event later must not move the override forward.
+    await db.prepare("DELETE FROM record_versions").run();
+    await db.prepare(`DELETE FROM records_moderationAction`).run();
+    await ingestRecords(db, [event], config);
+    expect(await cts()).toBe(observedUs / 1000);
   });
   it("hidden records do not consume pagination limits", async () => {
     await ingestRecords(db, [

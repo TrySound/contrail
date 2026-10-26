@@ -140,6 +140,94 @@ describe("scheduled label ingestion", () => {
     expect((await queryRecords(db, config, { collection: "event" })).records).toEqual([]);
     expect(await cursor(db)).toBe(10);
   });
+
+  it("does not skip a quiet backfill:false labeler's labels issued between cycles", async () => {
+    LabelSocket.instances = [];
+    vi.stubGlobal("WebSocket", LabelSocket);
+    const db = createTestDb();
+    const config = resolveConfig({
+      ...policy(["!hide"]),
+      labels: { sources: [{ did: src, endpoint: "https://labels.example", enforce: true, backfill: false }] },
+    });
+    await initSchema(db, config);
+    await ingestRecords(db, [makeEvent()], config);
+
+    // First cycle follows from now and sees no frame, so no cursor exists.
+    let work = runLabelIngestCycle(db, config, 1_000);
+    let ws = await socket();
+    expect(new URL(ws.url).searchParams.has("cursor")).toBe(false);
+    ws.close();
+    await work;
+    const startedAt = Date.now();
+
+    // Next cycle replays, dropping history from before the first connection.
+    LabelSocket.instances = [];
+    work = runLabelIngestCycle(db, config, 1_000);
+    ws = await socket();
+    expect(new URL(ws.url).searchParams.get("cursor")).toBe("0");
+    const old = new Date(startedAt - 60 * 60_000).toISOString();
+    ws.frame({ seq: 1, labels: [{ ...label, uri: "did:plc:old", cts: old }] });
+    ws.close();
+    await work;
+    expect(await cursor(db)).toBe(1);
+    expect((await db.prepare("SELECT * FROM labels").all()).results).toEqual([]);
+
+    // Replay may span multiple cycles. A nonzero cursor does not mean it has
+    // caught up: old hides must still be dropped after reconnecting.
+    LabelSocket.instances = [];
+    work = runLabelIngestCycle(db, config, 1_000);
+    ws = await socket();
+    expect(new URL(ws.url).searchParams.get("cursor")).toBe("1");
+    ws.frame({ seq: 2, labels: [{ ...label, cts: old }] });
+    ws.close();
+    await work;
+    expect(await cursor(db)).toBe(2);
+    expect((await db.prepare("SELECT * FROM labels").all()).results).toEqual([]);
+    expect((await queryRecords(db, config, { collection: "event" })).records).toHaveLength(1);
+
+    // A later cycle still admits labels issued after the first connection.
+    LabelSocket.instances = [];
+    work = runLabelIngestCycle(db, config, 1_000);
+    ws = await socket();
+    expect(new URL(ws.url).searchParams.get("cursor")).toBe("2");
+    ws.frame({ seq: 3, labels: [{ ...label, cts: new Date(startedAt + 1_000).toISOString() }] });
+    ws.close();
+    await work;
+    expect(await cursor(db)).toBe(3);
+    expect((await db.prepare("SELECT uri FROM labels").all()).results).toEqual([{ uri: did }]);
+    expect((await queryRecords(db, config, { collection: "event" })).records).toEqual([]);
+  });
+
+  it("resumes an existing backfill:false cursor without inventing a live cutoff", async () => {
+    const { db, config: initial } = await setup();
+    const config = resolveConfig({ ...initial, labels: { sources: [
+      { ...initial.labels!.sources[0]!, backfill: false },
+    ] } });
+    const work = runLabelIngestCycle(db, config, 1_000);
+    const ws = await socket();
+    expect(new URL(ws.url).searchParams.get("cursor")).toBe("10");
+    ws.frame({ seq: 11, labels: [label] });
+    ws.close();
+    await work;
+    expect(await cursor(db)).toBe(11);
+    expect((await queryRecords(db, config, { collection: "event" })).records).toEqual([]);
+    expect(await db.prepare("SELECT 1 FROM _contrail_meta WHERE key = ?")
+      .bind(`labeler_live_since:${src}`).first()).toBeNull();
+  });
+
+  it("ignores a saved live cutoff when historical backfill is enabled", async () => {
+    const { db, config } = await setup();
+    await db.prepare("INSERT INTO _contrail_meta (key, value) VALUES (?, ?)")
+      .bind(`labeler_live_since:${src}`, String(Date.now())).run();
+    const work = runLabelIngestCycle(db, config, 1_000);
+    const ws = await socket();
+    expect(new URL(ws.url).searchParams.get("cursor")).toBe("10");
+    ws.frame({ seq: 11, labels: [label] });
+    ws.close();
+    await work;
+    expect(await cursor(db)).toBe(11);
+    expect((await queryRecords(db, config, { collection: "event" })).records).toEqual([]);
+  });
 });
 
 describe("live label policy generations", () => {

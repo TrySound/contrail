@@ -3,6 +3,7 @@ import type { ContrailConfig, Database, Logger } from "../types";
 import type { LabelerSource } from "./types";
 import { applyLabels, type IncomingLabel } from "./apply";
 import { getLabelerState } from "./resolve";
+import { getMeta, setMeta } from "../db/meta";
 import {
   getModerationPolicyGeneration,
   lockModerationPolicyStatement,
@@ -18,6 +19,9 @@ const DEFAULT_BATCH_SIZE = 100;
 /** Unflushed batches retained before the socket is closed for a retry. */
 const MAX_BUFFERED_BATCHES = 20;
 const DEFAULT_FLUSH_INTERVAL_MS = 5_000;
+/** When a `backfill: false` labeler was first followed from now. */
+const LIVE_SINCE_KEY_PREFIX = "labeler_live_since:";
+const LIVE_SINCE_SKEW_MS = 5 * 60_000;
 
 function getLogger(config: ContrailConfig): Logger {
   return config.logger ?? console;
@@ -167,7 +171,24 @@ async function pumpOneLabeler(
   // resume from the saved cursor — `backfill` only flips the start point.
   const isFirstRun = state.cursor === 0;
   const backfill = source.backfill !== false;
-  const startCursor = isFirstRun && !backfill ? null : state.cursor;
+  let startCursor: number | null = state.cursor;
+  // `backfill: false` without a saved cursor: a "from now" connection that
+  // saw no frame has no seq to resume from, so labels issued while scheduled
+  // ingestion was disconnected would be skipped indefinitely for a quiet
+  // labeler. Only the first such connection starts from now; later ones
+  // replay from 0, admitting labels created after that start (minus clock
+  // skew). Keep that cutoff on every reconnect: replay can span multiple
+  // bounded cycles, and a nonzero cursor does not prove it has caught up.
+  let minCts: number | null = null;
+  if (!backfill) {
+    const sinceKey = `${LIVE_SINCE_KEY_PREFIX}${source.did}`;
+    const since = Number(await getMeta(db, sinceKey));
+    if (since > 0) minCts = since - LIVE_SINCE_SKEW_MS;
+    else if (isFirstRun) {
+      await setMeta(db, sinceKey, String(Date.now()));
+      startCursor = null;
+    }
+  }
 
   const url = buildWsUrl(state.endpoint!, startCursor);
   log.log(`[labels] connecting to ${source.did} (cursor=${startCursor ?? "now"})`);
@@ -297,7 +318,7 @@ async function pumpOneLabeler(
       const rawLabels = Array.isArray(frame.payload?.labels) ? frame.payload.labels : [];
       for (const raw of rawLabels) {
         const lab = normalizeLabel(raw, source.did);
-        if (lab) buffer.push(lab);
+        if (lab && !(minCts !== null && Date.parse(lab.cts) < minCts)) buffer.push(lab);
       }
       if (Number.isFinite(seq) && seq > highestSeq) highestSeq = seq;
       if (buffer.length >= batchSize * MAX_BUFFERED_BATCHES) {

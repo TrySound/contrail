@@ -1,5 +1,6 @@
 import type { ContrailConfig, Database, Statement } from "./types";
 import { getMeta, getMetaValues } from "./db/meta";
+import { getDialect, isPostgresDialect } from "./dialect";
 import {
   HIDE_VALUES_SQL,
   flushModerationDirtyStatements,
@@ -166,14 +167,16 @@ function pruneTask(src: string, values: string[] | null): PolicyTask {
     async page(db, cursor, pageSize, current) {
       const r = await pageRange(db, "labels", "uri", "src = ?", [src], cursor, pageSize);
       if (r.upper === null) return { statements: [], next: null };
-      const filter = values?.length
-        ? ` AND val NOT IN (${values.map(() => "?").join(",")})`
-        : "";
+      // One JSON parameter: an allowlist may exceed D1's bound-parameter limit.
+      const admitted = isPostgresDialect(getDialect(db))
+        ? "SELECT jsonb_array_elements_text(CAST(? AS jsonb))"
+        : "SELECT value FROM json_each(?)";
+      const filter = values?.length ? ` AND val NOT IN (${admitted})` : "";
       return {
         statements: [
           db
             .prepare(`DELETE FROM labels WHERE src = ? AND uri > ? AND uri <= ?${filter} AND ${JOB_IS_CURRENT_SQL}`)
-            .bind(src, r.lower, r.upper, ...(values?.length ? values : []), POLICY_JOB_KEY, current),
+            .bind(src, r.lower, r.upper, ...(values?.length ? [JSON.stringify(values)] : []), POLICY_JOB_KEY, current),
         ],
         next: r.full ? r.upper : null,
       };

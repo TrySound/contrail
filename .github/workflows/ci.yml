@@ -52,3 +52,6 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+      - name: Test moderation on PostgreSQL (PGlite)
+        run: pnpm test:postgres

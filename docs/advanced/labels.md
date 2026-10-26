@@ -71,7 +71,13 @@ Contrail drops expired labels, applies CID-pinned labels only to the matching re
 Per-source `values` filters stored label values; `subjects: "known"` restricts
 subjects to indexed identities and schedules durable first-seen `queryLabels`
 backfill. Stored retractions always pass admission. `backfill: false` starts a
-new stream from now rather than replaying its entire history.
+new stream from now rather than replaying its entire history. If that first
+connection receives no frame (a quiet labeler), there is no sequence number to
+resume from, so the next cycle replays from the beginning and keeps only
+labels created after the first connection (allowing five minutes of clock
+skew). Replay may span multiple cycles: each resumes from its saved cursor
+and retains that timestamp cutoff. Enabling historical backfill disables the
+cutoff; it does not reset an existing cursor.
 
 Set `enforce: true` to enforce `!hide` and `!takedown` independently of caller
 labeler selection. Account labels are included on returned records as well as

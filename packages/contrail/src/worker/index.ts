@@ -92,9 +92,10 @@ export function createWorker<Env extends WorkerEnv = WorkerEnv>(
   });
 
   let ready = false;
-  const ensureReady = async (env: Env, db: Database): Promise<void> => {
+  const ensureReady = async (env: Env, db: Database, request = false): Promise<void> => {
     if (ready) return;
-    await contrail.init(db);
+    // Requests never wait on a moderation policy job; cron cycles finish it.
+    await contrail.init(db, { deferModerationPolicyJob: request });
     if (options.reportsBinding) {
       const reportsDb = env[options.reportsBinding] as Database | undefined;
       if (!reportsDb) throw new TypeError(`Missing report storage binding ${options.reportsBinding}`);
@@ -111,7 +112,7 @@ export function createWorker<Env extends WorkerEnv = WorkerEnv>(
       ctx?: ExecutionContext,
     ): Promise<Response> {
       const db = env[binding] as Database;
-      await ensureReady(env, db);
+      await ensureReady(env, db, true);
       const response = (await handle(request, db, options.reportsBinding ? env[options.reportsBinding] as Database : undefined)) as Response;
       const notifyPath = `/xrpc/${contrail.config.namespace}.notifyOfUpdate`;
       if (

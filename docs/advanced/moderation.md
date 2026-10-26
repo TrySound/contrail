@@ -70,8 +70,10 @@ public at that point. Use the private report inbox for those fields.
   until all applicable actions have been removed. An update retracts the old
   subject/value and applies the new one atomically. Editing an action into an
   invalid record retracts it.
-- `createdAt` is clamped to the projection time, so a forward-dated action
-  cannot pre-empt labels issued before it was actually observed.
+- `createdAt` is clamped to the time the source observed the action (the
+  Jetstream event or reconcile listing), so a forward-dated action cannot
+  pre-empt labels issued before it was actually observed, and re-projecting
+  the same event keeps the same timestamp.
 - Untrusted authors cannot write moderation state, even through backfill or
   notify ingestion. The action collection has no generic public query routes
   and is excluded from ordinary network-wide discovery/dependent backfill.
@@ -105,12 +107,12 @@ identity at that rate. The first identity write rechecks an earlier record-only
 backfill; routine refreshes do not restart completed work. Changing a source's
 value allowlist resets its historical query checkpoints and drops stored values
 no longer admitted. Labels and each page checkpoint commit together, with
-bounded work and durable retries. Policy and queue generations are checked
+bounded work and durable retries. An explicit HTTP 400 `InvalidCursor` response
+resets historical pagination for the next retry; transient failures retain the
+saved cursor. Policy and queue generations are checked
 inside that transaction: an old response cannot reinsert a pruned value, complete
 a newly reset backfill, or overwrite another worker's progress. Reverting a
-policy also invalidates its earlier in-flight requests. Schema version 16 adds
-the queue generation column during initialization, before policy maintenance.
-The labeler must support the standard DID
+policy also invalidates its earlier in-flight requests. The labeler must support the standard DID
 and trailing-`*` URI patterns; observe real results/pagination before rollout.
 
 Schema version 17 upgrades stored label, action and override creation timestamps
@@ -128,7 +130,9 @@ rebuilds search indexes. `init()` rewrites the source trust table at once and
 starts a durable paged job that prunes no-longer-admitted labels, recomputes
 hidden state and requeues changed known-subject backfill. `init()` runs a
 short bounded slice inline, so small instances finish immediately; larger ones
-finish in the following moderation cycles. Until then, materialized hiding can
+finish in the following moderation cycles. Pass
+`init(db, { deferModerationPolicyJob: true })` on request paths to skip the
+inline slice; `createWorker` does this for requests and runs the job from cron. Until then, materialized hiding can
 lag: content of a removed moderator or no-longer-enforced value stays hidden,
 and stored hide labels of a newly enforced source are not yet applied. A
 newer policy, including a revert, replaces an unfinished job.
@@ -220,6 +224,12 @@ queues nothing. When a subject's visibility changes, or reaches a stored
 `moderation_recount_queue` and recounted in bounded pages by the moderation
 cycle. Counts, count filters, sorts and cursors all use the same stored columns
 and stay mutually consistent. They can lag a takedown by one cycle.
+
+A recount whose parent has more children than there are `moderation_hidden`
+rows takes the index-only total and subtracts the hidden children found from
+the hidden rows, so popular parents cost about the same as without moderation.
+Smaller parents, distinct counts, and instances with more than 10,000 hidden
+rows check each child instead.
 
 Built-in queries and pipeline queries enforce policy. Custom raw-SQL handlers
 must include `visibleRecordSql(alias)`; Contrail cannot rewrite arbitrary
@@ -330,11 +340,10 @@ Preference/UI disclosure is not a substitute for backend enforcement.
 
 ## Rollout and cache safety
 
-Publish/upgrade all three packages before integrating an older app. Blento's
-current checkout uses Contrail 0.5 and older atcute/OAuth APIs: that migration
-must precede replacing its hardcoded denylist. Choose a moderator DID, create
-the replacement takedown, confirm server-side 404s, and only then remove the
-old protection. No account action should be published without operator review.
+When replacing an app's existing protection (for example a hardcoded denylist),
+choose a moderator DID, publish the replacement takedown, confirm server-side
+404s, and only then remove the old protection. No account action should be
+published without operator review.
 
 Purge app-owned image, OG-image and CDN caches when hiding a subject. The
 record-only transactional change log does not currently emit lifecycle or

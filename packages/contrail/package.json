@@ -80,6 +80,7 @@
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:postgres": "CONTRAIL_TEST_DIALECT=postgres vitest run --testTimeout=60000 tests/moderation tests/account-lifecycle tests/label-backfill-policy tests/label-live-policy tests/profile-moderation tests/self-labels tests/labels",
     "test:built": "node tests/built-sqlite.mjs && node tests/built-alluvium.mjs && node tests/built-lexicons.mjs && node tests/built-client.mjs && node tests/built-changes.mjs",
     "test:workerd": "node tests/workerd-smoke.mjs",
     "test:watch": "vitest"
@@ -109,6 +110,7 @@
   "devDependencies": {
     "@atcute/crypto": "2.4.4",
     "@cloudflare/workers-types": "5.20260815.1",
+    "@electric-sql/pglite": "0.5.11",
     "@types/node": "^26.1.2",
     "@types/pg": "^8.20.4",
     "pg": "^8.22.0",

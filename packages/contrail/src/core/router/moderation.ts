@@ -15,7 +15,7 @@ import {
   knownAccountDids,
 } from "../moderation";
 import { hydrateLabels } from "../labels/hydrate";
-import { formatRecord } from "./helpers";
+import { batchedInQuery, formatRecord } from "./helpers";
 import { REPORT_REASON_TYPES } from "../../moderation-contract";
 
 export { REPORT_REASON_TYPES };
@@ -57,6 +57,15 @@ async function smallJson(c: Context): Promise<any> {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
     throw new Error("Expected object");
   return parsed;
+}
+
+/** The createReport Lexicon bounds `reason` by graphemes and UTF-8 bytes. */
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+function withinReasonLimits(reason: string): boolean {
+  if (new TextEncoder().encode(reason).length > 20_000) return false;
+  let count = 0;
+  for (const _ of graphemes.segment(reason)) if (++count > 2000) return false;
+  return true;
 }
 
 interface ReportRow {
@@ -104,47 +113,77 @@ async function isIndexedSubject(
   );
 }
 
+interface ReportPreview {
+  records: any[];
+  labels: Record<string, unknown[]>;
+  hidden: boolean;
+}
+
 /** Never use the public pipeline for moderator previews: moderators need the
- * locally indexed hidden subject too. No PDS fetch and no private data joins. */
-async function preview(db: Database, config: ContrailConfig, row: ReportRow) {
-  const records: any[] = [];
-  if (row.subject_uri.startsWith("at://")) {
-    const parsed = parseResourceUri(row.subject_uri);
-    const key = resolveCollectionKey(config, parsed.collection!);
-    if (key) {
-      const record = await db
-        .prepare(`SELECT * FROM ${recordsTableName(key)} WHERE uri = ?`)
-        .bind(row.subject_uri)
-        .first<any>();
-      if (record)
-        records.push(
-          formatRecord({ ...record, collection: parsed.collection }),
-        );
-    }
-  } else
-    for (const pc of (config.profiles ?? []).map(normalizeProfileConfig)) {
-      const record = await db
-        .prepare(
-          `SELECT * FROM ${recordsTableName(pc.shortName ?? pc.collection)} WHERE did = ? AND rkey = ?`,
-        )
-        .bind(row.subject_did, pc.rkey ?? "self")
-        .first<any>();
-      if (record)
-        records.push(formatRecord({ ...record, collection: pc.collection }));
-    }
+ * locally indexed hidden subject too. No PDS fetch and no private data joins.
+ * Batched per page: a fixed number of queries regardless of report count. */
+async function previews(
+  db: Database,
+  config: ContrailConfig,
+  rows: ReportRow[],
+): Promise<Map<string, ReportPreview>> {
+  const recordsByUri = new Map<string, any>();
+  const uris = new Map<string, string[]>();
+  const select = (key: string, list: string[]) =>
+    uris.set(key, [...(uris.get(key) ?? []), ...list]);
+  const profileConfigs = (config.profiles ?? []).map(normalizeProfileConfig);
+  const profileUris = (did: string) =>
+    profileConfigs.map((pc) => ({ pc, uri: `at://${did}/${pc.collection}/${pc.rkey ?? "self"}` }));
+  for (const row of rows) {
+    if (row.subject_uri.startsWith("at://")) {
+      const key = resolveCollectionKey(config, parseResourceUri(row.subject_uri).collection!);
+      if (key) select(key, [row.subject_uri]);
+    } else
+      for (const { pc, uri } of profileUris(row.subject_did))
+        select(pc.shortName ?? pc.collection, [uri]);
+  }
+  for (const [key, list] of uris) {
+    const nsid = config.collections[key]?.collection ?? key;
+    const found = await batchedInQuery<any>(
+      db,
+      `SELECT * FROM ${recordsTableName(key)} WHERE uri IN (__IN__)`,
+      [],
+      [...new Set(list)],
+    );
+    for (const record of found)
+      recordsByUri.set(record.uri, formatRecord({ ...record, collection: nsid }));
+  }
+  const subjects = [...new Set(rows.flatMap((r) => [r.subject_uri, r.subject_did]))];
   const labels = await hydrateLabels(
     db,
-    [row.subject_uri, row.subject_did],
+    subjects,
     config.labels?.sources.map((s) => s.did) ?? [],
-    new Map(records.map((r) => [r.uri, r.cid])),
+    new Map([...recordsByUri.values()].map((r) => [r.uri, r.cid])),
   );
-  const hidden = !!(await db
-    .prepare(
-      `SELECT 1 FROM moderation_hidden WHERE subject IN (?, ?) AND (cid = '' OR cid = ?) AND ${activeHiddenSql()} LIMIT 1`,
-    )
-    .bind(row.subject_uri, row.subject_did, records[0]?.cid ?? row.subject_cid)
-    .first());
-  return { records, labels, hidden };
+  const hiddenRows = await batchedInQuery<{ subject: string; cid: string }>(
+    db,
+    `SELECT subject, cid FROM moderation_hidden WHERE subject IN (__IN__) AND ${activeHiddenSql()}`,
+    [],
+    subjects,
+  );
+  const result = new Map<string, ReportPreview>();
+  for (const row of rows) {
+    const records = row.subject_uri.startsWith("at://")
+      ? [recordsByUri.get(row.subject_uri)].filter(Boolean)
+      : profileUris(row.subject_did).map(({ uri }) => recordsByUri.get(uri)).filter(Boolean);
+    const cid = records[0]?.cid ?? row.subject_cid;
+    result.set(row.id, {
+      records,
+      labels: Object.fromEntries(
+        [row.subject_uri, row.subject_did].filter((s) => labels[s]).map((s) => [s, labels[s]!]),
+      ),
+      hidden: hiddenRows.some(
+        (h) => (h.subject === row.subject_uri || h.subject === row.subject_did) &&
+          (h.cid === "" || h.cid === cid),
+      ),
+    });
+  }
+  return result;
 }
 
 export function registerModerationRoutes(
@@ -210,7 +249,7 @@ export function registerModerationRoutes(
     if (
       !(REPORT_REASON_TYPES as readonly string[]).includes(body.reasonType) ||
       (body.reason !== undefined &&
-        (typeof body.reason !== "string" || [...body.reason].length > 2000))
+        (typeof body.reason !== "string" || !withinReasonLimits(body.reason)))
     ) {
       return c.json({ error: "InvalidRequest" }, 400);
     }
@@ -334,8 +373,8 @@ export function registerModerationRoutes(
       )
       .bind(status, ...(cursor ? [cursor[0], cursor[0], cursor[1]] : []), limit)
       .all<ReportRow>();
-    const reports = await Promise.all(
-      rows.results.map(async (r) => ({
+    const previewById = await previews(projectionDb, config, rows.results);
+    const reports = rows.results.map((r) => ({
         id: Number(r.id),
         reportedBy: r.reporter,
         subject: subject(r),
@@ -349,9 +388,8 @@ export function registerModerationRoutes(
           r.resolved_at === null
             ? null
             : new Date(Number(r.resolved_at)).toISOString(),
-        preview: await preview(projectionDb, config, r),
-      })),
-    );
+        preview: previewById.get(r.id),
+      }));
     const last = rows.results.at(-1);
     return c.json({
       reports,

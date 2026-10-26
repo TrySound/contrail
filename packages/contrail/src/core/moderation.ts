@@ -542,7 +542,11 @@ export function accountUpdateStatements(
         `EXISTS (SELECT 1 FROM ${recordsTableName(short)} WHERE did = ?)`,
     ),
   ];
-  const stmts = updates.map((u) =>
+  // Mixed action/lifecycle batches already hold this lock before reaching
+  // their account writes. Account-only batches must take it before locking
+  // account_state too, not just during the later hidden-state recompute.
+  const stmts = moderationLockStatements(db);
+  stmts.push(...updates.map((u) =>
     db
       .prepare(
         `INSERT INTO account_state (did, active, status, source, epoch, cursor, time_us)
@@ -565,7 +569,7 @@ export function accountUpdateStatements(
         u.did,
         ...knownChecks.map(() => u.did),
       ),
-  );
+  ));
   const token = moderationDirtyToken();
   const dids = [...new Set(updates.map((u) => u.did))];
   for (let i = 0; i < dids.length; i += 50) {
@@ -623,8 +627,10 @@ export function actionProjectionStatements(
     if (!a || e.operation === "delete") continue;
     stmts.push(...markModerationDirtyStatements(db, token, [a.subject]));
     // A forward-dated createdAt must not pre-empt labels issued before the
-    // action was projected.
-    const cts = Math.min(Date.parse(a.createdAt), Date.now());
+    // action was observed. Clamp to the source's observation time rather than
+    // the projection time, so re-projecting the same event keeps its cts.
+    const observedMs = e.source?.time_us ? Math.floor(e.source.time_us / 1000) : Date.now();
+    const cts = Math.min(Date.parse(a.createdAt), observedMs, Date.now());
     const exp = a.expiresAt ? Math.floor(Date.parse(a.expiresAt) / 1000) : null;
     if (a.action === "override") {
       for (const val of new Set(a.labels ?? [""]))

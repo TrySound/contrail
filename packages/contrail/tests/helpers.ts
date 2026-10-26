@@ -1,10 +1,15 @@
 import { createSqliteDatabase } from "../src/adapters/sqlite";
+import { createPgliteDatabase } from "./pglite";
 import type { Database, IngestEvent, ResolvedContrailConfig } from "../src/index";
 import { resolveConfig } from "../src/index";
 import { initSchema } from "../src/index";
 import { ingestRecords as coreIngestRecords, type ExistingRecordInfo } from "../src/index";
 
+/** `CONTRAIL_TEST_DIALECT=postgres` runs suites on in-process PostgreSQL. */
+export const TEST_POSTGRES = process.env.CONTRAIL_TEST_DIALECT === "postgres";
+
 export function createTestDb(): Database {
+  if (TEST_POSTGRES) return createPgliteDatabase();
   return createSqliteDatabase(":memory:");
 }
 

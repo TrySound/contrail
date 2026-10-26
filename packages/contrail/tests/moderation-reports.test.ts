@@ -282,7 +282,16 @@ describe("private moderation reports", () => {
         })
       ).status,
     ).toBe(400);
-    for (let i = 0; i < 10; i++)
+    // The Lexicon limit counts graphemes: 2000 "e" + combining accent pairs fit.
+    expect(
+      (
+        await request(app, "com.atproto.moderation.createReport", reporter, {
+          ...report,
+          reason: "e\u0301".repeat(2000),
+        })
+      ).status,
+    ).toBe(200);
+    for (let i = 0; i < 9; i++)
       expect(
         (
           await request(
@@ -346,6 +355,30 @@ describe("private moderation reports", () => {
       (await db.prepare("SELECT used FROM moderation_report_limits").first<{ used: number }>())!.used,
     ).toBe(2);
   });
+  it("builds inbox previews with a query count independent of page size", async () => {
+    const { db, config } = await setup();
+    let queries = 0;
+    const counting = {
+      dialect: db.dialect,
+      prepare: (sql: string) => (queries++, db.prepare(sql)),
+      batch: (stmts: any[]) => db.batch(stmts),
+    };
+    const app = createApp(counting as typeof db, config);
+    const list = async () => {
+      queries = 0;
+      const response = await request(app, "com.example.moderation.listReports", moderator);
+      expect(response.status).toBe(200);
+      return { queries, reports: ((await response.json()) as any).reports.length };
+    };
+    await request(app, "com.atproto.moderation.createReport", reporter, report);
+    const one = await list();
+    for (let i = 0; i < 6; i++)
+      await request(app, "com.atproto.moderation.createReport", reporter, report);
+    const seven = await list();
+    expect([one.reports, seven.reports]).toEqual([1, 7]);
+    expect(seven.queries).toBe(one.queries);
+  });
+
   it("paginates stable equal-time reports and rejects bad cursor/unknown resolution", async () => {
     const { app, db } = await setup();
     for (let i = 0; i < 3; i++)

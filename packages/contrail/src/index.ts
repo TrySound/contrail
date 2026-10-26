@@ -1,7 +1,7 @@
 /** Contrail's public API. */
 export type { LexiconDoc } from "@atcute/lexicon-doc";
 export { Contrail } from "./contrail";
-export type { AppOptions, ContrailOptions } from "./contrail";
+export type { AppOptions, ContrailInitOptions, ContrailOptions } from "./contrail";
 export * from "./public-service";
 
 // Configuration, storage, identity, and dialects.

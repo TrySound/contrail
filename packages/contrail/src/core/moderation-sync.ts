@@ -286,6 +286,7 @@ async function backfillOne(
     db.prepare("UPDATE label_backfill_queue SET generation = generation WHERE src = ? AND did = ?")
       .bind(row.src, row.did),
   ];
+  let resetCursor = false;
   try {
     const state = await getLabelerState(db, row.src, source.endpoint, {
       ...config.networkOverrides,
@@ -301,7 +302,16 @@ async function backfillOne(
     const response = await fetch(url, {
       signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
     });
-    if (!response.ok) throw new Error(`queryLabels HTTP ${response.status}`);
+    if (!response.ok) {
+      // A rejected historical checkpoint cannot recover by retrying it. Only
+      // restart for an explicit invalid-cursor error; transient failures and
+      // unrelated bad requests must retain the last successful position.
+      if (row.cursor && response.status === 400) {
+        const failure = await response.json().catch(() => null) as { error?: string } | null;
+        resetCursor = failure?.error === "InvalidCursor";
+      }
+      throw new Error(`queryLabels HTTP ${response.status}`);
+    }
     const data = (await response.json()) as {
       labels?: IncomingLabel[];
       cursor?: string;
@@ -339,9 +349,10 @@ async function backfillOne(
     await db.batch([
       ...locks(),
       db.prepare(
-        `UPDATE label_backfill_queue SET retries = retries + 1, next_attempt_at = ?,
-          generation = generation + 1 WHERE ${queueGuard}`,
+        `UPDATE label_backfill_queue SET cursor = CASE WHEN CAST(? AS INTEGER) = 1 THEN NULL ELSE cursor END,
+          retries = retries + 1, next_attempt_at = ?, generation = generation + 1 WHERE ${queueGuard}`,
       ).bind(
+        resetCursor ? 1 : 0,
         Date.now() + Math.min(3_600_000, 30_000 * 2 ** Math.min(row.retries, 7)),
         ...guardArgs,
       ),
@@ -374,7 +385,10 @@ export async function runModerationRecounts(
     ),
   ];
   if (!childShorts.length) {
-    await db.prepare("DELETE FROM moderation_recount_queue").run();
+    // Rows can only remain from an older config with counted relations. Read
+    // first: an unconditional DELETE would be a write on every tick.
+    if (await db.prepare("SELECT 1 FROM moderation_recount_queue LIMIT 1").first())
+      await db.prepare("DELETE FROM moderation_recount_queue").run();
     return 0;
   }
   const rows = await db
