@@ -241,7 +241,7 @@ async function streamAndFlush(
         }
 
         // A feed can only go over cap right after this batch's fan-out or follow
-        // backfill, so prune exactly the feeds it grew (see the cron path in
+        // backfill, so prune the feeds it grew (see the cron path in
         // jetstream.ts). If the fan-out overflowed the budget or the prune
         // failed, the sweep below picks up the rest.
         if (config.feeds) {
@@ -264,7 +264,9 @@ async function streamAndFlush(
           }
         }
 
-        // Drain newly-known DIDs and ask Constellation for back-edges.
+        // Drain newly-known DIDs and ask Constellation for back-edges. It prunes
+        // the feeds its follows backfill; a failure may come after a page
+        // committed, so the sweep below picks those up.
         if (config.feeds && opts.newlyKnownDids && opts.newlyKnownDids.size > 0) {
           const drained = [...opts.newlyKnownDids];
           opts.newlyKnownDids.clear();
@@ -273,6 +275,7 @@ async function streamAndFlush(
               await backfillFollowersFromConstellation(db, config, subj);
             } catch (err) {
               log.warn(`[constellation] subject=${subj} failed: ${err}`);
+              state.feedDirty = true;
             }
           }
         }
@@ -331,7 +334,7 @@ async function streamAndFlush(
             }
             if (pruned > 0) {
               log.log(
-                `Pruned ${pruned} feed items (sweep, reason=${dirtyDue ? "overflow" : "recovery"})`
+                `Pruned ${pruned} feed items (sweep, reason=${dirtyDue ? "dirty" : "recovery"})`
               );
             }
           }

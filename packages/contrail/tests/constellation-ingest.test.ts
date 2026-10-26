@@ -60,7 +60,7 @@ async function cidFor(record: unknown) {
   return toString(await create(CODEC_DCBOR, encode(record)));
 }
 
-async function setup() {
+async function setup(feedMaxItems?: number) {
   const config = resolveConfig({
     namespace: "com.example",
     profiles: [],
@@ -75,7 +75,11 @@ async function setup() {
       },
     },
     feeds: {
-      network: { follow: "follow", targets: ["event"] },
+      network: {
+        follow: "follow",
+        targets: ["event"],
+        ...(feedMaxItems ? { maxItems: feedMaxItems } : {}),
+      },
     },
     constellation: {
       url: "https://constellation.example.com",
@@ -172,5 +176,37 @@ describe("Constellation enrichment through shared ingestion", () => {
         .bind(FOLLOWER, EVENT_URI)
         .first(),
     ).toEqual({ actor: FOLLOWER, uri: EVENT_URI });
+  });
+
+  it("prunes the feeds its follows backfill", async () => {
+    const { config, db } = await setup(1);
+    // The follower's feed is already at its cap of 1, with a newer item.
+    const newer = `at://did:plc:other/${EVENT}/newer`;
+    await db
+      .prepare(
+        "INSERT INTO feed_items (actor, uri, collection, time_us) VALUES (?, ?, ?, ?)",
+      )
+      .bind(FOLLOWER, newer, EVENT, TID_TIME + 1)
+      .run();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({ links: [{ did: FOLLOWER, rkey: FOLLOW_RKEY }] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+
+    expect(
+      await backfillFollowersFromConstellation(db, config, SUBJECT),
+    ).toBe(1);
+
+    // The backfill added the subject's older event; the prune dropped it.
+    const feed = await db
+      .prepare("SELECT uri FROM feed_items WHERE actor = ?")
+      .bind(FOLLOWER)
+      .all<{ uri: string }>();
+    expect((feed.results ?? []).map((r) => r.uri)).toEqual([newer]);
   });
 });

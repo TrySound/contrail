@@ -249,7 +249,9 @@ describe("grown-feed prune stays index-bounded", () => {
     const { db, sqls } = recordingDb(real);
     await pruneGrownFeeds(db, CONFIG, [authorEvent, newFollow], 100);
     expect(sqls.some((s) => /records_follow/is.test(s))).toBe(true);
-    expect(sqls.some((s) => /DELETE FROM feed_items/is.test(s))).toBe(true);
+    // One cutoff delete per grown feed: the follower's event feed, and the new
+    // follower's event and rsvp feeds.
+    expect(sqls.filter((s) => /DELETE FROM feed_items/is.test(s))).toHaveLength(3);
     await assertAllBounded(real, sqls);
   });
 
@@ -259,6 +261,21 @@ describe("grown-feed prune stays index-bounded", () => {
     const lookup = sqls.find((s) => /records_follow/is.test(s))!;
     const plan = (await queryPlan(real, lookup)).join(" | ");
     expect(plan).toMatch(/idx_follow_subject/i);
+  });
+
+  it("splits the follower lookup into chunks, each on idx_follow_subject", async () => {
+    const authors = Array.from({ length: 51 }, (_, i) => ({
+      ...authorEvent,
+      did: `did:plc:author${i}`,
+      uri: `at://did:plc:author${i}/${EVENT}/evt3`,
+    }));
+    const { db, sqls } = recordingDb(real);
+    await pruneGrownFeeds(db, CONFIG, authors, 100);
+    const lookups = sqls.filter((s) => /records_follow/is.test(s));
+    expect(lookups).toHaveLength(2);
+    for (const lookup of lookups) {
+      expect((await queryPlan(real, lookup)).join(" | ")).toMatch(/idx_follow_subject/i);
+    }
   });
 });
 

@@ -535,6 +535,11 @@ export interface GrownFeedPruneResult {
  * adds the batch's new followers, and runs the cutoff delete for those
  * (actor, collection) pairs only, rather than for a slice of every actor.
  *
+ * A follow update counts as a new follower too. The cron path applies a batch
+ * in several transactions and prunes once at the end, so a fan-out to a
+ * follower can precede an update that repoints their follow; the lookup by
+ * subject would then no longer find them.
+ *
  * A popular author's fan-out has no upper bound, so at most `limit` feeds are
  * pruned and `overflow` reports the rest. feed_items is a soft cache, so a feed
  * left a few rows over cap until the sweep reaches it is harmless.
@@ -576,7 +581,10 @@ export async function pruneGrownFeeds(
         written.add(e.collection);
         authors.set(e.did, written);
       }
-      if (short === followShort && e.operation === "create") {
+      if (
+        short === followShort &&
+        (e.operation === "create" || e.operation === "update")
+      ) {
         for (const target of targets) {
           add(e.did, nsidForShortName(config, target.collection) ?? target.collection);
         }
