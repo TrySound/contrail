@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "contrail-cost-benchmark-local-only",
+  "main": "src/cost-worker.ts",
+  "compatibility_date": "2025-12-25",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "contrail-cost-benchmark-local-only",
+      "database_id": "COST_BENCHMARK_LOCAL_ONLY"
+    }
+  ],
+  "dev": { "host": "127.0.0.1" }
+}

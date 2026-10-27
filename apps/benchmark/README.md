@@ -1,4 +1,90 @@
-# Contrail backfill benchmark
+# Contrail benchmarks
+
+Deterministic D1 row-cost workloads and live-network discovery/backfill throughput benchmarks. Commands below run from the repository root.
+
+## D1 row costs
+
+```bash
+# Small CI matrix, checked against reviewed per-phase ceilings
+pnpm test:cost
+pnpm bench:cost:ci
+
+# Heavily used app: 1k/10k posts, 100 actors, 50 observations/requests per phase
+pnpm bench:cost
+
+# Larger corpus; allow more time on slower machines
+pnpm bench:cost --profile heavy --timeout 900000
+
+# Compare the feature layers on the same corpus
+pnpm bench:cost --profile ci --preset all
+
+# Custom deterministic workload
+pnpm bench:cost --sizes 1000,10000 --actors 100 --operations 100 --seed 42
+```
+
+Each fixture gets a fresh, disposable **local-only D1** in a Worker using this app's pinned Wrangler. The Worker bundles the current Contrail source, not potentially stale `dist` files. State is removed afterward, including on failure; there is no remote database option and no deployment, production cursor reset or backfill. Each run freezes the application clock and seeds the same content and relationships. External fetches during workloads are prohibited and counted; unexpected warnings/errors fail the run.
+
+`--sizes` counts **posts**, not total rows. Each post has one comment and one reaction; every fourth post also adds a reaction to one hot parent. Profiles, follows, labels, indexes, FTS and ordering state add further rows. Actor count controls follower fanout and ownership concentration independently of corpus size.
+
+Presets are cumulative:
+
+- `core`: records, field indexes, FTS, references, total/grouped relation counts.
+- `moderation`: core plus external labels and private report SQL workloads.
+- `full` (default): moderation plus cached profiles and following feeds.
+
+### Workloads and accounting
+
+The JSON report (`apps/benchmark/results/cost-latest.json` by default) includes:
+
+- Creates, updates, deletes, unchanged-CID observations, exact/stale replay, and hot-parent reactions.
+- List/filter/search/count-sort queries, keyset pagination, feed reads, relation/reference hydration, cached profiles and attached labels.
+- Label hide/replay/retraction, account hide/restore, account deactivation/reactivation, moderator action creation/deletion, label expiry and complete paged enforcement-policy disable/re-enable jobs, including queued relation recounts.
+- Private report creation, inbox previews, resolution and exhausted-report-quota requests. These use the real routes with a **preauthenticated synthetic gate**: this measures SQL after authentication, not JWT verification/DID-resolution costs.
+- Warm schema checks, quiet moderation cycles **without network reconciliation**, and bounded feed-prune pages. These are not a measurement of the complete scheduled acquisition cycle.
+- Single-publisher and many-publisher floods, plus `recordFilter: false` exclusions. Reports include admitted/dropped observations, retained-record/ordering-state growth and checkpoint progress. **Publisher admission limits are not implemented by this harness.** Open discoverable publishers are currently accepted; record-filter exclusions still write ordering/tombstone state. The report-quota case separately checks an existing protection: HTTP 429 with no additional report growth.
+
+`rowsRead` / `rowsWritten` come directly from D1 result metadata for **every statement**, including batch members and writes to indexes. They are not returned-row counts, SQL-statement estimates, latency proxies or `EXPLAIN` estimates. The wrapper executes `first()` SQL once through `all()` to retain its metadata. Missing/invalid metadata, partial batch results and uninstrumented statements fail closed. A sanity probe requires a 32-row scan to report more reads than a one-row primary-key lookup and an indexed insert to report more writes than an unindexed one.
+
+Costs are separated into **setup**, **workload** and **verification**. Seed construction uses normal ingestion; it is not a throughput benchmark of the optimized historical bulk-loader. Correctness assertions, counter probes and storage snapshots are verification overhead, never charged to the simulated app's per-operation rates. Reports retain per-phase SQL-template attribution, outcomes, units, elapsed time, D1 `size_after` when available, and retained-row snapshots. Database bytes are diagnostic metadata, not a storage-billing estimate.
+
+Units matter: update phases count **observations**, which can coalesce repeated mutations to a small set of targets; accepted-mutation counts are reported separately. Query phases count requests. Hydration includes its base list query, so do not double-count it as another list request in projections.
+
+The fixture intentionally uses opaque synthetic CIDs and no runtime Lexicon validators. It preloads identities/profiles and calls core ingestion directly. Live acquisition, identity discovery/enrichment after publisher admission, authenticated DID resolution, remote labeler backfill, durable change-log consumers and public-query rate limits are not modeled. Flood ingestion costs are therefore a **lower bound on the complete pipeline**, not a claim that publisher floods are safe.
+
+### Guardrails and current findings
+
+`baselines/cost-ci.json` contains absolute read/write/statement ceilings per phase for 64/512-post full fixtures. Initial ceilings allow 10% plus 32 reads / 8 writes of slack; zero-write phases retain a zero-write ceiling. Fixture parameters, phase units and pinned Wrangler/Miniflare/workerd versions must match. Timings are informational. CI also checks that cold updates/replay and quiet initialization/moderation do not acquire corpus-sized work (per-unit ceiling: 3× the small fixture plus 16 rows). Account-wide jobs, hot-parent recounts and policy migrations legitimately depend on affected data and are reported separately.
+
+The initial 1k/10k-post, 100-actor, 50-operation runs already identify **existing costs to improve**, not approved efficiency targets:
+
+| Operation | Reads/unit at 1k posts | Reads/unit at 10k posts |
+| --- | ---: | ---: |
+| Cold update observation | 12.34 | 12.34 |
+| Delete | 2,019.62 | 19,839.62 |
+| Filtered list request | 2,000 | 20,000 |
+| Feed request | 101 | 1,001 |
+
+The delete's dominant SQL is `DELETE FROM feed_items WHERE uri = ?`; the filtered list reads/sorts the matching corpus before returning its bounded page. Scaling observations for deletion, filtered queries, feed reads and feed sweeps are explicitly marked **investigate** in reports and printed when growth is material. Their current costs are captured in the CI ceilings so further regressions fail, but **passing today's baseline does not mean today's spend is acceptable**. Review the query attribution before raising a ceiling.
+
+Regenerate ceilings only deliberately, after inspecting the diff:
+
+```bash
+pnpm bench:cost --profile ci \
+  --write-baseline apps/benchmark/baselines/cost-ci.json
+```
+
+### Usage projections and limits
+
+```bash
+pnpm bench:cost --sizes 10000 \
+  --projection apps/benchmark/configs/cost-usage.example.json
+```
+
+Projection files provide `days` and `dailyUnits` keyed by workload phase name. The report computes measured rows/unit × requested units/day × days for each fixture. Omitted phases contribute zero; setup/verification cannot be projected as daily activity. The example is illustrative, not a complete app traffic model. No USD prices or plan allowances are hardcoded: apply current, dated D1 pricing to the row estimates separately.
+
+These are **local emulator counters**, useful for deterministic regression checks. **Remote billing equivalence has not been calibrated**; that requires a separately approved disposable remote-D1 experiment. Projections assume the measured data shape and are not billing guarantees, pre-execution budgets or production circuit breakers. This work changes no production admission/moderation behavior.
+
+## Historical backfill throughput
 
 Fresh, repeatable local-D1 benchmarks for complete Contrail discovery and historical backfill runs.
 

@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "bench": "node --no-warnings --experimental-strip-types src/bench.ts",
+    "bench:cost": "node --no-warnings --experimental-strip-types src/cost.ts",
+    "test:cost": "node --no-warnings --experimental-strip-types --test src/cost/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
