@@ -265,8 +265,8 @@ async function streamAndFlush(
         }
 
         // Drain newly-known DIDs and ask Constellation for back-edges. It prunes
-        // the feeds its follows backfill; a failure may come after a page
-        // committed, so the sweep below picks those up.
+        // the feeds its follows backfill; whatever a failed backfill leaves over
+        // cap waits for the recovery pass.
         if (config.feeds && opts.newlyKnownDids && opts.newlyKnownDids.size > 0) {
           const drained = [...opts.newlyKnownDids];
           opts.newlyKnownDids.clear();
@@ -275,7 +275,6 @@ async function streamAndFlush(
               await backfillFollowersFromConstellation(db, config, subj);
             } catch (err) {
               log.warn(`[constellation] subject=${subj} failed: ${err}`);
-              state.feedDirty = true;
             }
           }
         }

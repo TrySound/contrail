@@ -245,20 +245,17 @@ export async function runGrownFeedPrune(
  *  long-lived persistent loop uses its in-memory clocks instead).
  *
  *  The feeds `applied` grew are pruned directly ({@link runGrownFeedPrune}). A
- *  sweep slice runs only when a full pass is overdue, the batch's fan-out
- *  overflowed the grown-feed budget, or the caller passes `sweep` because an
- *  earlier step may have grown feeds without pruning them (a failed
- *  Constellation backfill). It records pass completion so the recovery clock
- *  measures from a real drain (one slice per tick until the cursor wraps)
+ *  sweep slice runs only when a full pass is overdue or the batch's fan-out
+ *  overflowed the grown-feed budget. It records pass completion so the recovery
+ *  clock measures from a real drain (one slice per tick until the cursor wraps)
  *  rather than resetting on a single slice. The recovery pass remains the
  *  safety net for anything the grown-feed prune doesn't see: a lowered cap, a
- *  bulk import, a follower past the budget, an ingest path that doesn't prune.
- *  No-op when feeds are unconfigured. */
+ *  bulk import, a follower past the budget, a failed Constellation backfill, an
+ *  ingest path that doesn't prune. No-op when feeds are unconfigured. */
 export async function runGatedFeedPrune(
   db: Database,
   config: ContrailConfig,
-  applied: readonly IngestEvent[],
-  sweep = false
+  applied: readonly IngestEvent[]
 ): Promise<void> {
   if (!config.feeds) return;
   if (buildFeedTargetCaps(config).size === 0) return;
@@ -267,11 +264,11 @@ export async function runGatedFeedPrune(
   const lastFullPassMs =
     (await getMetaNumber(db, FEED_PRUNE_LAST_FULL_PASS_META)) ?? 0;
   const recoveryDue = nowMs - lastFullPassMs >= FEED_PRUNE_RECOVERY_INTERVAL_MS;
-  if (!overflow && !sweep && !recoveryDue) return;
+  if (!overflow && !recoveryDue) return;
   const { pruned, done } = await runFeedPruneSlice(db, config);
   if (done) await setMeta(db, FEED_PRUNE_LAST_FULL_PASS_META, String(nowMs));
   if (pruned > 0) {
-    const reason = overflow ? "overflow" : sweep ? "requested" : "recovery";
+    const reason = overflow ? "overflow" : "recovery";
     getLogger(config).log(`Pruned ${pruned} feed items (sweep, reason=${reason})`);
   }
 }
@@ -292,8 +289,8 @@ export interface IngestState {
    *  `_contrail_meta`. */
   lastFullFeedPassMs: number;
   /** Set by the persistent loop when a flushed batch's fan-out overflowed the
-   *  grown-feed prune's budget, or a prune or Constellation backfill failed
-   *  after writing, so the next sweep window runs a slice. Cleared
+   *  grown-feed prune's budget, or the grown-feed prune failed, so the next
+   *  sweep window runs a slice. Cleared
    *  when the sweep runs. The cron path makes the same decision per-tick and
    *  doesn't need the flag. */
   feedDirty: boolean;
@@ -920,17 +917,17 @@ export async function runIngestCycle(
   // rows are inserted by this batch's fan-out and follow backfill (Constellation
   // prunes its own backfill above). So we prune the feeds this batch grew, and
   // nothing on ticks that ingested nothing feed-relevant — the overwhelming
-  // majority. A failed Constellation backfill may have committed a page before
-  // failing, so it also asks for a sweep slice.
+  // majority.
   //
   // The cron isolate recycles each tick, so the recovery sweep's cursor and
   // clock live in the DB. The clock tracks when a *full pass* over every actor
   // last completed, not the last slice: while a pass is overdue we keep slicing
   // every tick (bounded cost) until the cursor wraps, then reset the clock. So a
-  // feed the grown-feed prune didn't reach, a lowered cap, or a bulk import all
-  // drain within one recovery interval plus the pass's lap time.
+  // feed the grown-feed prune didn't reach (including one a failed Constellation
+  // backfill grew), a lowered cap, or a bulk import all drain within one
+  // recovery interval plus the pass's lap time.
   if (config.feeds) {
-    await runGatedFeedPrune(db, config, accepted, constellationFailures > 0);
+    await runGatedFeedPrune(db, config, accepted);
   }
 
   // Opt-in planner-stat maintenance (gated + persisted cadence; no-op unless

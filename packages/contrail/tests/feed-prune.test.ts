@@ -437,13 +437,6 @@ describe("runGatedFeedPrune (recovery gate)", () => {
     expect(await rows("dave", EVENT)).toHaveLength(5);
   });
 
-  it("runs a sweep slice when the caller asks for one", async () => {
-    await runGatedFeedPrune(db, CONFIG, []); // stamp the recovery clock
-    await seed("bob", EVENT, 5);
-    await runGatedFeedPrune(db, CONFIG, [], true);
-    expect(await rows("bob", EVENT)).toHaveLength(2);
-  });
-
   it("prunes only the feeds the batch grew when recovery is not due", async () => {
     await runGatedFeedPrune(db, CONFIG, []); // stamp the recovery clock
     await follow("alice", "bob");

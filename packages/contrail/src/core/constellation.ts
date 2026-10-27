@@ -114,8 +114,8 @@ async function fetchBacklinksPage(
  *  and ingest synthesized follow records into the configured follow table.
  *  Each page's follows backfill the followers' feeds, so the page prunes
  *  those feeds itself. Best-effort: failures are logged but not retried
- *  (caller can re-trigger). A throw can come after a page committed, so the
- *  caller should treat it as possibly-grown feeds and schedule a sweep. */
+ *  (caller can re-trigger). A throw can come after a page committed; the
+ *  recovery pass trims whatever that leaves over cap. */
 export async function backfillFollowersFromConstellation(
   db: Database,
   config: ContrailConfig,
