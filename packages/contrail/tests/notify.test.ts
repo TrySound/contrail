@@ -1,11 +1,20 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
 import type { Database } from "../src/index";
 import { resolveConfig } from "../src/index";
-import { ingestRecords, createTestDb, createTestDbWithSchema, makeEvent, TEST_CONFIG } from "./helpers";
+import {
+  ingestRecords,
+  createTestDb,
+  createTestDbWithSchema,
+  feedUris,
+  GROWN_FEED,
+  makeEvent,
+  seedGrownFeed,
+  TEST_CONFIG,
+} from "./helpers";
 import { initSchema } from "../src/index";
 import { parseAtUri } from "../src/index";
 import { createApp } from "../src/index";
-import { processNotifyUris, queryRecords } from "../src/index";
+import { processNotifyUris, queryRecords, runGatedFeedPrune } from "../src/index";
 import type { Hono } from "hono";
 
 const NOTIFY_CONFIG = { ...TEST_CONFIG, notify: true };
@@ -84,8 +93,8 @@ describe("POST notifyOfUpdate", () => {
   }
 
   /** Seed the identities table so getPDS resolves without hitting slingshot. */
-  async function seedIdentity(did: string, pds: string) {
-    await db
+  async function seedIdentity(did: string, pds: string, target: Database = db) {
+    await target
       .prepare(
         "INSERT OR REPLACE INTO identities (did, handle, pds, resolved_at) VALUES (?, ?, ?, ?)"
       )
@@ -211,6 +220,34 @@ describe("POST notifyOfUpdate", () => {
       .first<{ source_id: string; source_time_us: number }>();
     expect(version?.source_id).toBe("pds-notify");
     expect(version?.source_time_us).toBeTypeOf("number");
+  });
+
+  it("prunes the feeds a notified record grew, and no others", async () => {
+    const EVENT = "community.lexicon.calendar.event";
+    const feedConfig = resolveConfig({
+      namespace: "com.example",
+      notify: true,
+      constellation: false,
+      collections: { event: { collection: EVENT } },
+      feeds: { main: { targets: [{ collection: "event", maxItems: 2 }] } },
+    });
+    const feedDb = createTestDb();
+    await initSchema(feedDb, feedConfig);
+    // Complete a recovery pass on the empty table, so the next is not due.
+    await runGatedFeedPrune(feedDb, feedConfig, []);
+    await seedGrownFeed(feedDb, EVENT);
+    const { author, follower, bystander } = GROWN_FEED;
+    const uri = `at://${author}/${EVENT}/new`;
+    await seedIdentity(author, "https://pds.example.com", feedDb);
+    mockFetch({ [uri]: { value: { name: "New" }, cid: "bafynew" } });
+
+    const result = await processNotifyUris(feedDb, feedConfig, [uri]);
+
+    expect(result.indexed).toBe(1);
+    const aliceFeed = await feedUris(feedDb, follower, EVENT);
+    expect(aliceFeed).toHaveLength(2);
+    expect(aliceFeed[0]).toBe(uri);
+    expect(await feedUris(feedDb, bystander, EVENT)).toHaveLength(5);
   });
 
   it("deletes locally when record not found on PDS", async () => {
