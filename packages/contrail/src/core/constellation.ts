@@ -113,9 +113,11 @@ async function fetchBacklinksPage(
 /** For a newly-known subject DID, find existing followers via Constellation
  *  and ingest synthesized follow records into the configured follow table.
  *  Each page's follows backfill the followers' feeds, so the page prunes
- *  those feeds itself. Best-effort: failures are logged but not retried
- *  (caller can re-trigger). A throw can come after a page committed; the
- *  recovery pass trims whatever that leaves over cap. */
+ *  those feeds itself. A failed prune is logged and the backfill goes on: the
+ *  follows matter more than the trim, which the recovery pass redoes.
+ *  Best-effort: other failures are logged but not retried (caller can
+ *  re-trigger). A throw can come after a page committed; the recovery pass
+ *  trims whatever that leaves over cap. */
 export async function backfillFollowersFromConstellation(
   db: Database,
   config: ContrailConfig,
@@ -195,12 +197,16 @@ export async function backfillFollowersFromConstellation(
         inserted += ingest.accepted.length;
         // A page holds at most PAGE_LIMIT follows, each growing one feed per
         // capped collection, so this limit is never overflowed.
-        await pruneGrownFeeds(
-          db,
-          config,
-          ingest.accepted,
-          PAGE_LIMIT * buildFeedTargetCaps(config).size
-        );
+        try {
+          await pruneGrownFeeds(
+            db,
+            config,
+            ingest.accepted,
+            PAGE_LIMIT * buildFeedTargetCaps(config).size
+          );
+        } catch (err) {
+          log.warn(`[constellation] subject=${subjectDid} feed prune failed: ${err}`);
+        }
       }
     }
 
