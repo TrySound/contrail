@@ -32,6 +32,12 @@ export interface Baseline {
   }>;
 }
 
+export const FLAT_COST_PHASES = [
+  "ingest.update", "ingest.exact-replay", "ingest.stale-replay", "maintenance.schema-check",
+  "maintenance.moderation-idle", "ingest.unchanged", "ingest.delete", "query.filter",
+  "query.filter-pagination", "query.filter-deep-page",
+];
+
 function key(fixture: FixtureOptions) {
   return [fixture.preset, fixture.posts, fixture.actors, fixture.operations, fixture.seed].join(":");
 }
@@ -99,7 +105,6 @@ export function compareBaseline(report: CostReport, baseline: Baseline): string[
  * recounts, account-wide moderation, search and policy scans intentionally do not. */
 export function checkScaling(report: CostReport): string[] {
   const failures: string[] = [];
-  const bounded = ["ingest.update", "ingest.exact-replay", "ingest.stale-replay", "maintenance.schema-check", "maintenance.moderation-idle", "ingest.unchanged"];
   const groups = new Map<string, RunResult[]>();
   for (const run of report.runs) {
     const group = [run.fixture.preset, run.fixture.actors, run.fixture.operations, run.fixture.seed].join(":");
@@ -109,7 +114,7 @@ export function checkScaling(report: CostReport): string[] {
     runs.sort((a, b) => a.fixture.posts - b.fixture.posts);
     if (runs.length < 2) continue;
     const small = runs[0]!;
-    for (const large of runs.slice(1)) for (const name of bounded) {
+    for (const large of runs.slice(1)) for (const name of FLAT_COST_PHASES) {
       const before = small.phases.find((phase) => phase.name === name);
       const after = large.phases.find((phase) => phase.name === name);
       if (!before || !after) { failures.push(`Missing scaling phase ${name}`); continue; }
@@ -140,8 +145,7 @@ export interface ScalingObservation {
  * explicitly data-dependent semantics and must not be advertised as flat. */
 export function observeScaling(report: CostReport): ScalingObservation[] {
   const observations: ScalingObservation[] = [];
-  const candidates = ["ingest.delete", "query.filter", "query.feed", "maintenance.feed-sweep"];
-  const flat = ["ingest.update", "ingest.unchanged", "ingest.exact-replay", "ingest.stale-replay", "maintenance.schema-check", "maintenance.moderation-idle"];
+  const candidates = ["query.feed", "maintenance.feed-sweep"];
   for (const small of report.runs) {
     const matches = report.runs.filter((run) => run.fixture.posts > small.fixture.posts &&
       run.fixture.preset === small.fixture.preset && run.fixture.actors === small.fixture.actors &&
@@ -154,7 +158,7 @@ export function observeScaling(report: CostReport): ScalingObservation[] {
       observations.push({
         preset: small.fixture.preset, phase: before.name, smallPosts: small.fixture.posts, largePosts: large.fixture.posts,
         readPerUnit: read, writtenPerUnit: written,
-        expectation: flat.includes(before.name) ? "flat" : candidates.includes(before.name) ? "investigate" : "data-dependent",
+        expectation: FLAT_COST_PHASES.includes(before.name) ? "flat" : candidates.includes(before.name) ? "investigate" : "data-dependent",
         grewMaterially: read[1] > read[0] * 3 + 16 || written[1] > written[0] * 3 + 16,
       });
     }

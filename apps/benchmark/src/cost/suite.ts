@@ -202,6 +202,31 @@ export async function runCostSuite(raw: Database, options: FixtureOptions) {
         assertions++;
       }
     });
+    await measure("query.filter-pagination", "workload", options.operations * 2, "request", async () => {
+      for (let i = 0; i < options.operations; i++) {
+        const first = await queryRecords(db, config, { collection: "post", filters: { category: "photos" }, limit: 5 });
+        check(first.cursor, "filtered pagination cursor exists");
+        const second = await queryRecords(db, config, { collection: "post", filters: { category: "photos" }, limit: 5, cursor: first.cursor });
+        const uris = new Set(first.records.map((record) => record.uri));
+        check(second.records.length > 0 && second.records.every((record) => !uris.has(record.uri) && JSON.parse(record.record!).category === "photos"), "filtered pages do not overlap or lose the filter");
+        assertions++;
+      }
+    });
+    const deepCursor = await measure("verify.filter-cursor", "verification", 1, "cursor-fixture", async () => {
+      const post = posts[Math.floor(options.posts / 4) | 1]!;
+      const result = await queryRecords(db, config, { collection: "post", limit: 1,
+        source: { conditions: ["r.uri = ?"], params: [post.uri] },
+      });
+      check(result.cursor, "deep filtered cursor fixture");
+      return result.cursor;
+    });
+    await measure("query.filter-deep-page", "workload", options.operations, "request", async () => {
+      for (let i = 0; i < options.operations; i++) {
+        const result = await queryRecords(db, config, { collection: "post", filters: { category: "photos" }, limit: 5, cursor: deepCursor });
+        check(result.records.length > 0 && result.records.every((record) => JSON.parse(record.record!).category === "photos"), "deep filtered page");
+        assertions++;
+      }
+    });
     if (full) await measure("query.feed", "workload", options.operations, "request", async () => {
       for (let i = 0; i < options.operations; i++) {
         const result = await queryRecords(db, config, { collection: "post", limit: 20, source: {

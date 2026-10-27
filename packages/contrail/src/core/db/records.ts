@@ -1911,8 +1911,12 @@ export async function queryRecords(
           );
         }
       } else if (!ftsClause) {
-        conditions.push(stableTail);
-        bindings.push(payload.t, payload.t, payload.u);
+        // Expose the time bound outside the tie-breaking OR so an equality
+        // filter's (field, time_us DESC, uri ASC) index can seek to a deep page
+        // instead of visiting every earlier match. The tail still preserves
+        // every URI when records share the cursor timestamp.
+        conditions.push(`(r.time_us <= ? AND ${stableTail})`);
+        bindings.push(payload.t, payload.t, payload.t, payload.u);
       }
     }
   }

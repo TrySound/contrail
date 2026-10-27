@@ -1,7 +1,7 @@
 {
   "version": 1,
   "contract": {
-    "fixtureVersion": 1,
+    "fixtureVersion": 2,
     "batchSize": 25,
     "compatibilityDate": "2025-12-25",
     "runtime": {
@@ -26,9 +26,9 @@
           "units": 1,
           "unit": "initialization",
           "ceilings": {
-            "rowsRead": 707,
-            "rowsWritten": 213,
-            "statements": 186
+            "rowsRead": 713,
+            "rowsWritten": 214,
+            "statements": 190
           }
         },
         {
@@ -71,7 +71,7 @@
           "unit": "record",
           "ceilings": {
             "rowsRead": 3341,
-            "rowsWritten": 4270,
+            "rowsWritten": 4402,
             "statements": 688
           }
         },
@@ -93,7 +93,7 @@
           "unit": "record",
           "ceilings": {
             "rowsRead": 167,
-            "rowsWritten": 320,
+            "rowsWritten": 344,
             "statements": 65
           }
         },
@@ -147,7 +147,7 @@
           "units": 8,
           "unit": "record",
           "ceilings": {
-            "rowsRead": 1253,
+            "rowsRead": 175,
             "rowsWritten": 98,
             "statements": 39
           }
@@ -180,7 +180,7 @@
           "units": 8,
           "unit": "request",
           "ceilings": {
-            "rowsRead": 1159,
+            "rowsRead": 560,
             "rowsWritten": 0,
             "statements": 11
           }
@@ -213,9 +213,31 @@
           "units": 16,
           "unit": "request",
           "ceilings": {
-            "rowsRead": 877,
+            "rowsRead": 798,
             "rowsWritten": 0,
             "statements": 20
+          }
+        },
+        {
+          "name": "query.filter-pagination",
+          "kind": "workload",
+          "units": 16,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 305,
+            "rowsWritten": 0,
+            "statements": 20
+          }
+        },
+        {
+          "name": "query.filter-deep-page",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 147,
+            "rowsWritten": 0,
+            "statements": 11
           }
         },
         {
@@ -543,9 +565,9 @@
           "units": 1,
           "unit": "initialization",
           "ceilings": {
-            "rowsRead": 707,
-            "rowsWritten": 213,
-            "statements": 186
+            "rowsRead": 713,
+            "rowsWritten": 214,
+            "statements": 190
           }
         },
         {
@@ -588,7 +610,7 @@
           "unit": "record",
           "ceilings": {
             "rowsRead": 27760,
-            "rowsWritten": 34055,
+            "rowsWritten": 35111,
             "statements": 5411
           }
         },
@@ -610,7 +632,7 @@
           "unit": "record",
           "ceilings": {
             "rowsRead": 167,
-            "rowsWritten": 320,
+            "rowsWritten": 344,
             "statements": 65
           }
         },
@@ -664,7 +686,7 @@
           "units": 8,
           "unit": "record",
           "ceilings": {
-            "rowsRead": 8645,
+            "rowsRead": 175,
             "rowsWritten": 98,
             "statements": 39
           }
@@ -697,7 +719,7 @@
           "units": 8,
           "unit": "request",
           "ceilings": {
-            "rowsRead": 9044,
+            "rowsRead": 560,
             "rowsWritten": 0,
             "statements": 11
           }
@@ -730,9 +752,31 @@
           "units": 16,
           "unit": "request",
           "ceilings": {
-            "rowsRead": 877,
+            "rowsRead": 798,
             "rowsWritten": 0,
             "statements": 20
+          }
+        },
+        {
+          "name": "query.filter-pagination",
+          "kind": "workload",
+          "units": 16,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 305,
+            "rowsWritten": 0,
+            "statements": 20
+          }
+        },
+        {
+          "name": "query.filter-deep-page",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 173,
+            "rowsWritten": 0,
+            "statements": 11
           }
         },
         {

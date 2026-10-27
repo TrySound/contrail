@@ -1,4 +1,4 @@
-export const FIXTURE_VERSION = 1;
+export const FIXTURE_VERSION = 2;
 export const FIXED_NOW = Date.parse("2026-09-01T12:00:00.000Z");
 export const BATCH_SIZE = 25;
 export interface FixtureOptions {

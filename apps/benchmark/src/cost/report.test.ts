@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { PhaseCost } from "./meter.ts";
 import { validateFixture } from "./model.ts";
-import { checkScaling, compareBaseline, createBaseline, observeScaling, projectUsage, sumCosts, type CostReport } from "./report.ts";
+import { FLAT_COST_PHASES, checkScaling, compareBaseline, createBaseline, observeScaling, projectUsage, sumCosts, type CostReport } from "./report.ts";
 
 function phase(name: string, rowsRead = 100, rowsWritten = 0): PhaseCost {
   return { name, kind: "workload", units: 10, unit: "observation", rowsRead, rowsWritten,
@@ -14,7 +14,7 @@ function report(): CostReport {
     contract: { fixtureVersion: 1, batchSize: 25, compatibilityDate: "2025-12-25", runtime: { wrangler: "4.84.1", miniflare: "test", workerd: "test" } },
     runs: [64, 512].map((posts) => ({
       fixture: { posts, actors: 16, operations: 10, seed: 42, preset: "full" },
-      phases: ["ingest.update", "ingest.exact-replay", "ingest.stale-replay", "maintenance.schema-check", "maintenance.moderation-idle", "ingest.unchanged"].map((name) => phase(name)),
+      phases: FLAT_COST_PHASES.map((name) => phase(name)),
       correctness: { passed: true, assertions: 10, networkAttempts: 0 }, storage: {},
       protection: { admissionLimitsImplemented: false, openFloodAccepted: 20 },
       accountingSanity: { indexedRowsRead: 1, scanRowsRead: 32, plainInsertRowsWritten: 1, indexedInsertRowsWritten: 2 },
@@ -60,8 +60,10 @@ test("verification overhead is neither a workload baseline nor a daily projectio
   const verify = { ...phase("verify.expensive", 1_000_000, 500), kind: "verification" as const };
   current.runs[0]!.phases.push(verify);
   const baseline = createBaseline(current);
-  assert.equal(baseline.runs[0]!.phases.length, 6);
-  assert.deepEqual(sumCosts(current.runs[0]!.phases.filter((p) => p.kind === "workload")), { rowsRead: 600, rowsWritten: 0, statements: 60 });
+  assert.equal(baseline.runs[0]!.phases.length, FLAT_COST_PHASES.length);
+  assert.deepEqual(sumCosts(current.runs[0]!.phases.filter((p) => p.kind === "workload")), {
+    rowsRead: 100 * FLAT_COST_PHASES.length, rowsWritten: 0, statements: 10 * FLAT_COST_PHASES.length,
+  });
   assert.throws(() => projectUsage(current.runs[0]!, { "verify.expensive": 1 }, 30), /non-workload/);
 });
 
@@ -75,11 +77,19 @@ test("unrelated-data scaling catches table scans with constant statement counts"
   assert.deepEqual(checkScaling(current), [], "account-wide jobs are explicitly data dependent");
 });
 
+test("deletion and equality-filter pages now reject corpus-sized scaling", () => {
+  for (const name of ["ingest.delete", "query.filter", "query.filter-pagination", "query.filter-deep-page"]) {
+    const current = report();
+    current.runs[1]!.phases.find((entry) => entry.name === name)!.rowsRead = 10_000;
+    assert.ok(checkScaling(current).some((failure) => failure.includes(name)), name);
+  }
+});
+
 test("reports existing scan risks separately from enforced flat expectations", () => {
   const current = report();
-  current.runs[0]!.phases.push(phase("ingest.delete", 100));
-  current.runs[1]!.phases.push(phase("ingest.delete", 10_000));
-  const observation = observeScaling(current).find((entry) => entry.phase === "ingest.delete")!;
+  current.runs[0]!.phases.push(phase("query.feed", 100));
+  current.runs[1]!.phases.push(phase("query.feed", 10_000));
+  const observation = observeScaling(current).find((entry) => entry.phase === "query.feed")!;
   assert.equal(observation.expectation, "investigate");
   assert.equal(observation.grewMaterially, true);
   assert.deepEqual(observation.readPerUnit, [10, 1_000]);

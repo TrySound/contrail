@@ -37,7 +37,7 @@ Presets are cumulative:
 The JSON report (`apps/benchmark/results/cost-latest.json` by default) includes:
 
 - Creates, updates, deletes, unchanged-CID observations, exact/stale replay, and hot-parent reactions.
-- List/filter/search/count-sort queries, keyset pagination, feed reads, relation/reference hydration, cached profiles and attached labels.
+- List/filter/search/count-sort queries, keyset pagination (including equality-filtered next/deep pages), feed reads, relation/reference hydration, cached profiles and attached labels.
 - Label hide/replay/retraction, account hide/restore, account deactivation/reactivation, moderator action creation/deletion, label expiry and complete paged enforcement-policy disable/re-enable jobs, including queued relation recounts.
 - Private report creation, inbox previews, resolution and exhausted-report-quota requests. These use the real routes with a **preauthenticated synthetic gate**: this measures SQL after authentication, not JWT verification/DID-resolution costs.
 - Warm schema checks, quiet moderation cycles **without network reconciliation**, and bounded feed-prune pages. These are not a measurement of the complete scheduled acquisition cycle.
@@ -53,9 +53,9 @@ The fixture intentionally uses opaque synthetic CIDs and no runtime Lexicon vali
 
 ### Guardrails and current findings
 
-`baselines/cost-ci.json` contains absolute read/write/statement ceilings per phase for 64/512-post full fixtures. Initial ceilings allow 10% plus 32 reads / 8 writes of slack; zero-write phases retain a zero-write ceiling. Fixture parameters, phase units and pinned Wrangler/Miniflare/workerd versions must match. Timings are informational. CI also checks that cold updates/replay and quiet initialization/moderation do not acquire corpus-sized work (per-unit ceiling: 3× the small fixture plus 16 rows). Account-wide jobs, hot-parent recounts and policy migrations legitimately depend on affected data and are reported separately.
+`baselines/cost-ci.json` contains absolute read/write/statement ceilings per phase for 64/512-post full fixtures. Initial ceilings allow 10% plus 32 reads / 8 writes of slack; zero-write phases retain a zero-write ceiling. Fixture parameters, phase units and pinned Wrangler/Miniflare/workerd versions must match. Timings are informational. CI also checks that cold updates/replay, deletion at fixed fanout, equality-filtered first/next/deep pages and quiet initialization/moderation do not acquire corpus-sized work (per-unit ceiling: 3× the small fixture plus 16 rows). These checks hold fanout, selectivity and timestamp distribution fixed; they do not promise constant reads with arbitrarily many hidden candidates or timestamp ties. Account-wide jobs, hot-parent recounts and policy migrations legitimately depend on affected data and are reported separately.
 
-The initial 1k/10k-post, 100-actor, 50-operation runs already identify **existing costs to improve**, not approved efficiency targets:
+The initial 1k/10k-post, 100-actor, 50-operation runs identified these costs before the first index optimization pass:
 
 | Operation | Reads/unit at 1k posts | Reads/unit at 10k posts |
 | --- | ---: | ---: |
@@ -64,7 +64,17 @@ The initial 1k/10k-post, 100-actor, 50-operation runs already identify **existin
 | Filtered list request | 2,000 | 20,000 |
 | Feed request | 101 | 1,001 |
 
-The delete's dominant SQL is `DELETE FROM feed_items WHERE uri = ?`; the filtered list reads/sorts the matching corpus before returning its bounded page. Scaling observations for deletion, filtered queries, feed reads and feed sweeps are explicitly marked **investigate** in reports and printed when growth is material. Their current costs are captured in the CI ceilings so further regressions fail, but **passing today's baseline does not mean today's spend is acceptable**. Review the query attribution before raising a ceiling.
+The first pass adds `feed_items(uri)` and replaces single-field equality indexes with `(field, time_us DESC, uri ASC)`, retaining single-field range indexes. The cursor predicate exposes its time bound so a deep filtered page can seek past newer matches. Updated results under the same 1k/10k-post fixture are:
+
+| Operation | Reads/unit at 1k posts | Reads/unit at 10k posts |
+| --- | ---: | ---: |
+| Delete | 16.12 | 16.12 |
+| Filtered list request (20 records) | 60 | 60 |
+| Deep filtered page (5 records) | 16 | 16 |
+
+The feed URI index is not free: normal creates in this full-feature fixture increase from **35.96 to 38.92 writes/record**, depending on follower fanout. Replacing an equality index does not add another maintained index; wider keys do add storage. With unchanged app configuration, the preceding schema upgrades by creating replacement indexes before dropping redundant ones, without rebuilding FTS, recounting records or resetting source progress. Building the indexes still has a one-time corpus-sized read/write cost, separate from steady-state costs.
+
+Fixture version 2 adds filtered next/deep-page workloads and tightens the CI ceilings for deletes and filtered lists. Feed reads and feed sweeps remain **investigate** observations and are printed when growth is material; this pass deliberately does not change those algorithms. **Passing today's baseline does not mean all spend is acceptable.** Review the query attribution before raising a ceiling.
 
 Regenerate ceilings only deliberately, after inspecting the diff:
 
