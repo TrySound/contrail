@@ -101,22 +101,28 @@ export const GROWN_FEED = {
   bystander: "did:plc:dave",
 } as const;
 
-export async function seedGrownFeed(db: Database, collection: string): Promise<void> {
-  const { author, follower, bystander } = GROWN_FEED;
+/** Insert a follow row directly, without ingestion. */
+export async function seedFollow(db: Database, follower: string, subject: string): Promise<void> {
+  const rkey = subject.replace(/\W/g, "");
   await db
     .prepare(
       "INSERT INTO records_follow (uri, did, rkey, cid, record, time_us, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(
-      `at://${follower}/app.bsky.graph.follow/bob`,
+      `at://${follower}/app.bsky.graph.follow/${rkey}`,
       follower,
-      "bob",
+      rkey,
       "bafyfollow",
-      JSON.stringify({ subject: author }),
+      JSON.stringify({ subject }),
       1000,
       1000
     )
     .run();
+}
+
+export async function seedGrownFeed(db: Database, collection: string): Promise<void> {
+  const { author, follower, bystander } = GROWN_FEED;
+  await seedFollow(db, follower, author);
   const feed: Array<[string, number]> = [
     [follower, 2],
     [bystander, 5],
