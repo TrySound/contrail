@@ -131,6 +131,55 @@ describe("Jetstream v2 live cursor semantics", () => {
     expect(fetchReceivers).toEqual([globalThis, globalThis]);
   });
 
+  it("subscribes to and normalizes account lifecycle events on the real transport", async () => {
+    const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+    const time = "2026-08-29T13:08:26.865272Z";
+    const subscription = new JetstreamLiveSubscription({
+      url: "https://jetstream.example",
+      cursor: 42,
+      wantedCollections: ["com.example.post"],
+      fetchImpl: (async () => new Response("Upgrade required", { status: 426 })) as typeof fetch,
+      liveTransport: {
+        async *stream(getUrl) {
+          const url = new URL(getUrl());
+          expect(url.searchParams.getAll("kinds")).toEqual([
+            "commit", "identity", "account",
+          ]);
+          expect(url.searchParams.getAll("collections")).toEqual(["com.example.post"]);
+          yield JSON.stringify({
+            $type: "message",
+            payload: {
+              $type: "network.bsky.jetstream.subscribeEvents#account",
+              did, seq: 43, time,
+              account: { did, active: false, status: "deactivated" },
+            },
+          });
+          yield JSON.stringify({
+            $type: "message",
+            payload: {
+              $type: "network.bsky.jetstream.subscribeEvents#account",
+              did, seq: 44, time,
+              account: { did, active: true },
+            },
+          });
+        },
+      },
+    });
+    const events = [];
+    for await (const event of subscription) events.push(event);
+    expect(events).toEqual([
+      {
+        kind: "account", did, seq: 43, time_us: 1_788_008_906_865_272,
+        account: { did, active: false, status: "deactivated" },
+      },
+      {
+        kind: "account", did, seq: 44, time_us: 1_788_008_906_865_272,
+        account: { did, active: true },
+      },
+    ]);
+    expect(subscription.cursor).toBe(44);
+  });
+
   it("preserves microsecond precision from the v2 datetime", () => {
     expect(
       jetstreamDatetimeToMicroseconds("2026-08-29T13:08:26.865272Z"),

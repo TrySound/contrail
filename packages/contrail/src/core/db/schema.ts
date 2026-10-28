@@ -25,6 +25,8 @@ import {
   getSearchableFields,
 } from "../search";
 import { buildLabelsSchema } from "../labels/schema";
+import { buildModerationSchema, moderationLockStatements } from "../moderation";
+import { applyModerationPolicy, MODERATION_POLICY_META_KEYS } from "../moderation-policy";
 import {
   assertFreshChangeLogGeneration,
   buildChangeLogSchema,
@@ -35,9 +37,9 @@ import {
   canonicalChangeDefinitions,
   changesEnabled,
 } from "../types";
-import { getMeta, setMeta } from "./meta";
+import { getMetaValues, setMeta } from "./meta";
 
-export const CONTRAIL_SCHEMA_VERSION = 14;
+export const CONTRAIL_SCHEMA_VERSION = 17;
 const SCHEMA_FINGERPRINT_KEY = "schema_fingerprint";
 
 function getResolved(config: ContrailConfig): ResolvedMaps {
@@ -188,27 +190,90 @@ export function buildCollectionTables(
   return statements;
 }
 
+function queryableIndexName(collection: string, field: string): string {
+  return `idx_${sanitizeName(collection)}_${sanitizeName(field)}`;
+}
+
+function equalityIndexNames(config: ContrailConfig): Set<string> {
+  const resolved = getResolved(config);
+  return new Set(Object.entries(config.collections).flatMap(([collection, colConfig]) =>
+    Object.entries(resolved.queryable[collection] ?? colConfig.queryable ?? {})
+      .filter(([, field]) => field.type !== "range")
+      .map(([field]) => queryableIndexName(collection, field)),
+  ));
+}
+
+/** Reserve legacy names before choosing replacement names: a field literally
+ * named `category_time_uri` must not collide with category's new index, or be
+ * mistaken for an obsolete index during upgrade. Names stay stable when a
+ * configured field switches between equality and range. */
+function orderedQueryableIndexNames(config: ContrailConfig): Map<string, string> {
+  const resolved = getResolved(config);
+  const names: string[] = [];
+  const reserved = new Set<string>();
+  for (const [collection, colConfig] of Object.entries(config.collections)) {
+    for (const field of Object.keys(resolved.queryable[collection] ?? colConfig.queryable ?? {})) {
+      const name = queryableIndexName(collection, field);
+      names.push(name);
+      reserved.add(name);
+    }
+    for (const relation of Object.values(colConfig.relations ?? {})) {
+      reserved.add(queryableIndexName(relation.collection, getRelationField(relation)));
+    }
+  }
+  for (const feed of Object.values(config.feeds ?? {})) {
+    reserved.add(queryableIndexName(feed.follow ?? "follow", "subject"));
+  }
+  const ordered = new Map<string, string>();
+  for (const name of names) {
+    let candidate = `${name}_time_uri`;
+    while (reserved.has(candidate)) candidate += "_list";
+    reserved.add(candidate);
+    ordered.set(name, candidate);
+  }
+  return ordered;
+}
+
 export function buildDynamicIndexes(
   config: ContrailConfig,
   dialect: SqlDialect,
 ): string[] {
+  return buildVersionedDynamicIndexes(config, dialect, false);
+}
+
+/** The old DDL is retained only to recognize an index-only upgrade without
+ * rebuilding FTS, counts or source-ordering state on an existing database. */
+function buildVersionedDynamicIndexes(
+  config: ContrailConfig,
+  dialect: SqlDialect,
+  legacy: boolean,
+): string[] {
   const resolved = getResolved(config);
+  const equality = equalityIndexNames(config);
+  const orderedNames = orderedQueryableIndexNames(config);
   const indexes: string[] = [];
   for (const [collection, colConfig] of Object.entries(config.collections)) {
     const table = recordsTableName(collection);
     const queryable =
       resolved.queryable[collection] ?? colConfig.queryable ?? {};
-    for (const field of Object.keys(queryable)) {
+    for (const [field, fieldConfig] of Object.entries(queryable)) {
+      const ordered = !legacy && fieldConfig.type !== "range";
+      const baseName = queryableIndexName(collection, field);
+      const name = ordered ? orderedNames.get(baseName)! : baseName;
+      const expression = dialect.indexExpression(dialect.jsonExtract("record", field));
       indexes.push(
-        `CREATE INDEX IF NOT EXISTS idx_${sanitizeName(collection)}_${sanitizeName(field)} ON ${table}(${dialect.indexExpression(dialect.jsonExtract("record", field))})`,
+        `CREATE INDEX IF NOT EXISTS ${name} ON ${table}(${expression}${ordered ? ", time_us DESC, uri ASC" : ""})`,
       );
     }
 
     for (const relation of Object.values(colConfig.relations ?? {})) {
       const on = getRelationField(relation);
       const childTable = recordsTableName(relation.collection);
+      const name = queryableIndexName(relation.collection, on);
+      // The ordered equality index already supports relation lookups by its prefix.
+      if (!legacy && equality.has(name)) continue;
       indexes.push(
-        `CREATE INDEX IF NOT EXISTS idx_${sanitizeName(relation.collection)}_${sanitizeName(on)} ON ${childTable}(${dialect.indexExpression(dialect.jsonExtract("record", on))})`,
+        `CREATE INDEX IF NOT EXISTS ${name} ON ${childTable}(${dialect.indexExpression(dialect.jsonExtract("record", on))})`,
       );
     }
   }
@@ -334,7 +399,7 @@ export async function applyCountColumns(
   }
 }
 
-function buildFeedTables(config: ContrailConfig, dialect: SqlDialect): string[] {
+function buildFeedTables(config: ContrailConfig, dialect: SqlDialect, legacy = false): string[] {
   if (!config.feeds || Object.keys(config.feeds).length === 0) return [];
   const statements = [
     `CREATE TABLE IF NOT EXISTS feed_items (
@@ -346,6 +411,7 @@ function buildFeedTables(config: ContrailConfig, dialect: SqlDialect): string[] 
     )`,
     "CREATE INDEX IF NOT EXISTS idx_feed_actor_coll_time ON feed_items(actor, collection, time_us DESC)",
     "CREATE INDEX IF NOT EXISTS idx_feed_actor_time ON feed_items(actor, time_us DESC)",
+    ...(legacy ? [] : ["CREATE INDEX IF NOT EXISTS idx_feed_uri ON feed_items(uri)"]),
     `CREATE TABLE IF NOT EXISTS feed_prune_cursor (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       actor TEXT
@@ -364,12 +430,29 @@ function buildFeedTables(config: ContrailConfig, dialect: SqlDialect): string[] 
   const followCollections = new Set(
     Object.values(config.feeds).map((feed) => feed.follow ?? "follow"),
   );
+  const equality = equalityIndexNames(config);
   for (const collection of followCollections) {
+    if (!legacy && equality.has(queryableIndexName(collection, "subject"))) continue;
     statements.push(
       `CREATE INDEX IF NOT EXISTS idx_${sanitizeName(collection)}_subject ON ${recordsTableName(collection)}(${dialect.indexExpression(dialect.jsonExtract("record", "subject"))})`,
     );
   }
   return statements;
+}
+
+/** New indexes are installed before their redundant predecessors are removed.
+ * Range indexes stay single-field; changing a configured field back to range
+ * also retires its old equality-list index. */
+async function retireSupersededQueryableIndexes(db: Database, config: ContrailConfig): Promise<void> {
+  const resolved = getResolved(config);
+  const orderedNames = orderedQueryableIndexNames(config);
+  for (const [collection, colConfig] of Object.entries(config.collections)) {
+    for (const [field, fieldConfig] of Object.entries(resolved.queryable[collection] ?? colConfig.queryable ?? {})) {
+      const baseName = queryableIndexName(collection, field);
+      const obsolete = fieldConfig.type === "range" ? orderedNames.get(baseName)! : baseName;
+      await runIdempotentDdl(db, `DROP INDEX IF EXISTS ${obsolete}`);
+    }
+  }
 }
 
 export function buildFtsTables(
@@ -646,6 +729,10 @@ export type SchemaModule = (db: Database) => Promise<void>;
 
 export interface InitSchemaOptions {
   extraSchemas?: SchemaModule[];
+  /** Apply moderation policy trust immediately but leave its paged job to
+   * moderation cycles. Use on request paths, so a large policy change never
+   * delays a response. */
+  deferModerationPolicyJob?: boolean;
 }
 
 /**
@@ -708,8 +795,27 @@ function schemaFingerprint(
     ...ddl.changes,
     canonicalChangeDefinitions(config),
     ...buildCountColumns(config),
-    ...(config.labels ? buildLabelsSchema(dialect) : []),
+    ...buildLabelsSchema(dialect),
+    ...buildModerationSchema(dialect),
     JSON.stringify(MIGRATIONS),
+  ]);
+}
+
+/** Upgrade creation timestamps atomically and exactly once, including under
+ * concurrent initializers. Expiry/visibility boundaries remain unix seconds.
+ * The marker row lock gives PostgreSQL's following statements fresh snapshots;
+ * SQLite/D1 already serialize the write batch. */
+async function upgradeModerationCreationTimestamps(db: Database): Promise<void> {
+  const key = "moderation_cts_unit";
+  const pending = "EXISTS (SELECT 1 FROM _contrail_meta WHERE key = ? AND value = 'seconds')";
+  await db.batch([
+    db.prepare("INSERT INTO _contrail_meta (key, value) VALUES (?, 'seconds') ON CONFLICT(key) DO NOTHING").bind(key),
+    db.prepare("UPDATE _contrail_meta SET value = value WHERE key = ?").bind(key),
+    ...moderationLockStatements(db),
+    ...["labels", "moderation_actions", "moderation_overrides"].map((table) =>
+      db.prepare(`UPDATE ${table} SET cts = cts * 1000 WHERE ${pending}`).bind(key),
+    ),
+    db.prepare("UPDATE _contrail_meta SET value = 'milliseconds' WHERE key = ?").bind(key),
   ]);
 }
 
@@ -742,9 +848,17 @@ export async function initSchema(
     observation TEXT NOT NULL,
     PRIMARY KEY (time_us, observation)
   )`;
-  const storedFingerprint = await getMeta(db, SCHEMA_FINGERPRINT_KEY);
+  // One steady-state read covers the schema and moderation policy gates.
+  const meta = await getMetaValues(db, [
+    SCHEMA_FINGERPRINT_KEY,
+    ...MODERATION_POLICY_META_KEYS,
+  ]);
+  const storedFingerprint = meta.get(SCHEMA_FINGERPRINT_KEY) ?? null;
 
   if (storedFingerprint === fingerprint) {
+    // Moderation policy has its own fingerprint: editing moderators or label
+    // sources must not rerun DDL or rebuild FTS.
+    await applyModerationPolicy(db, config, { meta, ...(options.deferModerationPolicyJob ? { maxPages: 0 } : {}) });
     for (const apply of options.extraSchemas ?? []) await apply(db);
     return;
   }
@@ -753,6 +867,27 @@ export async function initSchema(
     // deployment through the FTS rebuild path. Upgrade the prior fingerprint
     // directly after its idempotent DDL succeeds.
     await runIdempotentDdl(db, cursorObservationsDdl);
+    await applyModerationPolicy(db, config, { meta, ...(options.deferModerationPolicyJob ? { maxPages: 0 } : {}) });
+    for (const apply of options.extraSchemas ?? []) await apply(db);
+    await setMeta(db, SCHEMA_FINGERPRINT_KEY, fingerprint);
+    return;
+  }
+
+  const legacyFingerprint = schemaFingerprint(config, dialect, {
+    base, collections,
+    indexes: buildVersionedDynamicIndexes(config, dialect, true),
+    feeds: buildFeedTables(config, dialect, true),
+    fts, changes,
+  });
+  if (storedFingerprint === legacyFingerprint || storedFingerprint === `${legacyFingerprint}:cursor-observations-v1`) {
+    // Only the read indexes changed. Do not turn this upgrade into a corpus
+    // rewrite (FTS rebuild, legacy version seeding or relation recount).
+    for (const statement of [...indexes, ...feeds.filter((sql) => sql.startsWith("CREATE INDEX"))]) {
+      await runIdempotentDdl(db, statement);
+    }
+    await retireSupersededQueryableIndexes(db, config);
+    await runIdempotentDdl(db, cursorObservationsDdl);
+    await applyModerationPolicy(db, config, { meta, ...(options.deferModerationPolicyJob ? { maxPages: 0 } : {}) });
     for (const apply of options.extraSchemas ?? []) await apply(db);
     await setMeta(db, SCHEMA_FINGERPRINT_KEY, fingerprint);
     return;
@@ -768,12 +903,16 @@ export async function initSchema(
   for (const statement of [...base, ...collections, ...indexes, ...feeds]) {
     await runIdempotentDdl(db, statement);
   }
+  await retireSupersededQueryableIndexes(db, config);
 
-  if (config.labels) {
-    for (const statement of buildLabelsSchema(dialect)) {
-      await runIdempotentDdl(db, statement);
-    }
+  for (const statement of [...buildLabelsSchema(dialect), ...buildModerationSchema(dialect)]) {
+    await runIdempotentDdl(db, statement);
   }
+  // Existing queues need the generation column before policy jobs can reset
+  // them. CREATE TABLE IF NOT EXISTS only covers fresh databases.
+  await addColumnIfNotExists(db, "label_backfill_queue", "generation", "INTEGER NOT NULL DEFAULT 0");
+  await upgradeModerationCreationTimestamps(db);
+  await applyModerationPolicy(db, config, { ...(options.deferModerationPolicyJob ? { maxPages: 0 } : {}) });
 
   await runIdempotentDdl(db, cursorObservationsDdl);
   await applyFtsTables(db, config, dialect);

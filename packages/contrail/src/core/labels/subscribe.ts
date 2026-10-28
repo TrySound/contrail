@@ -2,24 +2,35 @@ import { decodeFirst } from "@atcute/cbor";
 import type { ContrailConfig, Database, Logger } from "../types";
 import type { LabelerSource } from "./types";
 import { applyLabels, type IncomingLabel } from "./apply";
+import { getLabelerState } from "./resolve";
+import { getMeta, setMeta } from "../db/meta";
 import {
-  getLabelerState,
-  resetLabelerCursor,
-  saveLabelerCursor,
-} from "./resolve";
+  getModerationPolicyGeneration,
+  lockModerationPolicyStatement,
+  moderationPolicyGenerationSql,
+} from "../moderation-policy";
+
+/** Stop an obsolete subscription rather than advancing the shared cursor or
+ * reconnecting forever with a superseded deployment's admission rules. */
+class ObsoleteLabelPolicyError extends Error {}
 
 const DEFAULT_CYCLE_TIMEOUT_MS = 25_000;
 const DEFAULT_BATCH_SIZE = 100;
+/** Unflushed batches retained before the socket is closed for a retry. */
+const MAX_BUFFERED_BATCHES = 20;
 const DEFAULT_FLUSH_INTERVAL_MS = 5_000;
+/** When a `backfill: false` labeler was first followed from now. */
+const LIVE_SINCE_KEY_PREFIX = "labeler_live_since:";
+const LIVE_SINCE_SKEW_MS = 5 * 60_000;
 
 function getLogger(config: ContrailConfig): Logger {
   return config.logger ?? console;
 }
 
-/** One catch-up cycle for every configured labeler. Designed to fit inside a
- *  Cloudflare Workers cron tick — we drain frames until the labeler has no
- *  more buffered events for us, or `timeoutMs` is reached, then save cursor
- *  and disconnect. Mirrors the shape of `runIngestCycle` for jetstream. */
+/** One catch-up cycle for every configured labeler. Pump sources concurrently
+ * under a shared deadline: subscribeLabels sockets normally stay open even
+ * after catching up, so sequential pumps would starve all later sources.
+ * Each source saves its own cursor before disconnecting. */
 export async function runLabelIngestCycle(
   db: Database,
   config: ContrailConfig,
@@ -29,26 +40,26 @@ export async function runLabelIngestCycle(
   const log = getLogger(config);
   const deadline = Date.now() + timeoutMs;
 
-  for (const source of config.labels.sources) {
-    if (Date.now() >= deadline) {
-      log.log(`[labels] cycle deadline hit before processing ${source.did}`);
-      break;
-    }
-    const remaining = Math.max(2_000, deadline - Date.now());
-    try {
-      await pumpOneLabeler(
-        db,
-        source,
-        log,
-        remaining,
-        /* persistent */ false,
-        {},
-        config.networkOverrides,
-      );
-    } catch (err) {
-      log.warn(`[labels] cycle for ${source.did} failed: ${err}`);
-    }
-  }
+  await Promise.all(
+    config.labels.sources.filter((source) => !source.records).map(async (source) => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return;
+      try {
+        await pumpOneLabeler(
+          db,
+          source,
+          log,
+          remaining,
+          /* persistent */ false,
+          {},
+          config,
+        );
+      } catch (err) {
+        if (err instanceof ObsoleteLabelPolicyError) return;
+        log.warn(`[labels] cycle for ${source.did} failed: ${err}`);
+      }
+    }),
+  );
 }
 
 export interface PersistentLabelsOptions {
@@ -69,8 +80,8 @@ export async function runPersistentLabels(
   const log = options.logger ?? config.logger ?? console;
   const signal = options.signal;
 
-  const tasks = config.labels.sources.map((source) =>
-    runOneLabelerForever(db, source, log, signal, options, config.networkOverrides),
+  const tasks = config.labels.sources.filter((s) => !s.records).map((source) =>
+    runOneLabelerForever(db, source, log, signal, options, config),
   );
   await Promise.all(tasks);
 }
@@ -81,7 +92,7 @@ async function runOneLabelerForever(
   log: Logger,
   signal: AbortSignal | undefined,
   options: PersistentLabelsOptions,
-  networkOverrides: ContrailConfig["networkOverrides"],
+  config: ContrailConfig,
 ): Promise<void> {
   let attempts = 0;
   while (!signal?.aborted) {
@@ -97,11 +108,11 @@ async function runOneLabelerForever(
           batchSize: options.batchSize ?? DEFAULT_BATCH_SIZE,
           flushIntervalMs: options.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS,
         },
-        networkOverrides,
+        config,
       );
       attempts = 0;
     } catch (err) {
-      if (signal?.aborted) break;
+      if (signal?.aborted || err instanceof ObsoleteLabelPolicyError) break;
       log.error(`[labels] ${source.did} stream error: ${err}`);
       const delay = Math.min(1_000 * 2 ** attempts, 30_000);
       attempts++;
@@ -130,10 +141,26 @@ async function pumpOneLabeler(
   log: Logger,
   timeoutMs: number,
   persistent: boolean,
-  pumpOpts: PumpOptions = {},
-  networkOverrides?: ContrailConfig["networkOverrides"],
+  pumpOpts: PumpOptions,
+  config: ContrailConfig,
 ): Promise<void> {
-  const state = await getLabelerState(db, source.did, source.endpoint, networkOverrides);
+  const deadline = Date.now() + timeoutMs;
+  // Capture before any endpoint resolution/network I/O. The nonce also rejects
+  // a buffered batch from before a policy change that was subsequently reverted.
+  const policyGeneration = await getModerationPolicyGeneration(db, config);
+  if (!policyGeneration) throw new ObsoleteLabelPolicyError("Label policy is no longer current");
+  const writeGuard = {
+    sql: moderationPolicyGenerationSql(),
+    bindings: [policyGeneration],
+  };
+  if (Date.now() >= deadline) return;
+  const state = await getLabelerState(db, source.did, source.endpoint, {
+    ...config.networkOverrides,
+    ...(Number.isFinite(deadline)
+      ? { signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())) }
+      : {}),
+  });
+  if (Date.now() >= deadline) return;
   if (!state) {
     log.warn(`[labels] could not resolve labeler endpoint for ${source.did}; skipping`);
     return;
@@ -142,9 +169,26 @@ async function pumpOneLabeler(
   // First-time policy: cursor 0 = "from the beginning" if backfill is on
   // (default), null = "from now" otherwise. After the first cycle we always
   // resume from the saved cursor — `backfill` only flips the start point.
-  const isFirstRun = state.cursor === 0 && state.resolved_at === null;
+  const isFirstRun = state.cursor === 0;
   const backfill = source.backfill !== false;
-  const startCursor = isFirstRun && !backfill ? null : state.cursor;
+  let startCursor: number | null = state.cursor;
+  // `backfill: false` without a saved cursor: a "from now" connection that
+  // saw no frame has no seq to resume from, so labels issued while scheduled
+  // ingestion was disconnected would be skipped indefinitely for a quiet
+  // labeler. Only the first such connection starts from now; later ones
+  // replay from 0, admitting labels created after that start (minus clock
+  // skew). Keep that cutoff on every reconnect: replay can span multiple
+  // bounded cycles, and a nonzero cursor does not prove it has caught up.
+  let minCts: number | null = null;
+  if (!backfill) {
+    const sinceKey = `${LIVE_SINCE_KEY_PREFIX}${source.did}`;
+    const since = Number(await getMeta(db, sinceKey));
+    if (since > 0) minCts = since - LIVE_SINCE_SKEW_MS;
+    else if (isFirstRun) {
+      await setMeta(db, sinceKey, String(Date.now()));
+      startCursor = null;
+    }
+  }
 
   const url = buildWsUrl(state.endpoint!, startCursor);
   log.log(`[labels] connecting to ${source.did} (cursor=${startCursor ?? "now"})`);
@@ -154,7 +198,8 @@ async function pumpOneLabeler(
 
   const buffer: IncomingLabel[] = [];
   let highestSeq = state.cursor;
-  let flushing = false;
+  let obsoletePolicy = false;
+  let flushPending: Promise<void> = Promise.resolve();
   let resolveDone!: () => void;
   let rejectDone!: (err: unknown) => void;
   const done = new Promise<void>((res, rej) => {
@@ -162,30 +207,57 @@ async function pumpOneLabeler(
     rejectDone = rej;
   });
 
-  const flush = async () => {
-    if (buffer.length === 0 || flushing) return;
-    flushing = true;
-    const batch = buffer.splice(0);
-    try {
-      const kept = await applyLabels(db, batch);
-      if (highestSeq > state.cursor) {
-        await saveLabelerCursor(db, source.did, highestSeq);
-        state.cursor = highestSeq;
+  const flush = (): Promise<void> => {
+    const work = flushPending.catch(() => {}).then(async () => {
+      if (obsoletePolicy) return;
+      // Freeze the seq with this exact batch, never checkpoint newer frames
+      // received while SQL is in flight. Filter-only frames still advance.
+      const seq = highestSeq;
+      if (!buffer.length && seq <= state.cursor) return;
+      const batch = buffer.splice(0);
+      try {
+        const kept = await applyLabels(db, batch, {
+          source,
+          config,
+          // Consistent lock order with policy replacement and backfill commits:
+          // policy -> moderation -> label rows. Every write, including a
+          // filter-only frame's checkpoint, uses the same transaction guard.
+          leadingStatements: [lockModerationPolicyStatement(db)],
+          writeGuard,
+          trailingStatements: [
+            db.prepare(`INSERT INTO labeler_cursors (did, cursor)
+              SELECT CAST(? AS TEXT), CAST(? AS BIGINT) WHERE ${writeGuard.sql}
+              ON CONFLICT(did) DO UPDATE SET cursor = excluded.cursor
+              WHERE excluded.cursor > labeler_cursors.cursor`)
+              .bind(source.did, seq, ...writeGuard.bindings),
+          ],
+        });
+        if (await getModerationPolicyGeneration(db, config) !== policyGeneration)
+          throw new ObsoleteLabelPolicyError("Label policy changed during subscription");
+        state.cursor = seq;
+        log.log(`[labels] ${source.did} flushed ${kept}/${batch.length} labels, cursor=${seq}`);
+      } catch (err) {
+        if (err instanceof ObsoleteLabelPolicyError) {
+          obsoletePolicy = true;
+          buffer.length = 0;
+          cleanup();
+          rejectDone(err);
+        } else buffer.unshift(...batch);
+        throw err;
       }
-      log.log(
-        `[labels] ${source.did} flushed ${kept}/${batch.length} labels, cursor=${highestSeq}`,
-      );
-    } catch (err) {
-      log.error(`[labels] ${source.did} flush failed: ${err}`);
-    } finally {
-      flushing = false;
-    }
+    });
+    flushPending = work;
+    return work;
   };
 
   const batchSize = pumpOpts.batchSize ?? DEFAULT_BATCH_SIZE;
   const flushInterval = pumpOpts.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
+  const flushFailed = (err: unknown) => {
+    if (!(err instanceof ObsoleteLabelPolicyError))
+      log.error(`[labels] ${source.did} flush failed (${buffer.length} buffered): ${err}`);
+  };
   const flushTimer = setInterval(() => {
-    flush().catch(() => {});
+    flush().catch(flushFailed);
   }, flushInterval);
 
   const cleanup = () => {
@@ -200,7 +272,7 @@ async function pumpOneLabeler(
   // External abort (persistent mode) — close socket gracefully.
   const abortHandler = () => {
     cleanup();
-    flush().finally(() => resolveDone());
+    flush().then(resolveDone, rejectDone);
   };
   pumpOpts.signal?.addEventListener("abort", abortHandler, { once: true });
 
@@ -210,8 +282,8 @@ async function pumpOneLabeler(
     deadlineTimer = setTimeout(() => {
       log.log(`[labels] ${source.did} cycle deadline reached, closing`);
       cleanup();
-      flush().finally(() => resolveDone());
-    }, timeoutMs);
+      flush().then(resolveDone, rejectDone);
+    }, Math.max(0, deadline - Date.now()));
   }
 
   ws.addEventListener("error", (ev) => {
@@ -224,10 +296,8 @@ async function pumpOneLabeler(
   ws.addEventListener("close", () => {
     if (deadlineTimer) clearTimeout(deadlineTimer);
     pumpOpts.signal?.removeEventListener("abort", abortHandler);
-    flush().finally(() => {
-      clearInterval(flushTimer);
-      resolveDone();
-    });
+    clearInterval(flushTimer);
+    flush().then(resolveDone, rejectDone);
   });
 
   ws.addEventListener("message", async (ev) => {
@@ -248,11 +318,16 @@ async function pumpOneLabeler(
       const rawLabels = Array.isArray(frame.payload?.labels) ? frame.payload.labels : [];
       for (const raw of rawLabels) {
         const lab = normalizeLabel(raw, source.did);
-        if (lab) buffer.push(lab);
+        if (lab && !(minCts !== null && Date.parse(lab.cts) < minCts)) buffer.push(lab);
       }
       if (Number.isFinite(seq) && seq > highestSeq) highestSeq = seq;
-      if (buffer.length >= batchSize) {
-        flush().catch(() => {});
+      if (buffer.length >= batchSize * MAX_BUFFERED_BATCHES) {
+        // Flushes keep failing: stop reading. The cursor was not advanced past
+        // unflushed labels, so the next connection replays them.
+        log.error(`[labels] ${source.did} buffer limit reached; closing to retry from cursor`);
+        cleanup();
+      } else if (buffer.length >= batchSize) {
+        flush().catch(flushFailed);
       }
     } else if (frame.t === "#info") {
       const name = String(frame.payload?.name ?? "");
@@ -261,8 +336,21 @@ async function pumpOneLabeler(
         // Labeler rewound its log — discard our cursor and let the next
         // run start from the beginning. We don't reconnect here; the
         // caller (or the persistent loop) will pick up the reset on retry.
-        await resetLabelerCursor(db, source.did);
-        cleanup();
+        try {
+          await flush();
+          await db.batch([
+            lockModerationPolicyStatement(db),
+            db.prepare(`INSERT INTO labeler_cursors (did, cursor)
+              SELECT CAST(? AS TEXT), 0 WHERE ${writeGuard.sql}
+              ON CONFLICT(did) DO UPDATE SET cursor = 0`)
+              .bind(source.did, ...writeGuard.bindings),
+          ]);
+          highestSeq = state.cursor = 0;
+          cleanup();
+        } catch (err) {
+          cleanup();
+          rejectDone(err);
+        }
       }
     } else if (frame.op === -1) {
       log.warn(`[labels] ${source.did} error frame: ${JSON.stringify(frame.payload)}`);
@@ -271,7 +359,13 @@ async function pumpOneLabeler(
   });
 
   // Workers WebSocket doesn't always emit `open`; just await `done` directly.
-  await done;
+  try {
+    await done;
+  } finally {
+    cleanup();
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    pumpOpts.signal?.removeEventListener("abort", abortHandler);
+  }
 }
 
 function buildWsUrl(httpEndpoint: string, cursor: number | null): string {

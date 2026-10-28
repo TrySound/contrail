@@ -108,6 +108,54 @@ function parameters(document: any): Record<string, any> {
 }
 
 describe("Contrail Lexicon generation", () => {
+  it("types self declarations on all generated views and pulls the standard dependency without labelers", () => {
+    const { root, config } = fixture();
+    config.profiles = [{ collection: "community.example.profile" }];
+    config.feeds = { network: { targets: ["event"] } };
+    const result = generateLexicons({ config, rootDir: root, quiet: true });
+    expect(result.pullNsids).toContain("com.atproto.label.defs");
+    expect(result.generated["com.atproto.label.defs"]).toBeDefined();
+    expect(result.lexicons.some((doc: any) => doc.id === "com.atproto.label.defs")).toBe(true);
+    const property = { type: "array", maxLength: 10,
+      items: { type: "ref", ref: "com.atproto.label.defs#selfLabel" } };
+    const list = result.generated["example.public.event.listRecords"] as any;
+    expect(list.defs.record.properties.selfLabels).toMatchObject(property);
+    expect(list.defs.hydrateRsvpsRecord.properties.selfLabels).toMatchObject(property);
+    expect(list.defs.profileEntry.properties.selfLabels).toMatchObject(property);
+    const rsvp = result.generated["example.public.rsvp.listRecords"] as any;
+    expect(rsvp.defs.refEventRecord.properties.selfLabels).toMatchObject(property);
+    const get = result.generated["example.public.event.getRecord"] as any;
+    expect(get.defs.main.output.schema.properties.selfLabels).toMatchObject(property);
+    const profile = result.generated["example.public.getProfile"] as any;
+    expect(profile.defs.profileEntry.properties.selfLabels).toMatchObject(property);
+    const feed = result.generated["example.public.getFeed"] as any;
+    expect(feed.defs.feedRecordEvent.properties.selfLabels).toMatchObject(property);
+  });
+  it("prefers project-provided standard label definitions over the offline fallback", () => {
+    const { root, config, write } = fixture();
+    const provided = { lexicon: 1, id: "com.atproto.label.defs", defs: {
+      selfLabel: { type: "object", required: ["val"], properties: { val: { type: "string", maxLength: 128 } },
+        description: "Project-pinned standard definition" },
+    } };
+    write("com.atproto.label.defs", provided);
+    const result = generateLexicons({ config, rootDir: root, quiet: true });
+    expect(result.generated["com.atproto.label.defs"]).toBeUndefined();
+    expect(result.lexicons.find((doc: any) => doc.id === "com.atproto.label.defs")).toEqual(provided);
+  });
+  it("generates moderation records and method-bound private routes without pulling the framework record", () => {
+    const { root, config } = fixture();
+    const result = generateLexicons({ config: { ...config,
+      moderation: { moderators: ["did:plc:moderator"] },
+      serviceAuth: { audience: "did:web:api.example.com#contrail", methods: [] },
+    }, rootDir: root, quiet: true });
+    expect(result.generated["tools.atmo.moderation.action"]).toMatchObject({ defs: { main: { type: "record", key: "tid" } } });
+    expect(result.methods).toContain("com.atproto.moderation.createReport");
+    expect(result.methods).toContain("example.public.moderation.listReports");
+    expect(result.methods).toContain("example.public.moderation.resolveReport");
+    expect(result.pullNsids).not.toContain("tools.atmo.moderation.action");
+    expect(result.pullNsids).toContain("com.atproto.moderation.defs");
+    expect(result.pullNsids).toContain("com.atproto.repo.strongRef");
+  });
   it("generates the public collection API from projection config", () => {
     const { root, config } = fixture();
     const result = generateLexicons({

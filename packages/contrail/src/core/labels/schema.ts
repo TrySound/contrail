@@ -1,4 +1,4 @@
-import type { SqlDialect } from "../dialect";
+import { isPostgresDialect, type SqlDialect } from "../dialect";
 
 /** DDL for the labels module. Single `labels` table covers record-level
  *  (uri starts with `at://`) and account-level (uri is a bare DID) entries —
@@ -15,7 +15,7 @@ export function buildLabelsSchema(dialect: SqlDialect): string[] {
        neg INTEGER NOT NULL DEFAULT 0,
        exp ${dialect.bigintType},
        cts ${dialect.bigintType} NOT NULL,
-       sig BLOB,
+       sig ${isPostgresDialect(dialect) ? "BYTEA" : "BLOB"},
        PRIMARY KEY (src, uri, val, cts)
      )`,
     `CREATE INDEX IF NOT EXISTS idx_labels_uri ON labels(uri)`,

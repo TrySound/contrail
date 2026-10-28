@@ -28,9 +28,10 @@ import { collectDids, resolveProfiles } from "./profiles";
 import { resolveActor } from "../identity";
 import type { FormattedRecord } from "./helpers";
 import { fieldToParam, formatRecord, parseIntParam } from "./helpers";
-import { hydrateLabels } from "../labels/hydrate";
+import { attachRecordLabels } from "../labels/attach";
 import { selectAcceptedLabelers } from "../labels/select";
 import { parseResourceUri } from "@atcute/lexicons/syntax";
+import { visibleRecordSql, isAccountHidden } from "../moderation";
 
 export async function runPipeline(
   db: Database,
@@ -66,7 +67,7 @@ export async function runPipeline(
     if (!resolved) throw new Error("Could not resolve actor");
     did = resolved;
     const nsid = nsidForShortName(config, collection) ?? collection;
-    await backfillUser(db, did, nsid, Date.now() + 3_000, config, {
+    if (!await isAccountHidden(db, did)) await backfillUser(db, did, nsid, Date.now() + 3_000, config, {
       maxRetries: 0,
       requestTimeout: 3_000,
     });
@@ -206,27 +207,9 @@ export async function runPipeline(
       config.labels,
     );
     if (selection.accepted.length > 0) {
-      const subjects = [...formattedRecords.map((record) => record.uri), ...allDids];
-      const cidByUri = new Map<string, string | null>();
-      for (const record of formattedRecords) cidByUri.set(record.uri, record.cid);
-      const labelsByUri = await hydrateLabels(
-        db,
-        subjects,
-        selection.accepted,
-        cidByUri,
-      );
-      for (const record of formattedRecords) {
-        const labels = labelsByUri[record.uri];
-        if (labels && labels.length > 0) record.labels = labels;
-      }
-      if (profileMap) {
-        for (const entries of Object.values(profileMap)) {
-          for (const entry of entries) {
-            const labels = labelsByUri[entry.did];
-            if (labels && labels.length > 0) entry.labels = labels;
-          }
-        }
-      }
+      await attachRecordLabels(db, formattedRecords,
+        [...Object.keys(relations), ...Object.keys(references)], selection.accepted,
+        Object.values(profileMap ?? {}).flat());
       labelersApplied = selection.accepted;
     }
   }
@@ -332,7 +315,7 @@ export function registerCollectionRoutes(
         ].join(", ");
         const row = await db
           .prepare(
-            `SELECT ${selectCols} FROM ${recordsTableName(collection)} WHERE uri = ?`,
+            `SELECT ${selectCols} FROM ${recordsTableName(collection)} r WHERE uri = ? AND ${visibleRecordSql("r")}`,
           )
           .bind(uri)
           .first<any>();
@@ -389,24 +372,9 @@ export function registerCollectionRoutes(
             config.labels,
           );
           if (selection.accepted.length > 0) {
-            const labelsByUri = await hydrateLabels(
-              db,
-              [row.uri, ...allDids],
-              selection.accepted,
-              new Map<string, string | null>([[row.uri, row.cid]]),
-            );
-            const labels = labelsByUri[row.uri];
-            if (labels && labels.length > 0) formatted.labels = labels;
-            if (profileMap) {
-              for (const entries of Object.values(profileMap)) {
-                for (const entry of entries) {
-                  const profileLabels = labelsByUri[entry.did];
-                  if (profileLabels && profileLabels.length > 0) {
-                    entry.labels = profileLabels;
-                  }
-                }
-              }
-            }
+            await attachRecordLabels(db, [formatted],
+              [...Object.keys(relations), ...Object.keys(references)], selection.accepted,
+              Object.values(profileMap ?? {}).flat());
             labelersApplied = selection.accepted;
           }
         }

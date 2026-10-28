@@ -23,6 +23,7 @@ import {
   maybeOptimize,
 } from "./jetstream";
 import type { IngestState } from "./jetstream";
+import { accountUpdateStatements, knownAccountDids, type AccountUpdate } from "./moderation";
 
 /** How often the long-lived persistent loop runs a bounded feed sweep. The
  *  process stays resident, so this in-memory throttle is reliable here (unlike
@@ -183,165 +184,192 @@ async function streamAndFlush(
   }
 
   const buffer: IngestEvent[] = [];
+  // Newest account event per actor; stored state only depends on the newest.
+  const accountBuffer = new Map<string, AccountUpdate>();
+  const bufferAccount = (update: AccountUpdate) => {
+    const prior = accountBuffer.get(update.did);
+    if (prior && prior.cursor >= update.cursor) return;
+    accountBuffer.delete(update.did);
+    accountBuffer.set(update.did, update);
+  };
+  /** Drop network-wide account traffic for actors this instance holds no data
+   * for before it costs SQL. Batch authors stay: their records commit first. */
+  const relevantAccounts = async (
+    updates: AccountUpdate[],
+    batch: IngestEvent[],
+  ): Promise<AccountUpdate[]> => {
+    const local = new Set(batch.map((event) => event.did));
+    const unresolved = updates
+      .map((u) => u.did)
+      .filter((did) => !local.has(did) && !knownDids?.has(did));
+    const known = await knownAccountDids(db, config, unresolved);
+    return updates.filter(
+      (u) => local.has(u.did) || knownDids?.has(u.did) || known.has(u.did),
+    );
+  };
   // Highest fully handled v2 seq not yet committed. This includes identity
   // events, so a commit-quiet stream still advances and does not replay global
   // identity traffic forever after restart.
   let pendingCursor: number | null = null;
-  // Guards against overlap between the periodic timer flush and a main-loop
-  // batchSize-driven flush. The main loop only ever awaits flush() sequentially,
-  // but the setInterval callback is a second entry point on another tick.
-  let flushing = false;
+  // Serializes the periodic timer flush and main-loop flushes (the timer is a
+  // second entry point on another tick). Chaining rather than skipping means
+  // the final flush always runs after any in-flight one.
+  let flushPending: Promise<void> = Promise.resolve();
 
-  const flush = async () => {
-    if (flushing) return;
-    flushing = true;
-
-    try {
-      const checkpoint = pendingCursor;
-      if (checkpoint !== null) pendingCursor = null;
-      if (buffer.length > 0) {
-        const batch = buffer.splice(0);
-        const lastCursor = Math.max(
-          checkpoint ?? 0,
-          ...batch.map((event) => Number(event.source?.cursor)),
-        );
-        let ingestResult: Awaited<ReturnType<typeof ingestRecords>>;
-        try {
-          ingestResult = await ingestRecords(db, batch, config, {
-            phase: "live",
-            knownDids,
-            trailingStatements: [
-              saveJetstreamCursorStatement(db, lastCursor),
-              ...(config.orderedSource
-                ? [
-                    saveOrderedSourcePositionStatement(
-                      db,
-                      config.orderedSource,
-                      lastCursor,
-                    ),
-                  ]
-                : []),
-              ...saveJetstreamCursorObservationStatements(db, lastCursor, []),
-            ],
-          });
-        } catch (error) {
-          // The cursor transaction failed, so keep this exact batch at the front
-          // for the timer's next attempt rather than losing it in memory.
-          buffer.unshift(...batch);
-          pendingCursor = Math.max(pendingCursor ?? 0, lastCursor);
-          throw error;
-        }
-        const { accepted, discoveredDids } = ingestResult;
-
-        if (knownDids) {
-          for (const did of discoveredDids) {
-            knownDids.add(did);
-            opts.newlyKnownDids?.add(did);
-          }
-        }
-
-        // A feed can only go over cap right after this batch's fan-out or follow
-        // backfill, so prune the feeds it grew (see the cron path in
-        // jetstream.ts). If the fan-out overflowed the budget or the prune
-        // failed, the sweep below picks up the rest.
-        if (config.feeds) {
-          try {
-            if (await runGrownFeedPrune(db, config, accepted)) {
-              state.feedDirty = true;
-            }
-          } catch (err) {
-            log.warn(`Grown-feed prune failed: ${err}`);
-            state.feedDirty = true;
-          }
-        }
-
-        const uniqueDids = [...new Set(accepted.map((e) => e.did))];
-        if (uniqueDids.length > 0) {
-          try {
-            await refreshStaleIdentities(db, uniqueDids, config);
-          } catch (err) {
-            log.warn(`Identity refresh failed: ${err}`);
-          }
-        }
-
-        // Drain newly-known DIDs and ask Constellation for back-edges. It prunes
-        // the feeds its follows backfill; whatever a failed backfill leaves over
-        // cap waits for the recovery pass.
-        if (config.feeds && opts.newlyKnownDids && opts.newlyKnownDids.size > 0) {
-          const drained = [...opts.newlyKnownDids];
-          opts.newlyKnownDids.clear();
-          for (const subj of drained) {
-            try {
-              await backfillFollowersFromConstellation(db, config, subj);
-            } catch (err) {
-              log.warn(`[constellation] subject=${subj} failed: ${err}`);
-            }
-          }
-        }
-
-        // Opt-in planner-stat maintenance (gated + persisted cadence).
-        await maybeOptimize(db, config, log);
-
-        log.log(
-          `Flushed ${accepted.length}/${batch.length} records. Cursor: ${lastCursor}`,
-        );
-      } else if (checkpoint !== null) {
-        try {
-          await db.batch([
-            saveJetstreamCursorStatement(db, checkpoint),
+  const flushWork = async () => {
+    const checkpoint = pendingCursor;
+    if (checkpoint !== null) pendingCursor = null;
+    if (buffer.length > 0 || accountBuffer.size > 0) {
+      const batch = buffer.splice(0);
+      const accountBatch = [...accountBuffer.values()];
+      accountBuffer.clear();
+      const lastCursor = Math.max(
+        checkpoint ?? 0,
+        ...batch.map((event) => Number(event.source?.cursor)),
+      );
+      let ingestResult: Awaited<ReturnType<typeof ingestRecords>>;
+      try {
+        const accounts = await relevantAccounts(accountBatch, batch);
+        ingestResult = await ingestRecords(db, batch, config, {
+          phase: "live",
+          knownDids,
+          trailingStatements: [
+            ...accountUpdateStatements(db, accounts, config),
+            saveJetstreamCursorStatement(db, lastCursor),
             ...(config.orderedSource
               ? [
                   saveOrderedSourcePositionStatement(
                     db,
                     config.orderedSource,
-                    checkpoint,
+                    lastCursor,
                   ),
                 ]
               : []),
-            ...saveJetstreamCursorObservationStatements(db, checkpoint, []),
-          ]);
-        } catch (error) {
-          pendingCursor = Math.max(pendingCursor ?? 0, checkpoint);
-          throw error;
+            ...saveJetstreamCursorObservationStatements(db, lastCursor, []),
+          ],
+        });
+      } catch (error) {
+        // The cursor transaction failed, so keep this exact batch at the front
+        // for the timer's next attempt rather than losing it in memory.
+        buffer.unshift(...batch);
+        for (const update of accountBatch) bufferAccount(update);
+        pendingCursor = Math.max(pendingCursor ?? 0, lastCursor);
+        throw error;
+      }
+      const { accepted, discoveredDids } = ingestResult;
+
+      if (knownDids) {
+        for (const did of discoveredDids) {
+          knownDids.add(did);
+          opts.newlyKnownDids?.add(did);
         }
       }
 
-      // Bounded, cursored feed prune (see sweepFeedItems / runFeedPruneSlice).
-      // Runs whether or not this tick had events: a batch whose grown-feed prune
-      // overflowed or failed is swept promptly (throttled by the sweep
-      // interval), and the recovery interval still fires on a fully idle
-      // stream — the timer drives this flush, and
-      // the old "return early when the buffer is empty" path starved recovery,
-      // so over-cap rows from a lowered cap or a bulk import never drained while
-      // the stream was quiet. The recovery clock tracks the last *completed*
-      // full pass (not the last slice), so an overdue pass keeps slicing each
-      // tick until the cursor wraps rather than advancing one slice per interval.
+      // A feed can only go over cap right after this batch's fan-out or follow
+      // backfill, so prune the feeds it grew (see the cron path in
+      // jetstream.ts). If the fan-out overflowed the budget or the prune
+      // failed, the sweep below picks up the rest.
       if (config.feeds) {
-        const caps = buildFeedTargetCaps(config);
-        if (caps.size > 0) {
-          const now = Date.now();
-          const dirtyDue =
-            state.feedDirty && now - state.lastFeedSweepMs > FEED_SWEEP_INTERVAL_MS;
-          const recoveryDue =
-            now - state.lastFullFeedPassMs > FEED_PRUNE_RECOVERY_INTERVAL_MS;
-          if (dirtyDue || recoveryDue) {
-            const { pruned, done } = await runFeedPruneSlice(db, config);
-            if (done) state.lastFullFeedPassMs = now;
-            if (dirtyDue) {
-              state.feedDirty = false;
-              state.lastFeedSweepMs = now;
-            }
-            if (pruned > 0) {
-              log.log(
-                `Pruned ${pruned} feed items (sweep, reason=${dirtyDue ? "dirty" : "recovery"})`
-              );
-            }
+        try {
+          if (await runGrownFeedPrune(db, config, accepted)) {
+            state.feedDirty = true;
+          }
+        } catch (err) {
+          log.warn(`Grown-feed prune failed: ${err}`);
+          state.feedDirty = true;
+        }
+      }
+
+      const uniqueDids = [...new Set(accepted.map((e) => e.did))];
+      if (uniqueDids.length > 0) {
+        try {
+          await refreshStaleIdentities(db, uniqueDids, config);
+        } catch (err) {
+          log.warn(`Identity refresh failed: ${err}`);
+        }
+      }
+
+      // Drain newly-known DIDs and ask Constellation for back-edges. It prunes
+      // the feeds its follows backfill; whatever a failed backfill leaves over
+      // cap waits for the recovery pass.
+      if (config.feeds && opts.newlyKnownDids && opts.newlyKnownDids.size > 0) {
+        const drained = [...opts.newlyKnownDids];
+        opts.newlyKnownDids.clear();
+        for (const subj of drained) {
+          try {
+            await backfillFollowersFromConstellation(db, config, subj);
+          } catch (err) {
+            log.warn(`[constellation] subject=${subj} failed: ${err}`);
           }
         }
       }
-    } finally {
-      flushing = false;
+
+      // Opt-in planner-stat maintenance (gated + persisted cadence).
+      await maybeOptimize(db, config, log);
+
+      log.log(
+        `Flushed ${accepted.length}/${batch.length} records. Cursor: ${lastCursor}`,
+      );
+    } else if (checkpoint !== null) {
+      try {
+        await db.batch([
+          saveJetstreamCursorStatement(db, checkpoint),
+          ...(config.orderedSource
+            ? [
+                saveOrderedSourcePositionStatement(
+                  db,
+                  config.orderedSource,
+                  checkpoint,
+                ),
+              ]
+            : []),
+          ...saveJetstreamCursorObservationStatements(db, checkpoint, []),
+        ]);
+      } catch (error) {
+        pendingCursor = Math.max(pendingCursor ?? 0, checkpoint);
+        throw error;
+      }
     }
+
+    // Bounded, cursored feed prune (see sweepFeedItems / runFeedPruneSlice).
+    // Runs whether or not this tick had events: a batch whose grown-feed prune
+    // overflowed or failed is swept promptly (throttled by the sweep
+    // interval), and the recovery interval still fires on a fully idle
+    // stream — the timer drives this flush, and
+    // the old "return early when the buffer is empty" path starved recovery,
+    // so over-cap rows from a lowered cap or a bulk import never drained while
+    // the stream was quiet. The recovery clock tracks the last *completed*
+    // full pass (not the last slice), so an overdue pass keeps slicing each
+    // tick until the cursor wraps rather than advancing one slice per interval.
+    if (config.feeds) {
+      const caps = buildFeedTargetCaps(config);
+      if (caps.size > 0) {
+        const now = Date.now();
+        const dirtyDue =
+          state.feedDirty &&
+          now - state.lastFeedSweepMs > FEED_SWEEP_INTERVAL_MS;
+        const recoveryDue =
+          now - state.lastFullFeedPassMs > FEED_PRUNE_RECOVERY_INTERVAL_MS;
+        if (dirtyDue || recoveryDue) {
+          const { pruned, done } = await runFeedPruneSlice(db, config);
+          if (done) state.lastFullFeedPassMs = now;
+          if (dirtyDue) {
+            state.feedDirty = false;
+            state.lastFeedSweepMs = now;
+          }
+          if (pruned > 0) {
+            log.log(
+              `Pruned ${pruned} feed items (sweep, reason=${dirtyDue ? "dirty" : "recovery"})`,
+            );
+          }
+        }
+      }
+    }
+  };
+  const flush = (): Promise<void> => {
+    const work = flushPending.catch(() => {}).then(flushWork);
+    flushPending = work;
+    return work;
   };
 
   // Periodic flush decoupled from the main loop. Runs even when Jetstream is
@@ -411,7 +439,14 @@ async function streamAndFlush(
             },
           }),
         );
-
+      } else if (event.kind === "account") {
+        bufferAccount({
+          did: event.did,
+          active: event.account.active,
+          status: event.account.status,
+          timeUs: event.time_us,
+          cursor: event.seq,
+        });
       } else if (
         event.kind === "identity" &&
         event.identity.handle !== undefined
@@ -425,14 +460,19 @@ async function streamAndFlush(
 
       pendingCursor = Math.max(pendingCursor ?? 0, event.seq);
 
-      if (buffer.length >= batchSize) {
+      // Account events are mostly unrelated network traffic; flush them on the
+      // timer unless enough distinct actors accumulate to bound memory.
+      if (buffer.length >= batchSize || accountBuffer.size >= batchSize * 10) {
         await flush();
       }
     }
   } finally {
     clearInterval(flushTimer);
     signal?.removeEventListener("abort", onAbort);
-    await iterator.return?.({ value: undefined, done: true });
-    await flush();
+    try {
+      await iterator.return?.({ value: undefined, done: true });
+    } finally {
+      await flush();
+    }
   }
 }

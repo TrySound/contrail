@@ -31,6 +31,8 @@ const BIGINT_COLUMNS = new Set([
   "last_error_at",
   "created_at",
   "updated_at",
+  "cts",
+  "exp",
 ]);
 
 function normalizeRow(row: any): any {

@@ -7,9 +7,10 @@ import _2 from "../pulled/community/lexicon/location/address.json";
 import _3 from "../pulled/community/lexicon/location/fsq.json";
 import _4 from "../pulled/community/lexicon/location/geo.json";
 import _5 from "../pulled/community/lexicon/location/hthree.json";
-import _6 from "./com/example/event/getRecord.json";
-import _7 from "./com/example/event/listRecords.json";
-import _8 from "./com/example/getCursor.json";
-import _9 from "./com/example/getProfile.json";
+import _6 from "./com/atproto/label/defs.json";
+import _7 from "./com/example/event/getRecord.json";
+import _8 from "./com/example/event/listRecords.json";
+import _9 from "./com/example/getCursor.json";
+import _10 from "./com/example/getProfile.json";
 
-export const lexicons: object[] = [_0, _1, _2, _3, _4, _5, _6, _7, _8, _9];
+export const lexicons: object[] = [_0, _1, _2, _3, _4, _5, _6, _7, _8, _9, _10];

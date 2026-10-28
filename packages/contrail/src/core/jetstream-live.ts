@@ -272,10 +272,9 @@ export class JetstreamLiveSubscription
       raw: true,
       cursor,
       collections: options.wantedCollections as CollectionFilter[] | undefined,
-      // Preserve the legacy live projection surface for now. Account and sync
-      // semantics remain a separate Contrail feature rather than being silently
-      // claimed by this transport migration.
-      kinds: ["commit", "identity"],
+      // Account lifecycle is enforced by both scheduled and persistent ingest.
+      // Sync events still have no projection semantics here.
+      kinds: ["commit", "identity", "account"],
       signal: options.signal,
       liveTransport: transport,
       onError: (error) => options.onConnectionError?.({ error }),

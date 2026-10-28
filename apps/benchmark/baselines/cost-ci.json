@@ -1,0 +1,1093 @@
+{
+  "version": 1,
+  "contract": {
+    "fixtureVersion": 2,
+    "batchSize": 25,
+    "compatibilityDate": "2025-12-25",
+    "runtime": {
+      "wrangler": "4.84.1",
+      "miniflare": "4.20260421.0",
+      "workerd": "1.20260421.1"
+    }
+  },
+  "runs": [
+    {
+      "fixture": {
+        "posts": 64,
+        "actors": 16,
+        "operations": 8,
+        "seed": 42,
+        "preset": "full"
+      },
+      "phases": [
+        {
+          "name": "setup.schema",
+          "kind": "setup",
+          "units": 1,
+          "unit": "initialization",
+          "ceilings": {
+            "rowsRead": 713,
+            "rowsWritten": 214,
+            "statements": 190
+          }
+        },
+        {
+          "name": "setup.report-schema",
+          "kind": "setup",
+          "units": 1,
+          "unit": "initialization",
+          "ceilings": {
+            "rowsRead": 0,
+            "rowsWritten": 0,
+            "statements": 7
+          }
+        },
+        {
+          "name": "setup.actors",
+          "kind": "setup",
+          "units": 16,
+          "unit": "actor",
+          "ceilings": {
+            "rowsRead": 90,
+            "rowsWritten": 223,
+            "statements": 32
+          }
+        },
+        {
+          "name": "setup.follows",
+          "kind": "setup",
+          "units": 30,
+          "unit": "follow",
+          "ceilings": {
+            "rowsRead": 173,
+            "rowsWritten": 345,
+            "statements": 58
+          }
+        },
+        {
+          "name": "setup.records",
+          "kind": "setup",
+          "units": 208,
+          "unit": "record",
+          "ceilings": {
+            "rowsRead": 3341,
+            "rowsWritten": 4402,
+            "statements": 688
+          }
+        },
+        {
+          "name": "setup.labels",
+          "kind": "setup",
+          "units": 64,
+          "unit": "label",
+          "ceilings": {
+            "rowsRead": 35,
+            "rowsWritten": 290,
+            "statements": 74
+          }
+        },
+        {
+          "name": "ingest.create",
+          "kind": "workload",
+          "units": 8,
+          "unit": "record",
+          "ceilings": {
+            "rowsRead": 167,
+            "rowsWritten": 344,
+            "statements": 65
+          }
+        },
+        {
+          "name": "ingest.update",
+          "kind": "workload",
+          "units": 8,
+          "unit": "observation",
+          "ceilings": {
+            "rowsRead": 371,
+            "rowsWritten": 188,
+            "statements": 65
+          }
+        },
+        {
+          "name": "ingest.unchanged",
+          "kind": "workload",
+          "units": 8,
+          "unit": "observation",
+          "ceilings": {
+            "rowsRead": 354,
+            "rowsWritten": 188,
+            "statements": 56
+          }
+        },
+        {
+          "name": "ingest.exact-replay",
+          "kind": "workload",
+          "units": 8,
+          "unit": "observation",
+          "ceilings": {
+            "rowsRead": 51,
+            "rowsWritten": 12,
+            "statements": 6
+          }
+        },
+        {
+          "name": "ingest.stale-replay",
+          "kind": "workload",
+          "units": 8,
+          "unit": "observation",
+          "ceilings": {
+            "rowsRead": 52,
+            "rowsWritten": 11,
+            "statements": 6
+          }
+        },
+        {
+          "name": "ingest.delete",
+          "kind": "workload",
+          "units": 8,
+          "unit": "record",
+          "ceilings": {
+            "rowsRead": 175,
+            "rowsWritten": 98,
+            "statements": 39
+          }
+        },
+        {
+          "name": "ingest.hot-reactions",
+          "kind": "workload",
+          "units": 8,
+          "unit": "reaction",
+          "ceilings": {
+            "rowsRead": 163,
+            "rowsWritten": 104,
+            "statements": 13
+          }
+        },
+        {
+          "name": "query.list",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 763,
+            "rowsWritten": 0,
+            "statements": 11
+          }
+        },
+        {
+          "name": "query.filter",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 560,
+            "rowsWritten": 0,
+            "statements": 11
+          }
+        },
+        {
+          "name": "query.search",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 3412,
+            "rowsWritten": 0,
+            "statements": 11
+          }
+        },
+        {
+          "name": "query.count-sort",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 763,
+            "rowsWritten": 0,
+            "statements": 11
+          }
+        },
+        {
+          "name": "query.pagination",
+          "kind": "workload",
+          "units": 16,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 798,
+            "rowsWritten": 0,
+            "statements": 20
+          }
+        },
+        {
+          "name": "query.filter-pagination",
+          "kind": "workload",
+          "units": 16,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 305,
+            "rowsWritten": 0,
+            "statements": 20
+          }
+        },
+        {
+          "name": "query.filter-deep-page",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 147,
+            "rowsWritten": 0,
+            "statements": 11
+          }
+        },
+        {
+          "name": "query.feed",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 393,
+            "rowsWritten": 0,
+            "statements": 11
+          }
+        },
+        {
+          "name": "query.hydrate",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 9184,
+            "rowsWritten": 0,
+            "statements": 117
+          }
+        },
+        {
+          "name": "query.reference",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 3746,
+            "rowsWritten": 0,
+            "statements": 38
+          }
+        },
+        {
+          "name": "moderation.label-hide",
+          "kind": "workload",
+          "units": 8,
+          "unit": "label",
+          "ceilings": {
+            "rowsRead": 907,
+            "rowsWritten": 184,
+            "statements": 63
+          }
+        },
+        {
+          "name": "moderation.label-replay",
+          "kind": "workload",
+          "units": 8,
+          "unit": "label",
+          "ceilings": {
+            "rowsRead": 318,
+            "rowsWritten": 96,
+            "statements": 27
+          }
+        },
+        {
+          "name": "moderation.label-retract",
+          "kind": "workload",
+          "units": 8,
+          "unit": "label",
+          "ceilings": {
+            "rowsRead": 651,
+            "rowsWritten": 202,
+            "statements": 64
+          }
+        },
+        {
+          "name": "moderation.account-hide",
+          "kind": "workload",
+          "units": 1,
+          "unit": "account",
+          "ceilings": {
+            "rowsRead": 358,
+            "rowsWritten": 58,
+            "statements": 37
+          }
+        },
+        {
+          "name": "moderation.account-restore",
+          "kind": "workload",
+          "units": 1,
+          "unit": "account",
+          "ceilings": {
+            "rowsRead": 312,
+            "rowsWritten": 60,
+            "statements": 38
+          }
+        },
+        {
+          "name": "moderation.status-deactivate",
+          "kind": "workload",
+          "units": 1,
+          "unit": "account",
+          "ceilings": {
+            "rowsRead": 362,
+            "rowsWritten": 56,
+            "statements": 37
+          }
+        },
+        {
+          "name": "moderation.status-restore",
+          "kind": "workload",
+          "units": 1,
+          "unit": "account",
+          "ceilings": {
+            "rowsRead": 316,
+            "rowsWritten": 57,
+            "statements": 37
+          }
+        },
+        {
+          "name": "moderation.action-create",
+          "kind": "workload",
+          "units": 1,
+          "unit": "action",
+          "ceilings": {
+            "rowsRead": 80,
+            "rowsWritten": 38,
+            "statements": 35
+          }
+        },
+        {
+          "name": "moderation.action-delete",
+          "kind": "workload",
+          "units": 1,
+          "unit": "action",
+          "ceilings": {
+            "rowsRead": 89,
+            "rowsWritten": 34,
+            "statements": 33
+          }
+        },
+        {
+          "name": "moderation.policy-hide-fixture",
+          "kind": "setup",
+          "units": 1,
+          "unit": "label",
+          "ceilings": {
+            "rowsRead": 75,
+            "rowsWritten": 26,
+            "statements": 22
+          }
+        },
+        {
+          "name": "moderation.policy-disable",
+          "kind": "workload",
+          "units": 1,
+          "unit": "policy-change",
+          "ceilings": {
+            "rowsRead": 118,
+            "rowsWritten": 51,
+            "statements": 59
+          }
+        },
+        {
+          "name": "moderation.policy-enable",
+          "kind": "workload",
+          "units": 1,
+          "unit": "policy-change",
+          "ceilings": {
+            "rowsRead": 490,
+            "rowsWritten": 82,
+            "statements": 64
+          }
+        },
+        {
+          "name": "moderation.expiry-fixture",
+          "kind": "setup",
+          "units": 1,
+          "unit": "label",
+          "ceilings": {
+            "rowsRead": 85,
+            "rowsWritten": 34,
+            "statements": 22
+          }
+        },
+        {
+          "name": "moderation.expiry",
+          "kind": "workload",
+          "units": 1,
+          "unit": "expiry",
+          "ceilings": {
+            "rowsRead": 38,
+            "rowsWritten": 10,
+            "statements": 7
+          }
+        },
+        {
+          "name": "moderation.report-create",
+          "kind": "workload",
+          "units": 8,
+          "unit": "report",
+          "ceilings": {
+            "rowsRead": 59,
+            "rowsWritten": 61,
+            "statements": 46
+          }
+        },
+        {
+          "name": "moderation.report-inbox",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 217,
+            "rowsWritten": 0,
+            "statements": 38
+          }
+        },
+        {
+          "name": "moderation.report-resolve",
+          "kind": "workload",
+          "units": 8,
+          "unit": "report",
+          "ceilings": {
+            "rowsRead": 50,
+            "rowsWritten": 26,
+            "statements": 20
+          }
+        },
+        {
+          "name": "setup.report-quota",
+          "kind": "setup",
+          "units": 9,
+          "unit": "report",
+          "ceilings": {
+            "rowsRead": 72,
+            "rowsWritten": 58,
+            "statements": 52
+          }
+        },
+        {
+          "name": "abuse.report-quota",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 59,
+            "rowsWritten": 0,
+            "statements": 46
+          }
+        },
+        {
+          "name": "maintenance.schema-check",
+          "kind": "workload",
+          "units": 1,
+          "unit": "initialization",
+          "ceilings": {
+            "rowsRead": 40,
+            "rowsWritten": 0,
+            "statements": 4
+          }
+        },
+        {
+          "name": "maintenance.moderation-idle",
+          "kind": "workload",
+          "units": 8,
+          "unit": "cycle",
+          "ceilings": {
+            "rowsRead": 50,
+            "rowsWritten": 0,
+            "statements": 20
+          }
+        },
+        {
+          "name": "maintenance.feed-sweep",
+          "kind": "workload",
+          "units": 1,
+          "unit": "page",
+          "ceilings": {
+            "rowsRead": 118,
+            "rowsWritten": 0,
+            "statements": 9
+          }
+        },
+        {
+          "name": "abuse.single-publisher",
+          "kind": "workload",
+          "units": 8,
+          "unit": "record",
+          "ceilings": {
+            "rowsRead": 134,
+            "rowsWritten": 223,
+            "statements": 65
+          }
+        },
+        {
+          "name": "abuse.many-publishers",
+          "kind": "workload",
+          "units": 8,
+          "unit": "record",
+          "ceilings": {
+            "rowsRead": 134,
+            "rowsWritten": 223,
+            "statements": 65
+          }
+        },
+        {
+          "name": "abuse.record-filter",
+          "kind": "workload",
+          "units": 8,
+          "unit": "observation",
+          "ceilings": {
+            "rowsRead": 72,
+            "rowsWritten": 58,
+            "statements": 31
+          }
+        }
+      ]
+    },
+    {
+      "fixture": {
+        "posts": 512,
+        "actors": 16,
+        "operations": 8,
+        "seed": 42,
+        "preset": "full"
+      },
+      "phases": [
+        {
+          "name": "setup.schema",
+          "kind": "setup",
+          "units": 1,
+          "unit": "initialization",
+          "ceilings": {
+            "rowsRead": 713,
+            "rowsWritten": 214,
+            "statements": 190
+          }
+        },
+        {
+          "name": "setup.report-schema",
+          "kind": "setup",
+          "units": 1,
+          "unit": "initialization",
+          "ceilings": {
+            "rowsRead": 0,
+            "rowsWritten": 0,
+            "statements": 7
+          }
+        },
+        {
+          "name": "setup.actors",
+          "kind": "setup",
+          "units": 16,
+          "unit": "actor",
+          "ceilings": {
+            "rowsRead": 90,
+            "rowsWritten": 223,
+            "statements": 32
+          }
+        },
+        {
+          "name": "setup.follows",
+          "kind": "setup",
+          "units": 30,
+          "unit": "follow",
+          "ceilings": {
+            "rowsRead": 173,
+            "rowsWritten": 345,
+            "statements": 58
+          }
+        },
+        {
+          "name": "setup.records",
+          "kind": "setup",
+          "units": 1664,
+          "unit": "record",
+          "ceilings": {
+            "rowsRead": 27760,
+            "rowsWritten": 35111,
+            "statements": 5411
+          }
+        },
+        {
+          "name": "setup.labels",
+          "kind": "setup",
+          "units": 512,
+          "unit": "label",
+          "ceilings": {
+            "rowsRead": 35,
+            "rowsWritten": 2261,
+            "statements": 567
+          }
+        },
+        {
+          "name": "ingest.create",
+          "kind": "workload",
+          "units": 8,
+          "unit": "record",
+          "ceilings": {
+            "rowsRead": 167,
+            "rowsWritten": 344,
+            "statements": 65
+          }
+        },
+        {
+          "name": "ingest.update",
+          "kind": "workload",
+          "units": 8,
+          "unit": "observation",
+          "ceilings": {
+            "rowsRead": 371,
+            "rowsWritten": 188,
+            "statements": 65
+          }
+        },
+        {
+          "name": "ingest.unchanged",
+          "kind": "workload",
+          "units": 8,
+          "unit": "observation",
+          "ceilings": {
+            "rowsRead": 354,
+            "rowsWritten": 188,
+            "statements": 56
+          }
+        },
+        {
+          "name": "ingest.exact-replay",
+          "kind": "workload",
+          "units": 8,
+          "unit": "observation",
+          "ceilings": {
+            "rowsRead": 51,
+            "rowsWritten": 12,
+            "statements": 6
+          }
+        },
+        {
+          "name": "ingest.stale-replay",
+          "kind": "workload",
+          "units": 8,
+          "unit": "observation",
+          "ceilings": {
+            "rowsRead": 52,
+            "rowsWritten": 11,
+            "statements": 6
+          }
+        },
+        {
+          "name": "ingest.delete",
+          "kind": "workload",
+          "units": 8,
+          "unit": "record",
+          "ceilings": {
+            "rowsRead": 175,
+            "rowsWritten": 98,
+            "statements": 39
+          }
+        },
+        {
+          "name": "ingest.hot-reactions",
+          "kind": "workload",
+          "units": 8,
+          "unit": "reaction",
+          "ceilings": {
+            "rowsRead": 533,
+            "rowsWritten": 104,
+            "statements": 13
+          }
+        },
+        {
+          "name": "query.list",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 763,
+            "rowsWritten": 0,
+            "statements": 11
+          }
+        },
+        {
+          "name": "query.filter",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 560,
+            "rowsWritten": 0,
+            "statements": 11
+          }
+        },
+        {
+          "name": "query.search",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 27066,
+            "rowsWritten": 0,
+            "statements": 11
+          }
+        },
+        {
+          "name": "query.count-sort",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 763,
+            "rowsWritten": 0,
+            "statements": 11
+          }
+        },
+        {
+          "name": "query.pagination",
+          "kind": "workload",
+          "units": 16,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 798,
+            "rowsWritten": 0,
+            "statements": 20
+          }
+        },
+        {
+          "name": "query.filter-pagination",
+          "kind": "workload",
+          "units": 16,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 305,
+            "rowsWritten": 0,
+            "statements": 20
+          }
+        },
+        {
+          "name": "query.filter-deep-page",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 173,
+            "rowsWritten": 0,
+            "statements": 11
+          }
+        },
+        {
+          "name": "query.feed",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 2857,
+            "rowsWritten": 0,
+            "statements": 11
+          }
+        },
+        {
+          "name": "query.hydrate",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 9211,
+            "rowsWritten": 0,
+            "statements": 117
+          }
+        },
+        {
+          "name": "query.reference",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 3755,
+            "rowsWritten": 0,
+            "statements": 38
+          }
+        },
+        {
+          "name": "moderation.label-hide",
+          "kind": "workload",
+          "units": 8,
+          "unit": "label",
+          "ceilings": {
+            "rowsRead": 1400,
+            "rowsWritten": 184,
+            "statements": 63
+          }
+        },
+        {
+          "name": "moderation.label-replay",
+          "kind": "workload",
+          "units": 8,
+          "unit": "label",
+          "ceilings": {
+            "rowsRead": 318,
+            "rowsWritten": 96,
+            "statements": 27
+          }
+        },
+        {
+          "name": "moderation.label-retract",
+          "kind": "workload",
+          "units": 8,
+          "unit": "label",
+          "ceilings": {
+            "rowsRead": 1020,
+            "rowsWritten": 202,
+            "statements": 64
+          }
+        },
+        {
+          "name": "moderation.account-hide",
+          "kind": "workload",
+          "units": 1,
+          "unit": "account",
+          "ceilings": {
+            "rowsRead": 1952,
+            "rowsWritten": 243,
+            "statements": 98
+          }
+        },
+        {
+          "name": "moderation.account-restore",
+          "kind": "workload",
+          "units": 1,
+          "unit": "account",
+          "ceilings": {
+            "rowsRead": 1590,
+            "rowsWritten": 245,
+            "statements": 99
+          }
+        },
+        {
+          "name": "moderation.status-deactivate",
+          "kind": "workload",
+          "units": 1,
+          "unit": "account",
+          "ceilings": {
+            "rowsRead": 1956,
+            "rowsWritten": 241,
+            "statements": 98
+          }
+        },
+        {
+          "name": "moderation.status-restore",
+          "kind": "workload",
+          "units": 1,
+          "unit": "account",
+          "ceilings": {
+            "rowsRead": 1595,
+            "rowsWritten": 242,
+            "statements": 98
+          }
+        },
+        {
+          "name": "moderation.action-create",
+          "kind": "workload",
+          "units": 1,
+          "unit": "action",
+          "ceilings": {
+            "rowsRead": 80,
+            "rowsWritten": 38,
+            "statements": 35
+          }
+        },
+        {
+          "name": "moderation.action-delete",
+          "kind": "workload",
+          "units": 1,
+          "unit": "action",
+          "ceilings": {
+            "rowsRead": 89,
+            "rowsWritten": 34,
+            "statements": 33
+          }
+        },
+        {
+          "name": "moderation.policy-hide-fixture",
+          "kind": "setup",
+          "units": 1,
+          "unit": "label",
+          "ceilings": {
+            "rowsRead": 75,
+            "rowsWritten": 26,
+            "statements": 22
+          }
+        },
+        {
+          "name": "moderation.policy-disable",
+          "kind": "workload",
+          "units": 1,
+          "unit": "policy-change",
+          "ceilings": {
+            "rowsRead": 118,
+            "rowsWritten": 51,
+            "statements": 59
+          }
+        },
+        {
+          "name": "moderation.policy-enable",
+          "kind": "workload",
+          "units": 1,
+          "unit": "policy-change",
+          "ceilings": {
+            "rowsRead": 1547,
+            "rowsWritten": 99,
+            "statements": 163
+          }
+        },
+        {
+          "name": "moderation.expiry-fixture",
+          "kind": "setup",
+          "units": 1,
+          "unit": "label",
+          "ceilings": {
+            "rowsRead": 85,
+            "rowsWritten": 34,
+            "statements": 22
+          }
+        },
+        {
+          "name": "moderation.expiry",
+          "kind": "workload",
+          "units": 1,
+          "unit": "expiry",
+          "ceilings": {
+            "rowsRead": 38,
+            "rowsWritten": 10,
+            "statements": 7
+          }
+        },
+        {
+          "name": "moderation.report-create",
+          "kind": "workload",
+          "units": 8,
+          "unit": "report",
+          "ceilings": {
+            "rowsRead": 59,
+            "rowsWritten": 61,
+            "statements": 46
+          }
+        },
+        {
+          "name": "moderation.report-inbox",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 217,
+            "rowsWritten": 0,
+            "statements": 38
+          }
+        },
+        {
+          "name": "moderation.report-resolve",
+          "kind": "workload",
+          "units": 8,
+          "unit": "report",
+          "ceilings": {
+            "rowsRead": 50,
+            "rowsWritten": 26,
+            "statements": 20
+          }
+        },
+        {
+          "name": "setup.report-quota",
+          "kind": "setup",
+          "units": 9,
+          "unit": "report",
+          "ceilings": {
+            "rowsRead": 72,
+            "rowsWritten": 58,
+            "statements": 52
+          }
+        },
+        {
+          "name": "abuse.report-quota",
+          "kind": "workload",
+          "units": 8,
+          "unit": "request",
+          "ceilings": {
+            "rowsRead": 59,
+            "rowsWritten": 0,
+            "statements": 46
+          }
+        },
+        {
+          "name": "maintenance.schema-check",
+          "kind": "workload",
+          "units": 1,
+          "unit": "initialization",
+          "ceilings": {
+            "rowsRead": 40,
+            "rowsWritten": 0,
+            "statements": 4
+          }
+        },
+        {
+          "name": "maintenance.moderation-idle",
+          "kind": "workload",
+          "units": 8,
+          "unit": "cycle",
+          "ceilings": {
+            "rowsRead": 50,
+            "rowsWritten": 0,
+            "statements": 20
+          }
+        },
+        {
+          "name": "maintenance.feed-sweep",
+          "kind": "workload",
+          "units": 1,
+          "unit": "page",
+          "ceilings": {
+            "rowsRead": 673,
+            "rowsWritten": 0,
+            "statements": 9
+          }
+        },
+        {
+          "name": "abuse.single-publisher",
+          "kind": "workload",
+          "units": 8,
+          "unit": "record",
+          "ceilings": {
+            "rowsRead": 134,
+            "rowsWritten": 223,
+            "statements": 65
+          }
+        },
+        {
+          "name": "abuse.many-publishers",
+          "kind": "workload",
+          "units": 8,
+          "unit": "record",
+          "ceilings": {
+            "rowsRead": 134,
+            "rowsWritten": 223,
+            "statements": 65
+          }
+        },
+        {
+          "name": "abuse.record-filter",
+          "kind": "workload",
+          "units": 8,
+          "unit": "observation",
+          "ceilings": {
+            "rowsRead": 72,
+            "rowsWritten": 58,
+            "statements": 31
+          }
+        }
+      ]
+    }
+  ]
+}

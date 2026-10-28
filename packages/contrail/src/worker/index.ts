@@ -33,11 +33,15 @@ import {
   type PublicServiceOptions,
 } from "../public-service.js";
 
+import { initModerationReports } from "../core/moderation.js";
+
 type WorkerEnv = Record<string, unknown>;
 
 export interface CreateWorkerOptions<Env extends WorkerEnv = WorkerEnv> {
   /** D1 binding name in wrangler env. Default: `"DB"`. */
   binding?: string;
+  /** Stable D1 binding for private reports; keep it across generation swaps. */
+  reportsBinding?: string;
   /** Exact generated/pinned bundle exposed for type generation and used by
    * collections with `validate: true`. */
   lexicons?: object[];
@@ -88,9 +92,15 @@ export function createWorker<Env extends WorkerEnv = WorkerEnv>(
   });
 
   let ready = false;
-  const ensureReady = async (env: Env, db: Database): Promise<void> => {
+  const ensureReady = async (env: Env, db: Database, request = false): Promise<void> => {
     if (ready) return;
-    await contrail.init(db);
+    // Requests never wait on a moderation policy job; cron cycles finish it.
+    await contrail.init(db, { deferModerationPolicyJob: request });
+    if (options.reportsBinding) {
+      const reportsDb = env[options.reportsBinding] as Database | undefined;
+      if (!reportsDb) throw new TypeError(`Missing report storage binding ${options.reportsBinding}`);
+      await initModerationReports(reportsDb);
+    }
     await options.onInit?.(env, db);
     ready = true;
   };
@@ -102,8 +112,8 @@ export function createWorker<Env extends WorkerEnv = WorkerEnv>(
       ctx?: ExecutionContext,
     ): Promise<Response> {
       const db = env[binding] as Database;
-      await ensureReady(env, db);
-      const response = (await handle(request, db)) as Response;
+      await ensureReady(env, db, true);
+      const response = (await handle(request, db, options.reportsBinding ? env[options.reportsBinding] as Database : undefined)) as Response;
       const notifyPath = `/xrpc/${contrail.config.namespace}.notifyOfUpdate`;
       if (
         deliveryEnabled &&

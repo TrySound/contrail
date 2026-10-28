@@ -51,6 +51,10 @@ This produces the following client parameters:
 
 Dotted fields become camel case: `subject.uri` becomes `subjectUri`. Every list method also supports `actor` (a DID or handle), `sort`, `order`, `limit`, `cursor`, and `profiles`.
 
+Equality fields get a composite index on `(field, time_us DESC, uri ASC)` for the common filtered list in default chronological order. Range fields retain a single-field index; multiple filters, other sorts and dense timestamp ties can require additional candidate reads. The equality index also serves relation/follow lookups on that field, so Contrail does not retain a redundant single-field index. Feeds additionally index record URIs to avoid scanning unrelated feed entries when deleting a record.
+
+With an unchanged app config, upgrading from the preceding schema installs these indexes without rebuilding FTS or resetting records/cursors. Index construction still incurs one-time database work; the extra feed URI index also adds ongoing writes per feed entry.
+
 A reference hydrates the current indexed target record identified by the URI in
 `field`. If that field comes from a strongRef, Contrail does not retrieve the
 historical record version named by the strongRef's CID. Lexicons also do not

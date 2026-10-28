@@ -3,15 +3,17 @@ import { cors } from "hono/cors";
 import type { ContrailConfig, Database } from "../types";
 import { normalizeProfileConfig } from "../types";
 import { backfillUser } from "../backfill";
-import { hydrateLabels } from "../labels/hydrate";
+import { attachRecordLabels } from "../labels/attach";
 import { selectAcceptedLabelers } from "../labels/select";
 import { resolveActor } from "../identity";
 import { getStatusOverview, registerCursorRoute } from "./diagnostics";
 import { registerCollectionRoutes } from "./collection";
 import { registerFeedRoutes } from "./feed";
 import { registerNotifyRoute } from "./notify";
-import { resolveProfiles } from "./profiles";
+import { hiddenProfileUris, resolveProfiles } from "./profiles";
 import { createServiceAuthGate } from "../service-auth";
+import { isAccountHidden } from "../moderation";
+import { registerModerationRoutes } from "./moderation";
 import {
   describePublicService,
   hostsServiceDidDocument,
@@ -27,6 +29,8 @@ export interface CreateAppOptions {
   lexicons?: object[];
   /** Enable stable discovery for anonymous read-through clients. */
   publicService?: PublicServiceOptions;
+  /** Stable instance-owned report storage, independent of projection rebuilds. */
+  reportsDb?: Database;
 }
 
 export function createApp(
@@ -146,7 +150,14 @@ export function createApp(
     const did = await resolveActor(db, actor, config);
     if (!did) return c.json({ error: "Could not resolve actor" }, 400);
 
-    for (const profile of (config.profiles ?? []).map(normalizeProfileConfig)) {
+    if (await isAccountHidden(db, did)) return c.json({ error: "Profile not found" }, 404);
+    const profilesToLoad = (config.profiles ?? []).map(normalizeProfileConfig);
+    const hiddenUris = await hiddenProfileUris(db, config, [did]);
+    if (profilesToLoad.length && profilesToLoad.every((p) =>
+      hiddenUris.has(`at://${did}/${p.collection}/${p.rkey ?? "self"}`),
+    )) return c.json({ error: "Profile not found" }, 404);
+    for (const profile of profilesToLoad) {
+      if (hiddenUris.has(`at://${did}/${profile.collection}/${profile.rkey ?? "self"}`)) continue;
       await backfillUser(
         db,
         did,
@@ -171,11 +182,7 @@ export function createApp(
         config.labels,
       );
       if (selection.accepted.length > 0) {
-        const labelsByUri = await hydrateLabels(db, [did], selection.accepted);
-        const labels = labelsByUri[did];
-        if (labels && labels.length > 0) {
-          for (const profile of profiles) profile.labels = labels;
-        }
+        await attachRecordLabels(db, [], [], selection.accepted, profiles);
         c.header("atproto-content-labelers", selection.accepted.join(","));
       }
     }
@@ -187,6 +194,7 @@ export function createApp(
   registerCollectionRoutes(app, db, config);
   registerFeedRoutes(app, db, config, serviceAuth);
   registerNotifyRoute(app, db, config, serviceAuth);
+  registerModerationRoutes(app, db, config, serviceAuth, options.reportsDb);
 
   return app;
 }

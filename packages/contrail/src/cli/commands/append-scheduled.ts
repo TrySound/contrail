@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync } from "node:fs";
-import { resolve as resolvePath, relative as relativePath } from "node:path";
+import { basename, resolve as resolvePath, relative as relativePath } from "node:path";
 import type { CAC } from "cac";
 
 interface AppendScheduledOpts {
@@ -62,14 +62,22 @@ export function registerAppendScheduled(cli: CAC): void {
         return;
       }
 
+      // A self-import gives us the public default export as a live ESM binding.
+      // It is read only after the original module body has initialized it. This
+      // supports both anonymous adapter-cloudflare 8 exports and older bundles
+      // without parsing/rewriting generated code or creating public asset files.
+      let workerBinding = "__contrail_scheduled_worker__";
+      while (code.includes(workerBinding)) workerBinding += "_";
+
       const patched =
         code +
         `
 ${MARKER} — patched by \`contrail append-scheduled\`
-worker_default.scheduled = async function (event, env, ctx) {
-\tconst req = new Request("http://localhost${options.cronPath}", {
+import ${workerBinding} from ${JSON.stringify("./" + basename(workerPath))};
+${workerBinding}.scheduled = async function (event, env, ctx) {
+\tconst req = new Request(${JSON.stringify("http://localhost" + options.cronPath)}, {
 \t\tmethod: "POST",
-\t\theaders: { "X-Cron-Secret": env.${options.secretEnv} || "" }
+\t\theaders: { "X-Cron-Secret": env[${JSON.stringify(options.secretEnv)}] || "" }
 \t});
 \tctx.waitUntil(this.fetch(req, env, ctx));
 };
