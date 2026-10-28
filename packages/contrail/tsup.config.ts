@@ -5,6 +5,7 @@ export default defineConfig({
     "src/index.ts",
     "src/server.ts",
     "src/public-client.ts",
+    "src/moderation-client.ts",
     "src/adapters/sqlite.ts",
     "src/adapters/postgres.ts",
     "src/adapters/alluvium.ts",

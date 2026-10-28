@@ -6,6 +6,7 @@ import type {
   RelationConfig,
 } from "../types";
 import { getDialect } from "../dialect";
+import { visibleRecordSql } from "../moderation";
 import {
   getNestedValue,
   getRelationField,
@@ -74,9 +75,9 @@ export async function resolveHydrates(
       Omit<RecordRow, "collection">
     >(
       db,
-      `SELECT uri, did, rkey, record, time_us
-       FROM ${recordsTableName(relation.collection)}
-       WHERE ${getDialect(db).jsonExtract("record", field)} IN (__IN__)
+      `SELECT uri, did, rkey, cid, record, time_us
+       FROM ${recordsTableName(relation.collection)} r
+       WHERE ${getDialect(db).jsonExtract("record", field)} IN (__IN__) AND ${visibleRecordSql("r")}
        ORDER BY time_us DESC
        LIMIT ${maxRows}`,
       [],
@@ -169,9 +170,9 @@ export async function resolveReferences(
     if (targetUris.length === 0) continue;
     const rows = await batchedInQuery<Omit<RecordRow, "collection">>(
       db,
-      `SELECT uri, did, rkey, record, time_us
-       FROM ${recordsTableName(reference.collection)}
-       WHERE uri IN (__IN__)`,
+      `SELECT uri, did, rkey, cid, record, time_us
+       FROM ${recordsTableName(reference.collection)} r
+       WHERE uri IN (__IN__) AND ${visibleRecordSql("r")}`,
       [],
       targetUris,
     );

@@ -67,6 +67,17 @@ describe("labels: applyLabels + hydrate", () => {
     expect(out[URI_X] ?? []).toHaveLength(0);
   });
 
+  it("rejects forward-dated labels beyond clock skew", async () => {
+    const { db } = await setup();
+    const kept = await applyLabels(db, [
+      { src: SRC_A, uri: URI_X, val: "skewed", cts: ctsIso(60) },
+      { src: SRC_A, uri: URI_X, val: "future", cts: ctsIso(3600) },
+    ]);
+    expect(kept).toBe(1);
+    const out = await hydrateLabels(db, [URI_X], [SRC_A]);
+    expect(out[URI_X]?.map((l) => l.val)).toEqual(["skewed"]);
+  });
+
   it("re-positive after a negation wins again", async () => {
     const { db } = await setup();
     await applyLabels(db, [

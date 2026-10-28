@@ -1,7 +1,7 @@
 /** Contrail's public API. */
 export type { LexiconDoc } from "@atcute/lexicon-doc";
 export { Contrail } from "./contrail";
-export type { AppOptions, ContrailOptions } from "./contrail";
+export type { AppOptions, ContrailInitOptions, ContrailOptions } from "./contrail";
 export * from "./public-service";
 
 // Configuration, storage, identity, and dialects.
@@ -90,8 +90,15 @@ export * from "./core/router/collection";
 export * from "./core/router/hydrate";
 export * from "./core/router/helpers";
 
+// Moderation and account lifecycle.
+export * from "./core/moderation";
+export * from "./core/moderation-sync";
+export * from "./core/moderation-policy";
+export { moderationActionLexicon } from "./lexicons/moderation";
+
 // Labels.
 export * from "./core/labels/types";
+export * from "./core/labels/self";
 export * from "./core/labels/hydrate";
 export * from "./core/labels/select";
 export * from "./core/labels/apply";

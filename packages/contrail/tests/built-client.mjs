@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createPublicServiceClient } from "../dist/public-client.js";
+import { moderationOAuthScope } from "../dist/moderation-client.js";
 
 const client = createPublicServiceClient({
   endpoint: "https://api.example.com",
@@ -21,4 +22,12 @@ assert.deepEqual(client.collections, ["community.example.event"]);
 const response = await client.get("com.example.listRecords");
 assert.equal(response.ok, true);
 assert.deepEqual(response.data, { records: [] });
+assert.equal(
+  moderationOAuthScope({
+    endpoint: "https://api.example.com",
+    audience: "did:web:api.example.com#contrail",
+    namespace: "com.example",
+  }),
+  "rpc?lxm=com.atproto.moderation.createReport&aud=did%3Aweb%3Aapi.example.com%23contrail",
+);
 console.log("built public client passed");

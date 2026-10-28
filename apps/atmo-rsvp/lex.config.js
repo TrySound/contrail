@@ -5,6 +5,7 @@ export default defineLexiconConfig({
   generate: {
     files: [
       "lexicons/custom/**/*.json",
+      "lexicons/pinned/**/*.json",
       "lexicons/pulled/**/*.json",
       "lexicons/generated/**/*.json",
     ],

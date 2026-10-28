@@ -38,10 +38,12 @@ import {
 import {
   ftsQueryClause,
   getDialect,
+  isPostgresDialect,
   sqliteFtsContentExpression,
 } from "../dialect";
 import type { SourcePosition } from "../sources";
 import { appendChangeLogStatements } from "../change-log";
+import { actionProjectionStatements, activeHiddenSql, visibleRecordSql, labelBackfillEnqueueStatements } from "../moderation";
 
 // --- Counts ---
 
@@ -172,16 +174,14 @@ function buildBatchCountStatements(
     const setClauses: string[] = [];
     const setBindings: (string | number)[] = [];
 
-    const countExpr = rel.countDistinct
-      ? `COUNT(DISTINCT ${rel.countDistinct})`
-      : "COUNT(*)";
+    const dialect = getDialect(db);
+    const fieldFilter = { expr: (alias: string) => dialect.jsonExtract(`${alias}.record`, field), value: targetValue };
 
     // Total count
     const totalCol = countColumnName(rel.collection);
-    setClauses.push(
-      `${totalCol} = (SELECT ${countExpr} FROM ${childTable} WHERE ${getDialect(db).jsonExtract('record', field)} = ?)`
-    );
-    setBindings.push(targetValue);
+    const total = visibleChildCountSql(db, childTable, rel.countDistinct, [fieldFilter]);
+    setClauses.push(`${totalCol} = ${total.sql}`);
+    setBindings.push(...total.bindings);
 
     // Grouped counts — column names are `count_<child-short>_<group-key>`; match
     // against the group's full token value in the record.
@@ -190,10 +190,13 @@ function buildBatchCountStatements(
       if (mapping?.groups) {
         for (const [groupKey, fullToken] of Object.entries(mapping.groups)) {
           const groupCol = groupedCountColumnName(rel.collection, groupKey);
-          setClauses.push(
-            `${groupCol} = (SELECT ${countExpr} FROM ${childTable} WHERE ${getDialect(db).jsonExtract('record', field)} = ? AND ${getDialect(db).jsonExtract('record', rel.groupBy)} = ?)`
-          );
-          setBindings.push(targetValue, fullToken);
+          const groupBy = rel.groupBy;
+          const grouped = visibleChildCountSql(db, childTable, rel.countDistinct, [
+            fieldFilter,
+            { expr: (alias) => dialect.jsonExtract(`${alias}.record`, groupBy), value: fullToken },
+          ]);
+          setClauses.push(`${groupCol} = ${grouped.sql}`);
+          setBindings.push(...grouped.bindings);
         }
       }
     }
@@ -210,6 +213,98 @@ function buildBatchCountStatements(
   }
 
   return statements;
+}
+
+/** Above this many `moderation_hidden` rows, never drive a count from them. */
+const HIDDEN_DRIVE_CAP = 10_000;
+
+/** Public child count: stored counts exclude hidden children, and moderation
+ * visibility changes recount affected parents.
+ *
+ * Probing visibility per child costs a row fetch and two index lookups per
+ * child, which is expensive for parents with many children. So when there are
+ * more children than hidden rows, count the index-only total and subtract the
+ * hidden children found by driving from `moderation_hidden` instead. Distinct
+ * counts cannot be subtracted and only skip the probes when nothing is hidden.
+ * Each filter value is bound once; subqueries read it from `q`. */
+function visibleChildCountSql(
+  db: Database,
+  childTable: string,
+  countDistinct: string | undefined,
+  filters: Array<{ expr: (alias: string) => string; value: string }>,
+): { sql: string; bindings: string[] } {
+  const pg = isPostgresDialect(getDialect(db));
+  // SQLite: unary `+` stops the planner from using the relation index when
+  // driving from hidden rows, so it probes children by did/uri instead.
+  const where = (alias: string, drive = false) =>
+    filters.map((f, i) => `${drive && !pg ? "+" : ""}${f.expr(alias)} = q.v${i}`).join(" AND ");
+  // PostgreSQL needs a parameter type; on SQLite a TEXT affinity would stop
+  // the relation's expression index from matching.
+  const params = `(SELECT ${filters.map((_, i) => `${pg ? "CAST(? AS TEXT)" : "?"} AS v${i}`).join(", ")}) p`;
+  // Keep `q` a materialized row: flattening would evaluate t/h per reference.
+  const fence = pg ? "OFFSET 0" : "LIMIT -1 OFFSET 0";
+  const bindings = filters.map((f) => f.value);
+  const columns = filters.map((_, i) => `p.v${i}`).join(", ");
+  if (countDistinct) {
+    const anyHidden = `EXISTS (SELECT 1 FROM moderation_hidden h WHERE ${activeHiddenSql("h")})`;
+    return {
+      sql: `(SELECT (SELECT COUNT(DISTINCT mc.${countDistinct}) FROM ${childTable} mc
+        WHERE ${where("mc")} AND (NOT ${anyHidden} OR ${visibleRecordSql("mc")}))
+        FROM (SELECT ${columns} FROM ${params}) q)`,
+      bindings,
+    };
+  }
+  const join = pg ? "JOIN" : "CROSS JOIN"; // SQLite: CROSS JOIN fixes join order
+  const perRow = `(SELECT COUNT(*) FROM ${childTable} mc WHERE ${where("mc")} AND ${visibleRecordSql("mc")})`;
+  const hiddenChildren = `(SELECT COUNT(*) FROM (
+      SELECT c.uri FROM moderation_hidden mh ${join} ${childTable} c ON c.did = mh.subject
+      WHERE mh.cid = '' AND ${activeHiddenSql("mh")} AND ${where("c", true)}
+      UNION
+      SELECT c.uri FROM moderation_hidden mh ${join} ${childTable} c
+        ON c.uri = mh.subject AND (mh.cid = '' OR mh.cid = c.cid)
+      WHERE ${activeHiddenSql("mh")} AND ${where("c", true)}
+    ) hidden_children)`;
+  return {
+    sql: `(SELECT CASE WHEN q.h >= ${HIDDEN_DRIVE_CAP} OR q.t <= q.h THEN ${perRow}
+        ELSE q.t - ${hiddenChildren} END
+      FROM (SELECT ${columns},
+        (SELECT COUNT(*) FROM ${childTable} mc WHERE ${filters.map((f, i) => `${f.expr("mc")} = p.v${i}`).join(" AND ")}) AS t,
+        (SELECT COUNT(*) FROM (SELECT 1 FROM moderation_hidden LIMIT ${HIDDEN_DRIVE_CAP}) x) AS h
+        FROM ${params} ${fence}) q)`,
+    bindings,
+  };
+}
+
+/** Recount every parent the given child records point at, under current
+ * moderation visibility. Used when a child's visibility changes. */
+export function childRecountStatements(
+  db: Database,
+  config: ContrailConfig,
+  childShort: string,
+  records: Array<{ record: unknown }>,
+): Statement[] {
+  const targets = new Map<string, CountTarget>();
+  for (const { parentCollection, relationName, rel } of getInboundRelations(
+    config,
+    childShort,
+  )) {
+    if (rel.count === false) continue;
+    for (const row of records) {
+      const record =
+        typeof row.record === "string" ? JSON.parse(row.record) : row.record;
+      const targetValue = record
+        ? getNestedValue(record, getRelationField(rel))
+        : null;
+      if (typeof targetValue === "string" && targetValue)
+        addCountTarget(targets, {
+          parentCollection,
+          relationName,
+          rel,
+          targetValue,
+        });
+    }
+  }
+  return buildBatchCountStatements(db, config, targets);
 }
 
 // --- FTS ---
@@ -1420,7 +1515,14 @@ export async function projectEvents(
 
   // Build deduplicated count statements, then append the compact change batch.
   // Caller-provided source checkpoints deliberately remain last.
+  // Counts (parent rows) precede moderation writes (moderation lock, then
+  // recount queue rows). PostgreSQL writers then share one lock order: parent
+  // rows -> moderation lock -> recount queue, matching moderation recounts and
+  // trailing lifecycle statements. Visibility changed by this batch's actions
+  // reaches parent counts through the recount queue.
   batch.push(...buildBatchCountStatements(db, config, countTargets));
+  batch.push(...actionProjectionStatements(db, events, config));
+  batch.push(...labelBackfillEnqueueStatements(db, events.filter((e) => e.operation !== "delete").map((e) => e.did), config));
   batch.push(
     ...appendChangeLogStatements(
       db,
@@ -1547,6 +1649,7 @@ export async function rebuildDerivedProjections(
         `WITH derived AS (
            SELECT ${childTarget} AS target, ${projections.join(", ")}
            FROM ${childTable} child
+           WHERE ${visibleRecordSql("child")}
            GROUP BY ${childTarget}
          )
          UPDATE ${parentTable} AS parent
@@ -1714,7 +1817,7 @@ export async function queryRecords(
 
   const table = recordsTableName(collection);
   const limit = Math.min(Math.max(1, rawLimit ?? 50), 200);
-  const conditions: string[] = [];
+  const conditions: string[] = [visibleRecordSql("r")];
   const bindings: (string | number)[] = [];
 
   if (source?.conditions) conditions.push(...source.conditions);
@@ -1808,8 +1911,12 @@ export async function queryRecords(
           );
         }
       } else if (!ftsClause) {
-        conditions.push(stableTail);
-        bindings.push(payload.t, payload.t, payload.u);
+        // Expose the time bound outside the tie-breaking OR so an equality
+        // filter's (field, time_us DESC, uri ASC) index can seek to a deep page
+        // instead of visiting every earlier match. The tail still preserves
+        // every URI when records share the cursor timestamp.
+        conditions.push(`(r.time_us <= ? AND ${stableTail})`);
+        bindings.push(payload.t, payload.t, payload.t, payload.u);
       }
     }
   }

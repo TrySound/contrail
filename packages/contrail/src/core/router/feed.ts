@@ -7,6 +7,7 @@ import type {
   FeedTargetConfig,
 } from "../types";
 import { getDialect } from "../dialect";
+import { isAccountHidden } from "../moderation";
 import {
   DEFAULT_FOLLOW_SHORT,
   feedTargetMaxItems,
@@ -264,6 +265,7 @@ export function registerFeedRoutes(
       );
     }
 
+    if (await isAccountHidden(db, did)) return c.json({ records: [] });
     await maybeBackfillFeed(c, db, config, did, feedName, feedConfig);
 
     const targets = feedConfig.targets.map(normalizeFeedTarget);
@@ -303,8 +305,10 @@ export function registerFeedRoutes(
     };
 
     try {
-      const result = await runPipeline(db, config, requestedShort, pipelineParams, source);
-      return c.json(result);
+      const result = await runPipeline(db, config, requestedShort, pipelineParams, source, c.req.raw.headers);
+      const { labelersApplied, ...body } = result;
+      if (labelersApplied?.length) c.header("atproto-content-labelers", labelersApplied.join(","));
+      return c.json(body);
     } catch (e: any) {
       if (e.message === "Could not resolve actor") {
         return c.json({ error: e.message }, 400);

@@ -1,4 +1,5 @@
 import { isDid } from "@atcute/lexicons/syntax";
+import { MODERATION_ACTION_NSID, parseModerationAction } from "./moderation";
 import type {
   ContrailConfig,
   Database,
@@ -217,8 +218,23 @@ export async function ingestRecords(
       );
       continue;
     }
+    if (event.collection === MODERATION_ACTION_NSID && !config.moderation?.moderators.includes(event.did)) {
+      dropped.unknownActor++;
+      continue;
+    }
     const record =
       event.operation === "delete" ? null : parseRecord(event.record);
+    if (event.collection === MODERATION_ACTION_NSID && event.operation !== "delete" && !parseModerationAction(record)) {
+      // An action edited into an invalid record no longer exists as an action:
+      // retract it rather than leaving the previous version in force.
+      dropped.invalidRecord++;
+      candidates.push({
+        event: { ...event, operation: "delete", cid: null, record: null },
+        shortName,
+        record: null,
+      });
+      continue;
+    }
     if (event.operation !== "delete" && !record) {
       dropped.invalidRecord++;
       emitIngestWarning(
@@ -241,7 +257,7 @@ export async function ingestRecords(
   });
   if (options.knownDids && !hasDiscoverableMutation) {
     candidates = candidates.filter(({ event, shortName, record }) => {
-      if (event.operation === "delete") return true;
+      if (event.operation === "delete" || event.collection === MODERATION_ACTION_NSID) return true;
       const collection = config.collections[shortName];
       if (collection?.discover !== false) return true;
       if (!options.knownDids!.has(event.did)) {
@@ -373,7 +389,7 @@ export async function ingestRecords(
 
     const actorFiltered: IngestEvent[] = [];
     for (const event of admitted) {
-      if (event.operation === "delete" || !effectiveKnownDids) {
+      if (event.operation === "delete" || event.collection === MODERATION_ACTION_NSID || !effectiveKnownDids) {
         actorFiltered.push(event);
         continue;
       }

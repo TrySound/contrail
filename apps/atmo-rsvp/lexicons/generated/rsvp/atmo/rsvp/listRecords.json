@@ -132,6 +132,15 @@
         "time_us": {
           "type": "integer"
         },
+        "selfLabels": {
+          "type": "array",
+          "maxLength": 10,
+          "description": "Author declarations on this record version, not trusted labeler claims",
+          "items": {
+            "type": "ref",
+            "ref": "com.atproto.label.defs#selfLabel"
+          }
+        },
         "event": {
           "type": "ref",
           "ref": "#refEventRecord"
@@ -174,6 +183,15 @@
         },
         "time_us": {
           "type": "integer"
+        },
+        "selfLabels": {
+          "type": "array",
+          "maxLength": 10,
+          "description": "Author declarations on this record version, not trusted labeler claims",
+          "items": {
+            "type": "ref",
+            "ref": "com.atproto.label.defs#selfLabel"
+          }
         }
       }
     },
@@ -208,6 +226,15 @@
         },
         "rkey": {
           "type": "string"
+        },
+        "selfLabels": {
+          "type": "array",
+          "maxLength": 10,
+          "description": "Author declarations on this record version, not trusted labeler claims",
+          "items": {
+            "type": "ref",
+            "ref": "com.atproto.label.defs#selfLabel"
+          }
         }
       }
     }

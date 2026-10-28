@@ -223,11 +223,12 @@ function publicServiceAuth(
   if (!config.serviceAuth || config.serviceAuth.methods.length === 0)
     return null;
   const methods = config.serviceAuth.methods
-    .map((method): PublicServiceProtectedMethod =>
-      method === "getFeed"
-        ? { id: `${config.namespace}.getFeed`, type: "query" }
-        : { id: `${config.namespace}.notifyOfUpdate`, type: "procedure" },
-    )
+    .map((method): PublicServiceProtectedMethod => ({
+      id: method === "createReport" ? "com.atproto.moderation.createReport"
+        : method === "listReports" || method === "resolveReport" ? `${config.namespace}.moderation.${method}`
+        : `${config.namespace}.${method}`,
+      type: method === "getFeed" || method === "listReports" ? "query" : "procedure",
+    }))
     .sort((left, right) => compareCanonical(left.id, right.id));
   const { serviceDid, audience } = parseServiceAudience(
     config.serviceAuth.audience,

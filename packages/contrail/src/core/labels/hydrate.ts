@@ -26,11 +26,11 @@ interface RawLabelRow {
   cts: number;
 }
 
-/** Fetch labels for a set of subjects, filter to caller's accepted labelers,
- *  collapse `(src, uri, val)` tuples by latest `cts`, and drop tuples whose
- *  latest is a `neg=true` retraction. Returns a per-subject map.
- *
- *  Subjects can be at-URIs or bare DIDs — the same table holds both. */
+/** Fetch effective labels and independent moderator actions, filter to the
+ *  caller's accepted labelers and record versions, then choose one applicable
+ *  label per `(src, uri, val)` for presentation. External label retractions and
+ *  supersession are resolved by the SQL view before expiry/CID filtering.
+ *  Subjects can be at-URIs or bare DIDs. */
 export async function hydrateLabels(
   db: Database,
   subjects: string[],
@@ -52,7 +52,7 @@ export async function hydrateLabels(
   // the SQL placeholder order.
   const rows = await batchedInQuery<RawLabelRow>(
     db,
-    `SELECT src, uri, val, cid, neg, exp, cts FROM labels
+    `SELECT src, uri, val, cid, neg, exp, cts FROM moderation_effective_labels
        WHERE src IN (${placeholders})
          AND (exp IS NULL OR exp > ?)
          AND uri IN (__IN__)`,
@@ -60,12 +60,18 @@ export async function hydrateLabels(
     uniqSubjects,
   );
 
+  // Filter independent actions to the returned version before collapsing:
+  // a newer action for another CID must not discard an applicable older one.
   // Pick the latest row per `(src, uri, val)`. Ties on `cts` resolve by
   // taking the row that arrived later in the query results — driver-dependent
   // but rare in practice; spec doesn't define tie-breaking.
   type Key = string;
   const latestByKey = new Map<Key, RawLabelRow>();
   for (const row of rows) {
+    if (row.cid && recordCidByUri) {
+      const recordCid = recordCidByUri.get(row.uri);
+      if (recordCid !== undefined && recordCid !== row.cid) continue;
+    }
     const key = `${row.src}\u0000${row.uri}\u0000${row.val}`;
     const prior = latestByKey.get(key);
     if (!prior || row.cts >= prior.cts) latestByKey.set(key, row);
@@ -75,21 +81,11 @@ export async function hydrateLabels(
   for (const row of latestByKey.values()) {
     if (row.neg) continue; // retracted
 
-    // CID pin: a label that names a specific record CID applies only to
-    // that version. If the caller passed a record-cid map and the row's
-    // CID disagrees, drop it — the label doesn't apply to the version
-    // we're returning. Account-level labels (DID subject) carry no CID
-    // pin in practice; we only check when the subject came with a CID.
-    if (row.cid && recordCidByUri) {
-      const recordCid = recordCidByUri.get(row.uri);
-      if (recordCid !== undefined && recordCid !== row.cid) continue;
-    }
-
     const label: HydratedLabel = {
       src: row.src,
       uri: row.uri,
       val: row.val,
-      cts: tsToIso(row.cts),
+      cts: new Date(row.cts).toISOString(),
     };
     if (row.cid) label.cid = row.cid;
     if (row.exp != null) label.exp = tsToIso(row.exp);

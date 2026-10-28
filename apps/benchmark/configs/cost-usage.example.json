@@ -1,0 +1,9 @@
+{
+  "days": 30,
+  "dailyUnits": {
+    "ingest.create": 20000,
+    "query.list": 100000,
+    "query.hydrate": 10000,
+    "maintenance.moderation-idle": 1440
+  }
+}

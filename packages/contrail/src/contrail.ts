@@ -58,7 +58,18 @@ import {
   type PersistentLabelsOptions,
 } from "./core/labels/subscribe";
 import { createApp, type CreateAppOptions } from "./core/router";
+import {
+  runModerationCycle,
+  runPersistentModeration,
+} from "./core/moderation-sync";
 import type { Hono } from "hono";
+
+export interface ContrailInitOptions {
+  /** Leave a changed moderation policy's paged job (label pruning, hidden
+   * state, backfill requeues) to `ingest()`/`runPersistent()` instead of
+   * running a bounded slice inline. Trust changes still apply immediately. */
+  deferModerationPolicyJob?: boolean;
+}
 
 export interface ContrailOptions extends ContrailConfig {
   db?: Database;
@@ -73,6 +84,10 @@ export class Contrail {
   readonly changes: ChangeConsumers;
   private _db?: Database;
   private _ingestState: IngestState = createIngestState();
+  /** Databases already initialized by this instance. Scheduled ticks must not
+   * re-apply moderation policy each time: two overlapping deployments with
+   * different policies would otherwise keep replacing each other's job. */
+  private _initialized = new WeakMap<Database, Promise<void>>();
 
   constructor(options: ContrailOptions) {
     const { db, lexicons, ...configInput } = options;
@@ -96,14 +111,28 @@ export class Contrail {
   }
 
   /** Initialize the database schema. */
-  async init(db?: Database): Promise<void> {
+  async init(db?: Database, options: ContrailInitOptions = {}): Promise<void> {
     const database = this.getDb(db);
-    prepareRecordValidation(this.config);
-    await initSchema(database, this.config);
-    await assertServingSourceCompatibility(
-      database,
-      this.config.orderedSource,
-    );
+    const ready = (async () => {
+      prepareRecordValidation(this.config);
+      await initSchema(database, this.config, options);
+      await assertServingSourceCompatibility(
+        database,
+        this.config.orderedSource,
+      );
+    })();
+    this._initialized.set(database, ready);
+    try {
+      await ready;
+    } catch (error) {
+      if (this._initialized.get(database) === ready) this._initialized.delete(database);
+      throw error;
+    }
+  }
+
+  /** Initialize once per database for recurring ingestion entry points. */
+  private ensureInitialized(database: Database): Promise<void> {
+    return this._initialized.get(database) ?? this.init(database);
   }
 
   /** Refresh the SQLite query-planner statistics (bounded `PRAGMA optimize`) so
@@ -135,6 +164,9 @@ export class Contrail {
    * retained candidates, and serialized bytes. */
   async ingest(options?: ScheduledIngestOptions, db?: Database): Promise<void> {
     const d = this.getDb(db);
+    await this.ensureInitialized(d);
+    // The cycle would otherwise initialize the schema a second time.
+    this._ingestState.schemaInitialized = true;
     const budget = resolveScheduledIngestBudget(options);
     const tasks: Promise<void>[] = [
       runIngestCycle(d, this.config, budget, this._ingestState),
@@ -142,6 +174,11 @@ export class Contrail {
     if (this.config.labels) {
       tasks.push(runLabelIngestCycle(d, this.config, budget.maxDrainMs));
     }
+    // Moderator reconciliation, first-seen label backfill and visibility
+    // recounts (account lifecycle needs recounts even without labels).
+    tasks.push(
+      runModerationCycle(d, this.config, Date.now() + Math.min(budget.maxDrainMs, 10_000)).then(() => {}),
+    );
     await Promise.all(tasks);
   }
 
@@ -150,6 +187,7 @@ export class Contrail {
    *  Both honor the supplied `signal` and shut down cleanly together. */
   async runPersistent(options?: Omit<PersistentIngestOptions, 'logger'>, db?: Database): Promise<void> {
     const d = this.getDb(db);
+    await this.ensureInitialized(d);
     const tasks: Promise<void>[] = [
       runPersistentIngestion(d, this.config, {
         ...options,
@@ -166,6 +204,7 @@ export class Contrail {
         }),
       );
     }
+    tasks.push(runPersistentModeration(d, this.config, { signal: options?.signal }));
     await Promise.all(tasks);
   }
 

@@ -15,7 +15,7 @@ import {
   optimizeIntervalMs,
   optimizeAnalysisLimit,
 } from "./types";
-import { assertJetstreamServiceCompatibility, assertServingSourceCompatibility, initSchema, getLastCursor, loadKnownActorDids, saveJetstreamCursor, saveJetstreamCursorStatement, saveJetstreamCursorObservationStatements, saveOrderedSourcePositionStatement, sweepFeedItems, getFeedPruneCursor, saveFeedPruneCursor, getMetaNumber, setMeta, optimizeDatabase } from "./db";
+import { assertJetstreamServiceCompatibility, assertServingSourceCompatibility, initSchema, getLastCursor, loadKnownActorDids, saveJetstreamCursorStatement, saveJetstreamCursorObservationStatements, saveOrderedSourcePositionStatement, sweepFeedItems, getFeedPruneCursor, saveFeedPruneCursor, getMetaNumber, setMeta, optimizeDatabase } from "./db";
 import {
   createIngestEvent,
   ingestRecords,
@@ -33,6 +33,8 @@ import {
   type RuntimeCpuUsageProcess,
 } from "./runtime-telemetry";
 
+import { accountUpdateStatements, knownAccountDids, MODERATION_ACTION_NSID, type AccountUpdate } from "./moderation";
+
 const BATCH_SIZE = 50;
 
 /** Fixed estimate for the URI, source position, revision, CID, and other
@@ -48,6 +50,7 @@ export const DEFAULT_SCHEDULED_INGEST_BUDGET = Object.freeze({
   maxDrainMs: 25_000,
   maxCandidates: 250,
   maxIdentityUpdates: 250,
+  maxAccountUpdates: 500,
   maxSerializedBytes: 4 * 1024 * 1024,
 }) satisfies ScheduledIngestBudget;
 
@@ -55,6 +58,7 @@ export interface ScheduledIngestBudget {
   maxDrainMs: number;
   maxCandidates: number;
   maxIdentityUpdates: number;
+  maxAccountUpdates: number;
   maxSerializedBytes: number;
 }
 
@@ -65,6 +69,9 @@ export interface ScheduledIngestOptions {
   maxCandidates?: number;
   /** Maximum distinct handle updates retained by one drain. Default: 250. */
   maxIdentityUpdates?: number;
+  /** Maximum distinct-actor account events retained by one drain; reaching
+   * it ends the drain so no lifecycle event is skipped. Default: 500. */
+  maxAccountUpdates?: number;
   /** UTF-8 record bytes plus metadata allowances. Default: 4 MiB. */
   maxSerializedBytes?: number;
   /** @deprecated Compatibility alias for maxDrainMs. */
@@ -86,6 +93,8 @@ export interface ScheduledIngestCollectionStats {
   retainedCandidates: number;
   retainedIdentityUpdates: number;
   identityUpdatesOmitted: number;
+  /** Account events for actors this instance holds no data for. */
+  accountUpdatesFiltered: number;
   exactDuplicatesDropped: number;
   cursorBoundaryDuplicatesDropped: number;
   resumeOverlapDropped: number;
@@ -139,6 +148,11 @@ export function resolveScheduledIngestBudget(
       options.maxIdentityUpdates ??
         DEFAULT_SCHEDULED_INGEST_BUDGET.maxIdentityUpdates,
       "maxIdentityUpdates",
+    ),
+    maxAccountUpdates: positiveInteger(
+      options.maxAccountUpdates ??
+        DEFAULT_SCHEDULED_INGEST_BUDGET.maxAccountUpdates,
+      "maxAccountUpdates",
     ),
     maxSerializedBytes: positiveInteger(
       options.maxSerializedBytes ??
@@ -393,11 +407,16 @@ export async function ingestEvents(
   budgetInput: ScheduledIngestOptions | ScheduledIngestBudget | number =
     DEFAULT_SCHEDULED_INGEST_BUDGET,
   knownDids?: Set<string>,
+  /** Resolves which account-event actors this instance holds data for. When
+   * set, network-wide account traffic for unknown actors is dropped before it
+   * spends the `maxAccountUpdates` budget. */
+  knownAccounts?: (dids: string[]) => Promise<Set<string>>,
 ): Promise<{
   events: IngestEvent[];
   lastCursor: number | null;
   cursorObservations: Set<string>;
   identityUpdates: Map<string, string>;
+  accountUpdates: AccountUpdate[];
   stats: ScheduledIngestCollectionStats;
 }> {
   const budget = resolveScheduledIngestBudget(budgetInput);
@@ -413,6 +432,30 @@ export async function ingestEvents(
 
   const seenObservations = new Map<string, Set<string>>();
   const identityUpdates = new Map<string, string>();
+  // Latest event per actor: the stored state only depends on the newest one.
+  const accountUpdates = new Map<string, AccountUpdate>();
+  // Actors with retained commits this drain; their records commit before the
+  // account statements, so their lifecycle events are kept unresolved.
+  const commitDids = new Set<string>();
+  // Account events awaiting a batched known-actor lookup.
+  const unresolvedAccounts = new Map<string, AccountUpdate>();
+  const retainAccount = (update: AccountUpdate) => {
+    const prior = accountUpdates.get(update.did);
+    if (prior && prior.cursor >= update.cursor) return;
+    accountUpdates.delete(update.did);
+    accountUpdates.set(update.did, update);
+    stats.serializedCandidateBytes += SCHEDULED_INGEST_METADATA_BYTES;
+  };
+  const resolveAccounts = async () => {
+    if (!unresolvedAccounts.size) return;
+    const batch = [...unresolvedAccounts.values()];
+    unresolvedAccounts.clear();
+    const known = await knownAccounts!(batch.map((u) => u.did));
+    for (const update of batch) {
+      if (known.has(update.did) || commitDids.has(update.did)) retainAccount(update);
+      else stats.accountUpdatesFiltered++;
+    }
+  };
   const stats: ScheduledIngestCollectionStats = {
     observedSourceItems: 0,
     commitObservations: 0,
@@ -420,6 +463,7 @@ export async function ingestEvents(
     retainedCandidates: 0,
     retainedIdentityUpdates: 0,
     identityUpdatesOmitted: 0,
+    accountUpdatesFiltered: 0,
     exactDuplicatesDropped: 0,
     cursorBoundaryDuplicatesDropped: 0,
     resumeOverlapDropped: 0,
@@ -502,9 +546,14 @@ export async function ingestEvents(
         return;
       }
 
+      if (commit.collection === MODERATION_ACTION_NSID && !config.moderation?.moderators.includes(event.did)) {
+        stats.sourceScopeFiltered++;
+        return;
+      }
       if (
         provisionalKnownDids &&
         !dependentCollections.has(commit.collection) &&
+        commit.collection !== MODERATION_ACTION_NSID &&
         commit.operation !== "delete"
       ) {
         provisionalKnownDids.add(event.did);
@@ -559,6 +608,7 @@ export async function ingestEvents(
         },
       });
       collected.push(candidate);
+      commitDids.add(event.did);
       stats.retainedCandidates++;
       stats.serializedCandidateBytes +=
         SCHEDULED_INGEST_METADATA_BYTES +
@@ -578,8 +628,21 @@ export async function ingestEvents(
         // Account overflow so global identity traffic cannot starve commits.
         stats.identityUpdatesOmitted++;
       }
-    } else {
-      accountSourceItem(event);
+    } else if (event.kind === "account") {
+      if (accountSourceItem(event)) return;
+      const update: AccountUpdate = { did: event.did, active: event.account.active, status: event.account.status, timeUs: event.time_us, cursor: event.seq };
+      if (
+        !knownAccounts ||
+        accountUpdates.has(event.did) ||
+        commitDids.has(event.did) ||
+        knownDids?.has(event.did)
+      ) {
+        retainAccount(update);
+        return;
+      }
+      unresolvedAccounts.delete(event.did);
+      unresolvedAccounts.set(event.did, update);
+      if (unresolvedAccounts.size >= 100) await resolveAccounts();
     }
   };
 
@@ -614,7 +677,10 @@ export async function ingestEvents(
         event.seq,
       );
 
-      if (stats.retainedCandidates >= budget.maxCandidates) {
+      if (
+        stats.retainedCandidates >= budget.maxCandidates ||
+        accountUpdates.size >= budget.maxAccountUpdates
+      ) {
         stats.stopReason = "count";
         break;
       }
@@ -629,6 +695,9 @@ export async function ingestEvents(
     subscriptionAbort.abort();
     Promise.resolve(iterator.return?.()).catch(() => {});
   }
+  // Every accounted seq's account event is either retained or known to be a
+  // no-op before the drain's cursor can be saved.
+  await resolveAccounts();
 
   // Never read the transport cursor again here: it may have moved when a frame
   // was buffered but not yielded. The constructor cursor captured above and the
@@ -646,6 +715,7 @@ export async function ingestEvents(
     lastCursor,
     cursorObservations,
     identityUpdates,
+    accountUpdates: [...accountUpdates.values()],
     stats,
   };
 }
@@ -727,12 +797,14 @@ export async function runIngestCycle(
     lastCursor,
     cursorObservations,
     identityUpdates,
+    accountUpdates,
     stats,
   } = await ingestEvents(
     config,
     cursor,
     budget,
     knownDids,
+    (dids) => knownAccountDids(db, config, dids),
   );
 
   const accepted: IngestEvent[] = [];
@@ -756,6 +828,7 @@ export async function runIngestCycle(
       trailingStatements:
         isFinalBatch && lastCursor !== null
           ? [
+              ...accountUpdateStatements(db, accountUpdates, config),
               saveJetstreamCursorStatement(db, lastCursor),
               ...(config.orderedSource
                 ? [
@@ -826,12 +899,12 @@ export async function runIngestCycle(
     // empty first drain so the next cron cannot silently start later.
     (stats.lastAccountedCursor !== null || cursor === null)
   ) {
-    await saveJetstreamCursor(
-      db,
-      lastCursor,
-      config.orderedSource,
-      cursorObservations,
-    );
+    await db.batch([
+      ...accountUpdateStatements(db, accountUpdates, config),
+      saveJetstreamCursorStatement(db, lastCursor),
+      ...(config.orderedSource ? [saveOrderedSourcePositionStatement(db, config.orderedSource, lastCursor)] : []),
+      ...saveJetstreamCursorObservationStatements(db, lastCursor, cursorObservations),
+    ]);
     databaseSubBatchesCommitted++;
   }
 
@@ -921,6 +994,8 @@ export async function runIngestCycle(
     observed_source_items: stats.observedSourceItems,
     commit_observations: stats.commitObservations,
     identity_observations: stats.identityObservations,
+    retained_account_updates: accountUpdates.length,
+    account_updates_filtered: stats.accountUpdatesFiltered,
     retained_candidates: stats.retainedCandidates,
     retained_identity_updates: stats.retainedIdentityUpdates,
     identity_updates_omitted: stats.identityUpdatesOmitted,
@@ -935,6 +1010,7 @@ export async function runIngestCycle(
     serialized_candidate_bytes: stats.serializedCandidateBytes,
     max_candidates: budget.maxCandidates,
     max_identity_updates: budget.maxIdentityUpdates,
+    max_account_updates: budget.maxAccountUpdates,
     max_serialized_bytes: budget.maxSerializedBytes,
     max_drain_ms: budget.maxDrainMs,
     starting_cursor: cursor,

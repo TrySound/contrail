@@ -2,6 +2,7 @@ import type { Did } from "@atcute/lexicons";
 import type { ContrailConfig, Database, Logger, Statement } from "./types";
 import { isDid, isHandle } from "@atcute/lexicons/syntax";
 import { resolvePDS } from "./client";
+import { labelBackfillEnqueueStatements } from "./moderation";
 
 const STALE_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -12,8 +13,8 @@ export interface Identity {
   resolved_at: number;
 }
 
-async function saveIdentity(db: Database, identity: Identity): Promise<void> {
-  await db
+async function saveIdentity(db: Database, identity: Identity, config?: ContrailConfig): Promise<void> {
+  const statement = db
     .prepare(
       // COALESCE so a null handle/pds from a partial resolution never clobbers
       // a previously-resolved value (e.g. refreshStaleIdentities passes through
@@ -21,8 +22,10 @@ async function saveIdentity(db: Database, identity: Identity): Promise<void> {
       // overwrites — handle changes apply normally.
       "INSERT INTO identities (did, handle, pds, resolved_at) VALUES (?, ?, ?, ?) ON CONFLICT(did) DO UPDATE SET handle = COALESCE(excluded.handle, identities.handle), pds = COALESCE(excluded.pds, identities.pds), resolved_at = excluded.resolved_at"
     )
-    .bind(identity.did, identity.handle, identity.pds, identity.resolved_at)
-    .run();
+    .bind(identity.did, identity.handle, identity.pds, identity.resolved_at);
+  const queued = labelBackfillEnqueueStatements(db, [identity.did], config, true);
+  if (queued.length) await db.batch([...queued, statement]);
+  else await statement.run();
 }
 
 function isStale(resolvedAt: number): boolean {
@@ -42,7 +45,7 @@ async function fetchAndSave(
     pds: resolved?.pds ?? cached?.pds ?? null,
     resolved_at: Date.now(),
   };
-  await saveIdentity(db, identity);
+  await saveIdentity(db, identity, config);
   return identity;
 }
 
@@ -122,7 +125,7 @@ export async function resolveActor(
     handle: resolved.handle ?? actor,
     pds: resolved.pds ?? null,
     resolved_at: Date.now(),
-  });
+  }, config);
 
   return resolved.did;
 }
