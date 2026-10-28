@@ -6,6 +6,19 @@ import {
 import type { Database, Statement } from "../src/index";
 import { createTestDb, makeEvent, TEST_POSTGRES } from "./helpers";
 
+// PostgreSQL supports search, but CI's Node 22 SQLite lacks FTS5. Keep the
+// index/migration tests running there with search disabled, rather than
+// skipping unrelated coverage or seeding into nonexistent FTS tables.
+let hasSearch = TEST_POSTGRES;
+if (!TEST_POSTGRES) {
+  try {
+    const probe = createTestDb();
+    await probe.prepare("CREATE VIRTUAL TABLE __read_indexes_fts USING fts5(content)").run();
+    await probe.prepare("DROP TABLE __read_indexes_fts").run();
+    hasSearch = true;
+  } catch {}
+}
+
 const CONFIG = resolveConfig({
   namespace: "com.example",
   profiles: [],
@@ -13,7 +26,7 @@ const CONFIG = resolveConfig({
     post: {
       collection: "com.example.post",
       queryable: { category: {}, "nested.kind": {}, rank: { type: "range" } },
-      searchable: ["text"],
+      searchable: hasSearch ? ["text"] : false,
       relations: { replies: { collection: "reply", field: "subject.uri" } },
     },
     reply: {
@@ -28,8 +41,10 @@ const CONFIG = resolveConfig({
   feeds: { following: { follow: "follow", targets: ["post"], maxItems: 20 } },
 });
 
-// Captured from the unmodified v17 initializer, not computed by the code under test.
-const LEGACY_FINGERPRINT = TEST_POSTGRES ? "68e79e3b243f7797" : "97324484d78152a8";
+// Captured from the unmodified v17 initializer at ec26161, not computed by
+// the code under test. The SQLite fixtures cover both searchable settings.
+const LEGACY_FINGERPRINT = TEST_POSTGRES ? "68e79e3b243f7797"
+  : hasSearch ? "97324484d78152a8" : "e82ed02846a73e3c";
 const EQUALITY_FIELDS = [
   ["post", "category"], ["post", "nested.kind"], ["reply", "subject.uri"], ["follow", "subject"],
 ] as const;
@@ -106,9 +121,9 @@ async function snapshot(db: Database, hasObservations = true) {
     cursor: await db.prepare("SELECT * FROM cursor").first(),
     feeds: (await db.prepare("SELECT * FROM feed_items ORDER BY actor, uri").all()).results,
     labels: (await db.prepare("SELECT * FROM labels ORDER BY src, uri, val").all()).results,
-    fts: (await db.prepare(TEST_POSTGRES
+    fts: hasSearch ? (await db.prepare(TEST_POSTGRES
       ? "SELECT uri, search_vector::text FROM records_post ORDER BY uri"
-      : "SELECT id, uri FROM fts_post_rows ORDER BY id").all()).results,
+      : "SELECT id, uri FROM fts_post_rows ORDER BY id").all()).results : [],
   };
 }
 
@@ -170,8 +185,10 @@ describe("bounded record read indexes", () => {
       await db.prepare("DROP INDEX idx_post_category").run();
     }
     await expectIndexOnlyUpgrade(db, variant !== "without-cursor-observations");
-    const search = await queryRecords(db, CONFIG, { collection: "post", search: "sample", limit: 5 });
-    expect(search.records).toHaveLength(5);
+    if (hasSearch) {
+      const search = await queryRecords(db, CONFIG, { collection: "post", search: "sample", limit: 5 });
+      expect(search.records).toHaveLength(5);
+    }
   });
 
   it("does not confuse a field ending in time_uri with another field's replacement index", async () => {
