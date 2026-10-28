@@ -1,5 +1,36 @@
 # @atmo-dev/contrail
 
+## 0.24.0
+
+### Minor Changes
+
+- b9502a2: Expose canonical author declarations as a separate optional `selfLabels` field on record, profile, feed, relation/reference and private moderator preview views. Normalize current record metadata without database writes or extra queries; self-labels never enforce visibility or depend on accepted labelers. Export `extractSelfLabels` and `SelfLabel`, update generated view contracts, and bundle the standard label definitions as an offline fallback for complete service/type-generation bundles.
+- bcd84f8: Add moderation: public moderator action records (`tools.atmo.moderation.action`) with overrides, per-source label trust (`enforce`, `values`, `subjects: "known"` with bounded first-seen `queryLabels` backfill), enforced SQL visibility, private method-bound report endpoints, and Jetstream v2 account lifecycle state.
+
+  - Enforcement uses an indexed, materialized `moderation_hidden` table, updated in the same transaction as each label, action, override or account change. Built-in queries, hydration, feeds, search, profiles and stored relation counts exclude hidden actors and records. Custom SQL can use the exported `visibleRecordSql(alias)`.
+  - Account lifecycle applies to every instance, with or without moderation config: deactivated, deleted, taken-down and suspended actors this instance holds data for are hidden, and reactivation restores their retained data. Scheduled drains gain a separate `maxAccountUpdates` budget (default 500).
+  - Moderator and label-source policy is tracked outside the schema fingerprint and applied by a bounded, resumable job, so policy edits never rebuild search indexes. `init()` accepts `deferModerationPolicyJob` to leave that job to moderation cycles; `createWorker` uses it for requests.
+  - Reports can live in stable instance-owned storage (`reportsDb`, `createWorker({ reportsBinding })`). Client helpers for reports, moderator inboxes and action records are available from `@atmo-dev/contrail/moderation`. Account-report previews include CID-filtered labels on displayed profile records, and bounded request bodies accommodate valid reasons including JSON escaping.
+  - Moderator reconciliation bounds local lookups and shares its mutation budget between updates and missed deletions. Large local deletion backlogs drain over repeated complete fresh listings.
+  - Label `cts` values more than five minutes in the future are rejected, and label creation timestamps keep millisecond precision.
+  - Known-subject label backfill restarts pagination after an explicit `InvalidCursor` error; transient failures keep the saved cursor.
+
+  Schema version 17 adds the moderation, lifecycle and report tables and converts stored label creation timestamps from seconds to milliseconds exactly once. Stop older Contrail processes before upgrading, and run `contrail lexicons generate` after enabling moderation.
+
+### Patch Changes
+
+- 96f336e: Fix `contrail append-scheduled` for adapter-cloudflare 8 / SvelteKit 3 Worker output. The command now accesses the Worker's public default export through a live ESM self-import instead of assuming a generated variable named `worker_default`. Older bundled default exports remain supported, and no extra files are added to the public assets directory.
+
+  Preserve authenticated cron forwarding and existing Worker handlers. Safely quote custom cron paths and secret environment-variable names in the generated JavaScript.
+
+- 4197137: Reduce unrelated-data reads during record deletion and equality-filtered listing. Feed items now have a URI index, and equality-queryable fields use `(field, time_us DESC, uri ASC)` indexes instead of redundant single-field indexes. Range indexes are unchanged. Chronological cursors expose their time bound so filtered deep pages can seek past newer matches while preserving URI tie-breaking and moderation visibility.
+
+  For an unchanged configuration, the preceding schema upgrades indexes in place without rebuilding FTS, recounting records, or resetting records and source progress. Replacement indexes are created before old indexes are removed, and interrupted upgrades can retry. Index construction incurs one-time database work; the feed URI index adds ongoing index writes per feed entry.
+
+- dc087b1: Pump external labelers concurrently during scheduled ingestion so a long-lived first stream cannot starve later sources. Include endpoint resolution in each cycle's time budget. Honor explicit labeler endpoint overrides when resuming cursor-only checkpoints or replacing a cached endpoint.
+
+  With `backfill: false`, a quiet labeler whose first "from now" connection saw no frame no longer skips labels issued between scheduled cycles: the next cycle replays from the beginning, keeping only labels created after that first connection (allowing five minutes of clock skew). The cutoff persists across partial replay cycles and reconnects, even after a nonzero cursor is saved.
+
 ## 0.23.0
 
 ### Minor Changes
