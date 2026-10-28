@@ -444,7 +444,7 @@
           "units": 8,
           "unit": "request",
           "ceilings": {
-            "rowsRead": 164,
+            "rowsRead": 217,
             "rowsWritten": 0,
             "statements": 38
           }
@@ -983,7 +983,7 @@
           "units": 8,
           "unit": "request",
           "ceilings": {
-            "rowsRead": 164,
+            "rowsRead": 217,
             "rowsWritten": 0,
             "statements": 38
           }

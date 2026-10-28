@@ -116,6 +116,83 @@ describe("moderation timestamp precision", () => {
 });
 
 describe("interrupted moderator reconciliation", () => {
+  it("drains a large local deletion backlog across complete fresh listings", async () => {
+    const db = await setupReconcile();
+    await ingestRecords(db, Array.from({ length: 1001 }, (_, i) =>
+      action(`deleted-${i}`, { subject: actor, action: "!hide" }),
+    ), config);
+    const sql: string[] = [];
+    const bounded: Database = {
+      dialect: db.dialect,
+      prepare(statement) { sql.push(statement); return db.prepare(statement); },
+      batch: (statements) => db.batch(statements),
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockImplementation(async () => Response.json({ records: [] }));
+    try {
+      await reconcileModeratorActions(bounded, config);
+      expect(await actions(db)).toHaveLength(1);
+      expect((await queryRecords(db, config, { collection: "event" })).records).toHaveLength(0);
+      // A failed listing cannot reuse an earlier absence proof to undo more.
+      fetchMock.mockResolvedValueOnce(new Response("retry", { status: 503 }));
+      await reconcileModeratorActions(bounded, config);
+      expect(await actions(db)).toHaveLength(1);
+      await reconcileModeratorActions(bounded, config);
+      expect(await actions(db)).toEqual([]);
+      expect((await queryRecords(db, config, { collection: "event" })).records).toHaveLength(1);
+      expect(sql.filter((s) => s.startsWith("SELECT uri, cid FROM records_")))
+        .toEqual([]); // An empty listing needs no local CID lookup at all.
+      const missing = sql.filter((s) => s.startsWith("SELECT uri FROM records_"));
+      expect(missing).toHaveLength(2);
+      expect(missing.every((s) => s.includes("LIMIT ?") && !s.includes("ORDER BY"))).toBe(true);
+      expect(fetchMock.mock.calls.every(([url]) => !new URL(String(url)).searchParams.has("cursor"))).toBe(true);
+    } finally { fetchMock.mockRestore(); }
+  });
+
+  it("shares the mutation budget between changed actions and missed deletions", async () => {
+    const db = await setupReconcile();
+    await ingestRecords(db, [
+      ...Array.from({ length: 1000 }, (_, i) => action(`deleted-${i}`, { subject: actor, action: "!hide" })),
+      action("updated", { subject: actor, action: "!hide" }),
+    ], config);
+    const current = { ...remote("updated"), cid: "changed-cid", value: {
+      ...remote("updated").value, action: "!warn",
+    } };
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockImplementation(async () => Response.json({ records: [current] }));
+    try {
+      await reconcileModeratorActions(db, config);
+      const remaining = await actions(db);
+      expect(remaining).toHaveLength(2); // One update and only 999 deletions.
+      expect(remaining).toContain(current.uri);
+      expect((await hydrateLabels(db, [actor], [moderator]))[actor]!.map((l) => l.val).sort())
+        .toEqual(["!hide", "!warn"]);
+      await reconcileModeratorActions(db, config);
+      expect(await actions(db)).toEqual([current.uri]);
+      expect((await queryRecords(db, config, { collection: "event" })).records).toHaveLength(1);
+    } finally { fetchMock.mockRestore(); }
+  });
+
+  it("does not let a bounded deletion overwrite a newer live action", async () => {
+    const db = await setupReconcile();
+    await ingestRecords(db, [action("raced", { subject: actor, action: "!hide" })], config);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      // A newer live observation arrives after this listing began. It must
+      // survive even though the complete listing does not contain its URI.
+      await ingestRecords(db, [{
+        ...action("raced", { subject: actor, action: "!takedown" }),
+        cid: "new-live-cid",
+        source: { id: "jetstream", time_us: Date.now() * 1000 + 1_000_000 },
+      }], config);
+      return Response.json({ records: [] });
+    });
+    try {
+      await reconcileModeratorActions(db, config);
+      expect(await actions(db)).toEqual([remote("raced").uri]);
+      expect((await hydrateLabels(db, [actor], [moderator]))[actor]![0]!.val).toBe("!takedown");
+    } finally { fetchMock.mockRestore(); }
+  });
+
   it("commits valid pages and resumes after a later timeout without inferring deletions", async () => {
     const db = await setupReconcile();
     await ingestRecords(db, [action("retained", { subject: "did:plc:retained", action: "!hide" })], config);

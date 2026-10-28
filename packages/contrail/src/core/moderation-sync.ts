@@ -7,6 +7,8 @@ import { MODERATION_ACTION_NSID, moderationLockStatements, parseModerationAction
 import { createIngestEvent, ingestRecords } from "./ingest";
 import { childRecountStatements } from "./db/records";
 import { getMeta, setMeta } from "./db/meta";
+import { getDialect, isPostgresDialect } from "./dialect";
+import { batchedInQuery } from "./router/helpers";
 import { getLabelerState } from "./labels/resolve";
 import { applyLabels, type IncomingLabel } from "./labels/apply";
 import {
@@ -27,7 +29,10 @@ const MAX_RECONCILE_PAGES = 10;
  * local actions. Pagination and work per cycle are bounded: a listing that
  * exceeds the budget applies the creates/updates seen so far and resumes from
  * a durable cursor next cycle, so large repos still converge on changes (their
- * deletions rely on live ingestion and fail closed). Persist the last attempt
+ * deletions rely on live ingestion and fail closed). Local lookups are bounded
+ * too, and inferred deletions share the 1000-mutation budget with updates.
+ * A large local deletion backlog drains over repeated complete fresh listings.
+ * Persist the last attempt
  * so timeouts cannot starve later moderators, even across scheduled
  * invocations in different Worker isolates. */
 export async function reconcileModeratorActions(
@@ -142,11 +147,13 @@ export async function reconcileModeratorActions(
       );
       const local = new Map(
         (
-          await db
-            .prepare(`SELECT uri, cid FROM ${table} WHERE did = ?`)
-            .bind(did)
-            .all<{ uri: string; cid: string | null }>()
-        ).results.map((r) => [r.uri, r.cid]),
+          await batchedInQuery<{ uri: string; cid: string | null }>(
+            db,
+            `SELECT uri, cid FROM ${table} WHERE did = ? AND uri IN (__IN__)`,
+            [did],
+            [...records.keys()],
+          )
+        ).map((r) => [r.uri, r.cid]),
       );
       const events: IngestEvent[] = [];
       for (const r of records.values()) {
@@ -167,8 +174,26 @@ export async function reconcileModeratorActions(
           }),
         );
       }
-      if (complete) for (const uri of local.keys())
-        if (!records.has(uri))
+      const deletionBudget = MAX_RECONCILE_RECORDS - events.length;
+      if (complete && deletionBudget > 0) {
+        // The listing is a complete absence proof, but the local corpus may
+        // be much larger than it. Fetch only this cycle's remaining budget.
+        // No ORDER BY: the did index can stop after enough missing rows,
+        // without sorting/scanning the entire moderator's local history.
+        // A single JSON parameter keeps even a full listing below D1's bind
+        // limit. A subsequent cycle obtains a fresh complete absence proof
+        // before draining more; partial/resumed listings never undo actions.
+        const listedUris = isPostgresDialect(getDialect(db))
+          ? "SELECT jsonb_array_elements_text(CAST(? AS jsonb))"
+          : "SELECT value FROM json_each(?)";
+        const missing = await db
+          .prepare(
+            `SELECT uri FROM ${table} WHERE did = ?
+              AND uri NOT IN (${listedUris}) LIMIT ?`,
+          )
+          .bind(did, JSON.stringify([...records.keys()]), deletionBudget)
+          .all<{ uri: string }>();
+        for (const { uri } of missing.results)
           events.push(
             createIngestEvent({
               did,
@@ -180,6 +205,7 @@ export async function reconcileModeratorActions(
               source: { id: "pds-moderation", time_us: timeUs },
             }),
           );
+      }
       // The sweep position commits with the changes it covers.
       const progress =
         resetCursor

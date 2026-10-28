@@ -110,6 +110,42 @@ describe("private moderation reports", () => {
     expect(preview.records[0].selfLabels).toEqual([{ val: "nudity" }]);
     expect(preview.records[0].value.labels.values).toEqual([{ val: "nudity" }]);
   });
+  it.each([undefined,
+    "bafyreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy",
+    "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  ])("includes profile-scoped labels in account previews with CID filtering (pin=%s)", async (subjectCid) => {
+    const { db, config } = await setup();
+    const collection = "com.example.profile";
+    const cid = "bafyreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy";
+    const uri = `at://${reporter}/${collection}/self`;
+    const withProfile = resolveConfig({ ...config,
+      profiles: [{ collection, shortName: "profile" }],
+      collections: { ...config.collections, profile: { collection } },
+    });
+    await initSchema(db, withProfile);
+    await ingestRecords(db, [
+      createIngestEvent({ did: reporter, collection, rkey: "self", operation: "create", cid,
+        timeUs: 100, value: { displayName: "Test" } }),
+      createIngestEvent({ did: moderator, collection: MODERATION_ACTION_NSID,
+        rkey: "profile-hide", operation: "create", cid: "actioncid", timeUs: 101,
+        value: { subject: uri, action: "!hide", subjectCid, createdAt: new Date().toISOString() } }),
+    ], withProfile);
+    expect(await db.prepare("SELECT cid FROM moderation_actions WHERE uri = ?")
+      .bind(`at://${moderator}/${MODERATION_ACTION_NSID}/profile-hide`).first())
+      .toEqual({ cid: subjectCid ?? null });
+    const app = createApp(db, withProfile);
+    expect((await request(app, "com.atproto.moderation.createReport", reporter, report)).status).toBe(200);
+    const inbox = await request(app, "com.example.moderation.listReports", moderator);
+    expect(inbox.status).toBe(200);
+    const preview = ((await inbox.json()) as any).reports[0].preview;
+    expect(preview.records).toHaveLength(1);
+    expect(preview.records[0].uri).toBe(uri);
+    if (!subjectCid || subjectCid === cid) {
+      expect(preview.labels[uri]).toMatchObject([{ val: "!hide", uri, src: moderator }]);
+    } else expect(preview.labels[uri]).toBeUndefined();
+    expect(preview.labels[reporter]).toBeUndefined(); // A record label is not a DID label.
+  });
+
   it("requires audience configuration and publishes exact method-bound auth", async () => {
     expect(() =>
       resolveConfig({
@@ -252,7 +288,7 @@ describe("private moderation reports", () => {
       (
         await request(app, "com.atproto.moderation.createReport", reporter, {
           ...report,
-          padding: "x".repeat(20_000),
+          padding: "x".repeat(128 * 1024),
         })
       ).status,
     ).toBe(400);
@@ -264,6 +300,32 @@ describe("private moderation reports", () => {
         .results,
     ).toEqual([]);
   });
+  it("accepts valid reasons above 16 KiB, including fully escaped JSON", async () => {
+    const { app, db } = await setup();
+    // 1000 graphemes, exactly 20,000 UTF-8 bytes, but >60 KiB when escaped.
+    const reason = ("e" + "\u0301".repeat(9)).repeat(1000) + "\u0301".repeat(500);
+    expect(new TextEncoder().encode(reason)).toHaveLength(20_000);
+    for (const escaped of [false, true]) {
+      const token = await createServiceJwt({ keypair: key, issuer: reporter, audience,
+        lxm: "com.atproto.moderation.createReport" });
+      let body = JSON.stringify({ ...report, reason });
+      if (escaped) {
+        const escapedReason = Array.from(reason,
+          (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`).join("");
+        body = body.replace(JSON.stringify(reason), `"${escapedReason}"`);
+        expect(new TextEncoder().encode(body).length).toBeGreaterThan(60 * 1024);
+      }
+      const response = await app.request("/xrpc/com.atproto.moderation.createReport", {
+        method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body,
+      });
+      expect(response.status).toBe(200);
+      expect(((await response.json()) as any).reason).toBe(reason);
+    }
+    expect((await request(app, "com.atproto.moderation.createReport", reporter,
+      { ...report, reason: reason + "\u0301" })).status).toBe(400);
+    expect((await db.prepare("SELECT used FROM moderation_report_limits").first<any>()).used).toBe(2);
+  });
+
   it("enforces a transaction-safe per-reporter quota and validates reasons/subjects", async () => {
     const { app, db } = await setup();
     expect(

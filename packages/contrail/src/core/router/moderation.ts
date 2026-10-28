@@ -20,6 +20,10 @@ import { REPORT_REASON_TYPES } from "../../moderation-contract";
 
 export { REPORT_REASON_TYPES };
 
+// Leave room for JSON escape expansion of valid 20,000-byte reasons and
+// their subject/envelope. Field-level limits still apply after parsing.
+const MAX_JSON_BODY_BYTES = 128 * 1024;
+
 async function smallJson(c: Context): Promise<any> {
   const reader = c.req.raw.body?.getReader();
   if (!reader) throw new Error("Missing body");
@@ -37,7 +41,7 @@ async function smallJson(c: Context): Promise<any> {
       const { value, done } = await Promise.race([reader.read(), timeout]);
       if (done) break;
       size += value.byteLength;
-      if (size > 16_384) {
+      if (size > MAX_JSON_BODY_BYTES) {
         reader.cancel().catch(() => {});
         throw new Error("Body too large");
       }
@@ -154,9 +158,10 @@ async function previews(
       recordsByUri.set(record.uri, formatRecord({ ...record, collection: nsid }));
   }
   const subjects = [...new Set(rows.flatMap((r) => [r.subject_uri, r.subject_did]))];
+  const labelSubjects = [...new Set([...subjects, ...recordsByUri.keys()])];
   const labels = await hydrateLabels(
     db,
-    subjects,
+    labelSubjects,
     config.labels?.sources.map((s) => s.did) ?? [],
     new Map([...recordsByUri.values()].map((r) => [r.uri, r.cid])),
   );
@@ -172,10 +177,13 @@ async function previews(
       ? [recordsByUri.get(row.subject_uri)].filter(Boolean)
       : profileUris(row.subject_did).map(({ uri }) => recordsByUri.get(uri)).filter(Boolean);
     const cid = records[0]?.cid ?? row.subject_cid;
+    const previewSubjects = [...new Set([
+      row.subject_uri, row.subject_did, ...records.map((r) => r.uri),
+    ])];
     result.set(row.id, {
       records,
       labels: Object.fromEntries(
-        [row.subject_uri, row.subject_did].filter((s) => labels[s]).map((s) => [s, labels[s]!]),
+        previewSubjects.filter((s) => labels[s]).map((s) => [s, labels[s]!]),
       ),
       hidden: hiddenRows.some(
         (h) => (h.subject === row.subject_uri || h.subject === row.subject_did) &&

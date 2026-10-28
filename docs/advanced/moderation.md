@@ -81,8 +81,12 @@ public at that point. Use the private report inbox for those fields.
 `contrail.ingest()` and `contrail.runPersistent()` reconcile a bounded complete
 PDS listing for each moderator (each cron tick; every 30 s when persistent).
 Only actions whose CID differs from the indexed one, and missed deletions, are
-written: unchanged actions cost reads only. With multiple moderators, a durable
-last-attempt checkpoint rotates the next cycle's starting moderator so a slow or
+written: unchanged actions cost reads only. Local CID lookups are limited to
+the fetched URIs, and creates/updates plus inferred deletions share a budget of
+1000 mutations per moderator per cycle. A larger local deletion backlog drains
+over repeated complete fresh listings; no partial listing is used as an absence
+proof. With multiple moderators, a durable last-attempt checkpoint rotates the
+next cycle's starting moderator so a slow or
 unavailable repository cannot starve the others. Incomplete listings, failed
 pages and timeouts never infer deletions. A listing larger than one cycle's
 budget (1000 actions or 10 pages) applies the creates/updates seen so far and
@@ -245,7 +249,9 @@ Report routes always require a method-bound service JWT with the exact
 fragmented audience:
 
 - `com.atproto.moderation.createReport`: standard repoRef/strongRef subject and
-  standard reason types. Request bodies have byte and read-time limits.
+  standard reason types. Request bodies are limited to 128 KiB and five seconds
+  to read, including JSON escape overhead. Reasons allow at most 2000 graphemes
+  and 20,000 UTF-8 bytes after parsing.
   The subject must be indexed by the instance: a known account, or a record in
   a configured collection (hidden subjects stay reportable). Anything else is
   rejected without spending quota.
@@ -253,7 +259,8 @@ fragmented audience:
   Bounded request bodies and notes. Returns a standard integer report ID.
 - `<namespace>.moderation.listReports`: moderator-only, open/resolved filtering,
   stable cursor pagination; private indexed subject previews include hidden
-  records and effective labels without refetching the PDS.
+  records and effective labels without refetching the PDS. Account previews
+  also include labels on their displayed profile records, filtered by CID.
 - `<namespace>.moderation.resolveReport`: moderator-only, idempotent resolution,
   optional private note and associated public action URI.
 
@@ -262,9 +269,10 @@ instance: always retain the service endpoint alongside an ID when aggregating.
 
 ### Storage that survives fresh-generation rebuilds
 
-For a single non-generational database the private tables are additive and are
-never erased by `initSchema`. For fresh projection generations, bind a stable
-**separate instance database**, not the candidate projection:
+Reports, resolution notes and report quotas are authoritative instance data:
+they are not ATProto records and cannot be recovered by replaying the network.
+Use a stable **separate instance database** in production, especially when
+rebuilding or replacing the projection database:
 
 ```ts
 import { initModerationReports } from "@atmo-dev/contrail";
@@ -275,7 +283,13 @@ const app = contrail.app({ reportsDb: instanceReportsDb });
 A Cloudflare Worker can use `createWorker(config, { reportsBinding: "REPORTS_DB" })`.
 Keep that D1 binding unchanged when replacing `DB`. The handler uses the active
 projection only for moderator previews; reports and rate-limit state stay in
-the stable database. There is no automatic copy between arbitrary databases.
+the stable database. Back it up independently of the projection cache.
+
+Without `reportsDb` / `reportsBinding`, reports currently fall back to the
+projection database. Its private tables are additive and never erased by
+`initSchema`, but deleting/replacing that database loses the reports. There is
+no automatic copy between arbitrary databases: moving existing reports requires
+an explicit migration of both `moderation_reports` and `moderation_report_limits`.
 
 ## Client helpers
 

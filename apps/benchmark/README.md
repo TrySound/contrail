@@ -55,6 +55,8 @@ The fixture intentionally uses opaque synthetic CIDs and no runtime Lexicon vali
 
 `baselines/cost-ci.json` contains absolute read/write/statement ceilings per phase for 64/512-post full fixtures. Initial ceilings allow 10% plus 32 reads / 8 writes of slack; zero-write phases retain a zero-write ceiling. Fixture parameters, phase units and pinned Wrangler/Miniflare/workerd versions must match. Timings are informational. CI also checks that cold updates/replay, deletion at fixed fanout, equality-filtered first/next/deep pages and quiet initialization/moderation do not acquire corpus-sized work (per-unit ceiling: 3× the small fixture plus 16 rows). These checks hold fanout, selectivity and timestamp distribution fixed; they do not promise constant reads with arbitrarily many hidden candidates or timestamp ties. Account-wide jobs, hot-parent recounts and policy migrations legitimately depend on affected data and are reported separately.
 
+Account-report previews include labels on their displayed profiles. This adds an indexed URI lookup to label hydration: the CI inbox workload now reads 21 rows/request instead of 15 at both fixture sizes, with no extra statements or writes. Only the two inbox read ceilings were regenerated for this correctness fix; all other ceilings are unchanged.
+
 The initial 1k/10k-post, 100-actor, 50-operation runs identified these costs before the first index optimization pass:
 
 | Operation | Reads/unit at 1k posts | Reads/unit at 10k posts |

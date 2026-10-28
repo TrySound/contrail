@@ -924,6 +924,7 @@ describe("label admission and recovery", () => {
       // New DB/config objects simulate the next cron in another Worker isolate:
       // fairness must come from durable state, not a process-local counter.
       const nextDb: Database = {
+        dialect: db.dialect,
         prepare: (sql) => db.prepare(sql),
         batch: (stmts) => db.batch(stmts),
       };
@@ -1018,6 +1019,7 @@ describe("label admission and recovery", () => {
       .run();
     let batches = 0;
     const counting: Database = {
+      dialect: db.dialect,
       prepare: (sql) => db.prepare(sql),
       batch: (stmts) => {
         batches++;
