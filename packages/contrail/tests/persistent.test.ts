@@ -4,8 +4,20 @@ import type {
   Database,
   PersistentJetstreamSubscription,
 } from "../src/index";
-import { resolveConfig } from "../src/index";
-import { createTestDb, createTestDbWithSchema, TEST_CONFIG } from "./helpers";
+import {
+  FEED_PRUNE_RECOVERY_INTERVAL_MS,
+  FEED_PRUNE_SWEEP_ACTORS,
+  resolveConfig,
+} from "../src/index";
+import {
+  createTestDb,
+  createTestDbWithSchema,
+  feedUris,
+  GROWN_FEED,
+  seedFollow,
+  seedGrownFeed,
+  TEST_CONFIG,
+} from "./helpers";
 import { runPersistent } from "../src/index";
 import { JetstreamLiveHistoryExpiredError } from "../src/core/jetstream-live";
 import {
@@ -646,5 +658,119 @@ describe("runPersistent", () => {
       .bind("did:plc:alice", EVENT)
       .first<{ n: number }>();
     expect(Number(res?.n)).toBe(2);
+  });
+
+  it("prunes the feeds a flushed batch grew, and no others", async () => {
+    const EVENT = "community.lexicon.calendar.event";
+    const feedConfig = resolveConfig({
+      namespace: "com.example",
+      constellation: false,
+      collections: { event: { collection: EVENT } },
+      feeds: { main: { targets: [{ collection: "event", maxItems: 2 }] } },
+    });
+    const feedDb = createTestDb();
+    await initSchema(feedDb, feedConfig);
+    await seedGrownFeed(feedDb, EVENT);
+    const { author, follower, bystander } = GROWN_FEED;
+
+    // The loop keeps its recovery clock in memory, starting at 0. Pin the clock
+    // inside the first recovery interval, so that pass isn't due and can't trim
+    // feeds itself.
+    const now = vi.spyOn(Date, "now").mockReturnValue(FEED_PRUNE_RECOVERY_INTERVAL_MS - 1);
+    try {
+      const controller = new AbortController();
+      const promise = runPersistent(feedDb, feedConfig, {
+        batchSize: 100,
+        flushIntervalMs: 50,
+        signal: controller.signal,
+        createSubscription: () =>
+          mockSubscription([
+            {
+              kind: "commit",
+              did: author,
+              time_us: 5000,
+              commit: {
+                collection: EVENT,
+                operation: "create",
+                rkey: "new",
+                cid: "cidnew",
+                record: { name: "New", startsAt: "2026-04-01T10:00:00Z", mode: "online" },
+              },
+            },
+          ]) as any,
+      });
+      await new Promise((r) => setTimeout(r, 300));
+      controller.abort();
+      await promise;
+    } finally {
+      now.mockRestore();
+    }
+
+    const aliceFeed = await feedUris(feedDb, follower, EVENT);
+    expect(aliceFeed).toHaveLength(2);
+    expect(aliceFeed[0]).toBe(`at://${author}/${EVENT}/new`);
+    expect(await feedUris(feedDb, bystander, EVENT)).toHaveLength(5);
+  });
+
+  it("sweeps a slice when a flushed batch grew more feeds than the prune's budget", async () => {
+    const EVENT = "community.lexicon.calendar.event";
+    const feedConfig = resolveConfig({
+      namespace: "com.example",
+      constellation: false,
+      collections: { event: { collection: EVENT } },
+      feeds: { main: { targets: [{ collection: "event", maxItems: 2 }] } },
+    });
+    const feedDb = createTestDb();
+    await initSchema(feedDb, feedConfig);
+    // The budget is FEED_PRUNE_SWEEP_ACTORS feeds per capped collection, and
+    // there is one, so one more follower than that overflows it.
+    const author = "did:plc:bob";
+    for (let i = 0; i <= FEED_PRUNE_SWEEP_ACTORS; i++) {
+      await seedFollow(feedDb, `f-${String(i).padStart(4, "0")}`, author);
+    }
+    // Over cap and unrelated to bob, first in actor order: only a sweep slice
+    // reaches it.
+    const bystander = "a-bystander";
+    for (let i = 0; i < 5; i++) {
+      await feedDb
+        .prepare("INSERT INTO feed_items (actor, uri, collection, time_us) VALUES (?, ?, ?, ?)")
+        .bind(bystander, `at://did:plc:old/${EVENT}/${i}`, EVENT, 1000 + i)
+        .run();
+    }
+
+    // As above: keep the in-memory recovery pass from coming due.
+    const now = vi.spyOn(Date, "now").mockReturnValue(FEED_PRUNE_RECOVERY_INTERVAL_MS - 1);
+    try {
+      const controller = new AbortController();
+      const promise = runPersistent(feedDb, feedConfig, {
+        batchSize: 100,
+        flushIntervalMs: 50,
+        signal: controller.signal,
+        createSubscription: () =>
+          mockSubscription([
+            {
+              kind: "commit",
+              did: author,
+              time_us: 5000,
+              commit: {
+                collection: EVENT,
+                operation: "create",
+                rkey: "new",
+                cid: "cidnew",
+                record: { name: "New", startsAt: "2026-04-01T10:00:00Z", mode: "online" },
+              },
+            },
+          ]) as any,
+      });
+      await new Promise((r) => setTimeout(r, 500));
+      controller.abort();
+      await promise;
+    } finally {
+      now.mockRestore();
+    }
+
+    // The fan-out reached every follower, so the batch did overflow.
+    expect(await feedUris(feedDb, `f-${String(FEED_PRUNE_SWEEP_ACTORS).padStart(4, "0")}`, EVENT)).toHaveLength(1);
+    expect(await feedUris(feedDb, bystander, EVENT)).toHaveLength(2);
   });
 });

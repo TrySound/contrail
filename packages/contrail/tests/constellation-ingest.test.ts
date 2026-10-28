@@ -11,6 +11,7 @@ import {
   queryRecords,
   resolveConfig,
 } from "../src/index";
+import type { Database } from "../src/index";
 import { createSqliteDatabase } from "../src/adapters/sqlite";
 
 const EVENT = "com.example.event";
@@ -60,7 +61,7 @@ async function cidFor(record: unknown) {
   return toString(await create(CODEC_DCBOR, encode(record)));
 }
 
-async function setup() {
+async function setup(feedMaxItems?: number) {
   const config = resolveConfig({
     namespace: "com.example",
     profiles: [],
@@ -75,7 +76,11 @@ async function setup() {
       },
     },
     feeds: {
-      network: { follow: "follow", targets: ["event"] },
+      network: {
+        follow: "follow",
+        targets: ["event"],
+        ...(feedMaxItems ? { maxItems: feedMaxItems } : {}),
+      },
     },
     constellation: {
       url: "https://constellation.example.com",
@@ -172,5 +177,80 @@ describe("Constellation enrichment through shared ingestion", () => {
         .bind(FOLLOWER, EVENT_URI)
         .first(),
     ).toEqual({ actor: FOLLOWER, uri: EVENT_URI });
+  });
+
+  it("prunes the feeds its follows backfill", async () => {
+    const { config, db } = await setup(1);
+    // The follower's feed is already at its cap of 1, with a newer item.
+    const newer = `at://did:plc:other/${EVENT}/newer`;
+    await db
+      .prepare(
+        "INSERT INTO feed_items (actor, uri, collection, time_us) VALUES (?, ?, ?, ?)",
+      )
+      .bind(FOLLOWER, newer, EVENT, TID_TIME + 1)
+      .run();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({ links: [{ did: FOLLOWER, rkey: FOLLOW_RKEY }] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+
+    expect(
+      await backfillFollowersFromConstellation(db, config, SUBJECT),
+    ).toBe(1);
+
+    // The backfill added the subject's older event; the prune dropped it.
+    const feed = await db
+      .prepare("SELECT uri FROM feed_items WHERE actor = ?")
+      .bind(FOLLOWER)
+      .all<{ uri: string }>();
+    expect((feed.results ?? []).map((r) => r.uri)).toEqual([newer]);
+  });
+
+  it("keeps going when a page's feed prune fails", async () => {
+    const { config, db: real } = await setup(1);
+    const second = "did:plc:second";
+    await real
+      .prepare(
+        "INSERT INTO identities (did, handle, pds, resolved_at) VALUES (?, ?, ?, ?)",
+      )
+      .bind(second, null, "https://pds.example.com", 1)
+      .run();
+    // The first page's cutoff delete throws; saving records still works.
+    let failPrune = true;
+    const db: Database = {
+      prepare(sql: string) {
+        if (failPrune && /DELETE FROM feed_items\s+WHERE actor = \? AND collection = \?/.test(sql)) {
+          failPrune = false;
+          throw new Error("D1 unavailable");
+        }
+        return real.prepare(sql);
+      },
+      batch: (stmts) => real.batch(stmts),
+      dialect: real.dialect,
+    };
+    const pages = [
+      { links: [{ did: FOLLOWER, rkey: FOLLOW_RKEY }], cursor: "page-2" },
+      { links: [{ did: second, rkey: createTid(TID_TIME + 1, 0) }] },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify(pages.shift()), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+
+    expect(await backfillFollowersFromConstellation(db, config, SUBJECT)).toBe(2);
+    expect(failPrune).toBe(false);
+    expect(
+      (await queryRecords(real, config, { collection: "follow" })).records,
+    ).toHaveLength(2);
   });
 });

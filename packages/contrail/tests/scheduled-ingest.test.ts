@@ -53,12 +53,13 @@ import {
   getLastCursor,
   initSchema,
   resolveConfig,
+  runGatedFeedPrune,
   runIngestCycle,
   type Database,
   type Logger,
 } from "../src/index";
 import { saveJetstreamCursor } from "../src/core/db/records";
-import { createTestDb } from "./helpers";
+import { createTestDb, feedUris, GROWN_FEED, seedGrownFeed } from "./helpers";
 
 const COLLECTION = "com.example.event";
 
@@ -462,5 +463,53 @@ describe("bounded scheduled ingest cycles", () => {
     expect(summary?.text).toContain('"retained_candidates":0');
     expect(summary?.text).toContain('"source_scope_filtered":1');
     expect(summary?.text).toContain('"safe_ending_cursor":2000001');
+  });
+});
+
+describe("scheduled ingest feed prune", () => {
+  beforeEach(() => {
+    source.initialCursor = 0;
+    source.requestedCursors = [];
+    source.events = [];
+  });
+
+  it("prunes the feeds the cycle's events grew, and no others", async () => {
+    const EVENT = "community.lexicon.calendar.event";
+    const feedConfig = resolveConfig({
+      namespace: "com.example",
+      profiles: [],
+      constellation: false,
+      collections: { event: { collection: EVENT } },
+      feeds: { main: { targets: [{ collection: "event", maxItems: 2 }] } },
+      logger: logger().value,
+    });
+    const db = createTestDb();
+    await initSchema(db, feedConfig);
+    // Complete a recovery pass on the empty table, so the next is not due.
+    await runGatedFeedPrune(db, feedConfig, []);
+    await seedGrownFeed(db, EVENT);
+    const { author, follower, bystander } = GROWN_FEED;
+    source.events = [
+      {
+        kind: "commit",
+        time_us: 1_000_001,
+        did: author,
+        commit: {
+          rev: "1",
+          collection: EVENT,
+          operation: "create",
+          rkey: "new",
+          cid: "bafy-new",
+          record: { $type: EVENT, name: "New" },
+        },
+      },
+    ];
+
+    await runIngestCycle(db, feedConfig, budget);
+
+    const aliceFeed = await feedUris(db, follower, EVENT);
+    expect(aliceFeed).toHaveLength(2);
+    expect(aliceFeed[0]).toBe(`at://${author}/${EVENT}/new`);
+    expect(await feedUris(db, bystander, EVENT)).toHaveLength(5);
   });
 });

@@ -26,6 +26,7 @@ import {
   nsidForShortName,
   normalizeFeedTarget,
   feedTargetMaxItems,
+  buildFeedTargetCaps,
   DEFAULT_FOLLOW_SHORT,
   changesEnabled,
 } from "../types";
@@ -605,6 +606,121 @@ export async function pruneFeedItems(
     cursor = res.nextCursor;
   }
   return total;
+}
+
+/** Subjects per follower lookup in {@link pruneGrownFeeds}, under D1's limit of
+ *  100 bound parameters per statement. */
+const GROWN_FEED_SUBJECT_CHUNK = 50;
+
+export interface GrownFeedPruneResult {
+  /** Rows deleted. */
+  pruned: number;
+  /** True when the batch grew more than `limit` feeds. Only `limit` of them were
+   *  pruned; the caller should fall back to the rolling sweep. */
+  overflow: boolean;
+}
+
+/**
+ * Prune only the feeds an applied ingest batch can have grown.
+ *
+ * A feed grows only through the two inserts in buildFeedStatements: a target
+ * create/update fans out to the author's followers, and a follow create
+ * backfills the subject's recent items into the follower's feed. Deletes only
+ * shrink feeds. So this looks up the followers of the batch's target authors,
+ * adds the batch's new followers, and runs the cutoff delete for those
+ * (actor, collection) pairs only, rather than for a slice of every actor.
+ *
+ * A follow update counts as a new follower too. The cron path applies a batch
+ * in several transactions and prunes once at the end, so a fan-out to a
+ * follower can precede an update that repoints their follow; the lookup by
+ * subject would then no longer find them.
+ *
+ * A popular author's fan-out has no upper bound, so at most `limit` feeds are
+ * pruned and `overflow` reports the rest. feed_items is a soft cache, so a feed
+ * left a few rows over cap until the sweep reaches it is harmless.
+ */
+export async function pruneGrownFeeds(
+  db: Database,
+  config: ContrailConfig,
+  events: readonly IngestEvent[],
+  limit: number
+): Promise<GrownFeedPruneResult> {
+  const caps = buildFeedTargetCaps(config);
+  if (!config.feeds || caps.size === 0 || limit <= 0) {
+    return { pruned: 0, overflow: false };
+  }
+
+  const grown = new Map<string, { actor: string; collection: string }>();
+  const add = (actor: string, collection: string) => {
+    if (caps.has(collection)) {
+      grown.set(`${actor}\0${collection}`, { actor, collection });
+    }
+  };
+  let overflow = false;
+
+  for (const feedConfig of Object.values(config.feeds)) {
+    const followShort = feedConfig.follow ?? DEFAULT_FOLLOW_SHORT;
+    const targets = feedConfig.targets.map(normalizeFeedTarget);
+    const targetShorts = targets.map((t) => t.collection);
+    // Target authors in this batch -> the collections they wrote to.
+    const authors = new Map<string, Set<string>>();
+
+    for (const e of events) {
+      const short = shortNameForNsid(config, e.collection);
+      if (!short) continue;
+      if (
+        targetShorts.includes(short) &&
+        (e.operation === "create" || e.operation === "update")
+      ) {
+        const written = authors.get(e.did) ?? new Set<string>();
+        written.add(e.collection);
+        authors.set(e.did, written);
+      }
+      if (
+        short === followShort &&
+        (e.operation === "create" || e.operation === "update")
+      ) {
+        for (const target of targets) {
+          add(e.did, nsidForShortName(config, target.collection) ?? target.collection);
+        }
+      }
+    }
+
+    const subjectExpr = getDialect(db).jsonExtract("r.record", "subject");
+    const subjects = [...authors.keys()];
+    for (let i = 0; i < subjects.length && !overflow; i += GROWN_FEED_SUBJECT_CHUNK) {
+      const chunk = subjects.slice(i, i + GROWN_FEED_SUBJECT_CHUNK);
+      const res = await db
+        .prepare(
+          `SELECT r.did AS actor, ${subjectExpr} AS subject
+           FROM ${recordsTableName(followShort)} r
+           WHERE ${subjectExpr} IN (${chunk.map(() => "?").join(", ")})
+           LIMIT ?`
+        )
+        .bind(...chunk, limit + 1)
+        .all<{ actor: string; subject: string }>();
+      const followers = res.results ?? [];
+      for (const row of followers) {
+        for (const collection of authors.get(row.subject) ?? []) {
+          add(row.actor, collection);
+        }
+      }
+      if (followers.length > limit) overflow = true;
+    }
+    if (grown.size > limit) overflow = true;
+  }
+
+  const stmts = [...grown.values()]
+    .slice(0, limit)
+    .map(({ actor, collection }) =>
+      actorCutoffDelete(db, actor, collection, caps.get(collection)!)
+    );
+  let pruned = 0;
+  for (let i = 0; i < stmts.length; i += SWEEP_BATCH_SIZE) {
+    const results = await db.batch(stmts.slice(i, i + SWEEP_BATCH_SIZE));
+    for (const r of results) pruned += (r as any)?.changes ?? 0;
+  }
+  return { pruned, overflow };
 }
 
 // --- Feed prune cursor ---

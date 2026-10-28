@@ -13,6 +13,7 @@ import {
   sweepFeedItems,
   pruneActorFeed,
   pruneFeedItems,
+  pruneGrownFeeds,
 } from "../src/index";
 
 // ---------------------------------------------------------------------------
@@ -216,6 +217,65 @@ describe("feed maintenance stays index-bounded", () => {
     const fanout = sqls.find((s) => /records_follow/is.test(s))!;
     const plan = (await queryPlan(real, fanout)).join(" | ");
     expect(plan).toMatch(/idx_follow_subject/i);
+  });
+});
+
+describe("grown-feed prune stays index-bounded", () => {
+  const authorEvent: IngestEvent = {
+    uri: "at://did:plc:author/" + EVENT + "/evt3",
+    did: "did:plc:author",
+    collection: EVENT,
+    rkey: "evt3",
+    cid: "bafyevt3",
+    record: JSON.stringify({ name: "x" }),
+    time_us: 7000,
+    indexed_at: 7000,
+    operation: "create",
+  };
+  const newFollow: IngestEvent = {
+    uri: "at://did:plc:new/" + FOLLOW + "/f1",
+    did: "did:plc:new",
+    collection: FOLLOW,
+    rkey: "f1",
+    cid: "bafyfollow2",
+    record: JSON.stringify({ subject: "did:plc:author" }),
+    time_us: 7001,
+    indexed_at: 7001,
+    operation: "create",
+  };
+
+  it("pruneGrownFeeds issues only index-bounded statements", async () => {
+    await makeFollowRow(real, "did:plc:follower", "did:plc:author");
+    const { db, sqls } = recordingDb(real);
+    await pruneGrownFeeds(db, CONFIG, [authorEvent, newFollow], 100);
+    expect(sqls.some((s) => /records_follow/is.test(s))).toBe(true);
+    // One cutoff delete per grown feed: the follower's event feed, and the new
+    // follower's event and rsvp feeds.
+    expect(sqls.filter((s) => /DELETE FROM feed_items/is.test(s))).toHaveLength(3);
+    await assertAllBounded(real, sqls);
+  });
+
+  it("its follower lookup uses idx_follow_subject (not a full scan)", async () => {
+    const { db, sqls } = recordingDb(real);
+    await pruneGrownFeeds(db, CONFIG, [authorEvent], 100);
+    const lookup = sqls.find((s) => /records_follow/is.test(s))!;
+    const plan = (await queryPlan(real, lookup)).join(" | ");
+    expect(plan).toMatch(/idx_follow_subject/i);
+  });
+
+  it("splits the follower lookup into chunks, each on idx_follow_subject", async () => {
+    const authors = Array.from({ length: 51 }, (_, i) => ({
+      ...authorEvent,
+      did: `did:plc:author${i}`,
+      uri: `at://did:plc:author${i}/${EVENT}/evt3`,
+    }));
+    const { db, sqls } = recordingDb(real);
+    await pruneGrownFeeds(db, CONFIG, authors, 100);
+    const lookups = sqls.filter((s) => /records_follow/is.test(s));
+    expect(lookups).toHaveLength(2);
+    for (const lookup of lookups) {
+      expect((await queryPlan(real, lookup)).join(" | ")).toMatch(/idx_follow_subject/i);
+    }
   });
 });
 

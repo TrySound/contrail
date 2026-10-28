@@ -61,6 +61,7 @@ export {
   lookupExistingRecords,
   pruneActorFeed,
   pruneFeedItems,
+  pruneGrownFeeds,
   queryRecords,
   saveCursor,
   saveCursorStatement,
@@ -73,6 +74,7 @@ export {
 export type {
   ExistingRecordInfo,
   FeedSweepResult,
+  GrownFeedPruneResult,
   QueryOptions,
   SortOption,
   ServingSourcePosition,
