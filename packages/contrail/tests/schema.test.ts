@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { initSchema } from "../src/core/db/schema";
+import { initSchema } from "../src/index";
 import { createTestDb, TEST_CONFIG } from "./helpers";
 
 describe("initSchema", () => {
@@ -15,9 +15,38 @@ describe("initSchema", () => {
     expect(names).toContain("records_event");
     expect(names).toContain("records_rsvp");
     expect(names).toContain("backfills");
+    expect(names).toContain("backfill_state");
     expect(names).toContain("discovery");
     expect(names).toContain("cursor");
     expect(names).toContain("identities");
+    expect(names).toContain("record_versions");
+    expect(names).toContain("ingest_diagnostics");
+    expect(names).toContain("_contrail_projection_state");
+    expect(names).not.toContain("change_log_state");
+
+    const backfillColumns = await db
+      .prepare("PRAGMA table_info(backfills)")
+      .all<{ name: string }>();
+    expect(backfillColumns.results.map((column) => column.name)).toEqual(
+      expect.arrayContaining([
+        "last_attempt_at",
+        "next_retry_at",
+        "scheduled_retries",
+        "retry_exhausted",
+      ])
+    );
+
+    const discoveryColumns = await db
+      .prepare("PRAGMA table_info(discovery)")
+      .all<{ name: string }>();
+    expect(discoveryColumns.results.map((column) => column.name)).toEqual(
+      expect.arrayContaining([
+        "retries",
+        "last_error",
+        "last_attempt_at",
+        "next_retry_at",
+      ])
+    );
   });
 
   it("creates dynamic indexes for queryable fields", async () => {
@@ -48,6 +77,146 @@ describe("initSchema", () => {
     expect(names.some((n) => n.includes("subject"))).toBe(true);
   });
 
+  it("migrates existing backfill and discovery state tables", async () => {
+    const db = createTestDb();
+    await db
+      .prepare(
+        "CREATE TABLE backfills (did TEXT NOT NULL, collection TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0, pds_cursor TEXT, retries INTEGER NOT NULL DEFAULT 0, last_error TEXT, PRIMARY KEY (did, collection))"
+      )
+      .run();
+    await db
+      .prepare(
+        "CREATE TABLE discovery (collection TEXT NOT NULL, relay TEXT NOT NULL, cursor TEXT, completed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (collection, relay))"
+      )
+      .run();
+
+    await initSchema(db, TEST_CONFIG);
+
+    const backfillColumns = await db
+      .prepare("PRAGMA table_info(backfills)")
+      .all<{ name: string }>();
+    expect(backfillColumns.results.map((column) => column.name)).toEqual(
+      expect.arrayContaining([
+        "last_attempt_at",
+        "next_retry_at",
+        "scheduled_retries",
+        "retry_exhausted",
+      ])
+    );
+
+    const discoveryColumns = await db
+      .prepare("PRAGMA table_info(discovery)")
+      .all<{ name: string }>();
+    expect(discoveryColumns.results.map((column) => column.name)).toEqual(
+      expect.arrayContaining([
+        "retries",
+        "last_error",
+        "last_attempt_at",
+        "next_retry_at",
+      ])
+    );
+  });
+
+  it("migrates optimistic tokens onto existing version rows", async () => {
+    const db = createTestDb();
+    await db
+      .prepare(
+        `CREATE TABLE record_versions (
+          uri TEXT PRIMARY KEY,
+          did TEXT NOT NULL,
+          collection TEXT NOT NULL,
+          rkey TEXT NOT NULL,
+          operation TEXT NOT NULL,
+          cid TEXT,
+          source_id TEXT NOT NULL,
+          source_revision TEXT,
+          source_time_us BIGINT NOT NULL,
+          source_cursor TEXT,
+          indexed_at BIGINT NOT NULL
+        )`,
+      )
+      .run();
+    await db
+      .prepare(
+        `INSERT INTO record_versions
+         (uri, did, collection, rkey, operation, cid, source_id,
+          source_revision, source_time_us, source_cursor, indexed_at)
+         VALUES (?, ?, ?, ?, 'update', ?, 'legacy', NULL, 1, NULL, 1)`,
+      )
+      .bind(
+        "at://did:plc:legacy/community.lexicon.calendar.event/one",
+        "did:plc:legacy",
+        "community.lexicon.calendar.event",
+        "one",
+        "cid-legacy",
+      )
+      .run();
+
+    await initSchema(db, TEST_CONFIG);
+    expect(
+      await db
+        .prepare("SELECT projection_token FROM record_versions")
+        .first(),
+    ).toEqual({
+      projection_token:
+        "at://did:plc:legacy/community.lexicon.calendar.event/one",
+    });
+  });
+
+  it("seeds ordering metadata for visible rows from older schemas", async () => {
+    const db = createTestDb();
+    await db
+      .prepare(
+        `CREATE TABLE records_event (
+          uri TEXT PRIMARY KEY,
+          did TEXT NOT NULL,
+          rkey TEXT NOT NULL,
+          cid TEXT,
+          record TEXT,
+          time_us BIGINT NOT NULL,
+          indexed_at BIGINT NOT NULL
+        )`,
+      )
+      .run();
+    await db
+      .prepare(
+        "INSERT INTO records_event (uri, did, rkey, cid, record, time_us, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .bind(
+        "at://did:plc:legacy/community.lexicon.calendar.event/one",
+        "did:plc:legacy",
+        "one",
+        "cid-legacy",
+        JSON.stringify({ name: "legacy" }),
+        100,
+        200,
+      )
+      .run();
+
+    await initSchema(db, TEST_CONFIG);
+
+    const version = await db
+      .prepare(
+        "SELECT operation, source_id, source_time_us, cid, projection_token FROM record_versions WHERE uri = ?",
+      )
+      .bind("at://did:plc:legacy/community.lexicon.calendar.event/one")
+      .first<{
+        operation: string;
+        source_id: string;
+        source_time_us: number;
+        cid: string;
+        projection_token: string;
+      }>();
+    expect(version).toEqual({
+      operation: "update",
+      source_id: "legacy",
+      source_time_us: 200,
+      cid: "cid-legacy",
+      projection_token:
+        "at://did:plc:legacy/community.lexicon.calendar.event/one",
+    });
+  });
+
   it("is idempotent", async () => {
     const db = createTestDb();
     await initSchema(db, TEST_CONFIG);
@@ -55,3 +224,4 @@ describe("initSchema", () => {
     await initSchema(db, TEST_CONFIG);
   });
 });
+

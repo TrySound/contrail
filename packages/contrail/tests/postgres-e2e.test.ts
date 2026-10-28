@@ -10,16 +10,25 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import pg from "pg";
 import { createPostgresDatabase } from "../src/adapters/postgres";
-import { initSchema } from "../src/core/db/schema";
+import { initSchema } from "../src/index";
 import {
-  applyEvents,
+  acknowledgeChanges,
+  acknowledgeCurrentSnapshotPage,
+  claimChanges,
+  claimCurrentActivation,
+  claimCurrentBootstrapChanges,
+  claimCurrentSnapshotPage,
+  completeCurrentActivation,
+  getChangesStatus,
+  hydrateChanges,
+  ingestRecords,
   queryRecords,
   getLastCursor,
   saveCursor,
-} from "../src/core/db/records";
-import { resolveConfig } from "../src/core/types";
-import type { Database } from "../src/core/types";
-import { resolveHydrates, resolveReferences } from "../src/core/router/hydrate";
+} from "../src/index";
+import { resolveConfig } from "../src/index";
+import type { Database, Statement } from "../src/index";
+import { resolveHydrates, resolveReferences } from "../src/index";
 import { makeEvent } from "./helpers";
 
 const TEST_CONFIG = resolveConfig({
@@ -55,6 +64,30 @@ const TEST_CONFIG = resolveConfig({
   },
 });
 
+const CHANGE_CONFIG = resolveConfig({
+  namespace: "com.example",
+  profiles: [],
+  collections: {
+    event: { collection: "community.lexicon.calendar.event" },
+  },
+  changes: {
+    consumers: {
+      search: {
+        collections: ["community.lexicon.calendar.event"],
+        initial: "history",
+      },
+      analytics: {
+        collections: ["community.lexicon.calendar.event"],
+        initial: "history",
+      },
+      cache: {
+        collections: ["community.lexicon.calendar.event"],
+        initial: "current",
+      },
+    },
+  },
+});
+
 const PG_URL = process.env.TEST_DATABASE_URL;
 if (!PG_URL) {
   describe.skip("PostgreSQL e2e (TEST_DATABASE_URL not set)", () => {
@@ -78,7 +111,7 @@ if (!PG_URL) {
     const tables = await pool.query(
       `SELECT tablename FROM pg_tables WHERE schemaname = 'public'
        AND (tablename LIKE 'records_%' OR tablename LIKE 'fts_%'
-            OR tablename IN ('backfills', 'discovery', 'cursor', 'identities', 'feed_items', 'feed_backfills'))`
+            OR tablename IN ('_contrail_meta', '_contrail_projection_state', 'backfills', 'backfill_state', 'discovery', 'cursor', 'source_position', 'bootstrap_state', 'bootstrap_snapshot_progress', 'identities', 'record_versions', 'ingest_diagnostics', 'feed_items', 'feed_prune_cursor', 'feed_backfills', 'change_log_state', 'change_batches', 'change_consumers', 'change_log_coverage', 'change_consumer_actions'))`
     );
     for (const { tablename } of tables.rows) {
       await pool.query(`DROP TABLE IF EXISTS ${tablename} CASCADE`);
@@ -132,7 +165,7 @@ if (!PG_URL) {
 
   describe("ingestion", () => {
     it("inserts create events", async () => {
-      await applyEvents(db, [
+      await ingestRecords(db, [
         makeEvent({ record: { name: "Event 1", mode: "online" } }),
       ]);
       const result = await queryRecords(db, TEST_CONFIG, {
@@ -144,10 +177,10 @@ if (!PG_URL) {
 
     it("upserts on conflict", async () => {
       const uri = "at://did:plc:test/community.lexicon.calendar.event/1";
-      await applyEvents(db, [
+      await ingestRecords(db, [
         makeEvent({ uri, rkey: "1", cid: "cid1", record: { name: "V1", mode: "online" } }),
       ]);
-      await applyEvents(db, [
+      await ingestRecords(db, [
         makeEvent({ uri, rkey: "1", cid: "cid2", record: { name: "V2", mode: "online" } }),
       ]);
       const result = await queryRecords(db, TEST_CONFIG, {
@@ -159,10 +192,10 @@ if (!PG_URL) {
 
     it("deletes events", async () => {
       const uri = "at://did:plc:test/community.lexicon.calendar.event/1";
-      await applyEvents(db, [
+      await ingestRecords(db, [
         makeEvent({ uri, rkey: "1", record: { name: "Gone", mode: "online" } }),
       ]);
-      await applyEvents(db, [
+      await ingestRecords(db, [
         makeEvent({ uri, rkey: "1", operation: "delete", record: null, cid: null }),
       ]);
       const result = await queryRecords(db, TEST_CONFIG, {
@@ -171,8 +204,83 @@ if (!PG_URL) {
       expect(result.records).toHaveLength(0);
     });
 
+    it("retries an overlapping stale projector after the transaction lock", async () => {
+      const uri = "at://did:plc:test/community.lexicon.calendar.event/concurrent";
+      let arrivals = 0;
+      let releaseBoth!: () => void;
+      const both = new Promise<void>((resolve) => {
+        releaseBoth = resolve;
+      });
+      let releaseNewer!: () => void;
+      const newerDone = new Promise<void>((resolve) => {
+        releaseNewer = resolve;
+      });
+
+      const overlap = (role: "older" | "newer"): Database => {
+        let writes = 0;
+        return {
+          prepare(sql: string): Statement {
+            return db.prepare(sql);
+          },
+          async batch(statements: Statement[]) {
+            writes++;
+            if (writes > 1) return db.batch(statements);
+            arrivals++;
+            if (arrivals === 2) releaseBoth();
+            await both;
+            if (role === "older") await newerDone;
+            try {
+              return await db.batch(statements);
+            } finally {
+              if (role === "newer") releaseNewer();
+            }
+          },
+          dialect: db.dialect,
+        };
+      };
+
+      const [older] = await Promise.all([
+        ingestRecords(
+          overlap("older"),
+          [
+            makeEvent({
+              uri,
+              rkey: "concurrent",
+              cid: "cid-old",
+              record: { name: "old", mode: "online" },
+              time_us: 100,
+              indexed_at: 100,
+            }),
+          ],
+          TEST_CONFIG,
+        ),
+        ingestRecords(
+          overlap("newer"),
+          [
+            makeEvent({
+              uri,
+              rkey: "concurrent",
+              cid: "cid-new",
+              record: { name: "new", mode: "online" },
+              time_us: 200,
+              indexed_at: 200,
+            }),
+          ],
+          TEST_CONFIG,
+        ),
+      ]);
+
+      expect(older.dropped.superseded).toBe(1);
+      const row = await pool.query(
+        "SELECT record, cid FROM records_community_lexicon_calendar_event WHERE uri = $1",
+        [uri],
+      );
+      expect(row.rows[0]).toMatchObject({ cid: "cid-new" });
+      expect(row.rows[0].record.name).toBe("new");
+    });
+
     it("does nothing for empty events", async () => {
-      await applyEvents(db, []);
+      await ingestRecords(db, []);
       const cursor = await getLastCursor(db);
       expect(cursor).toBeNull();
     });
@@ -184,13 +292,13 @@ if (!PG_URL) {
     const eventUri = "at://did:plc:host/community.lexicon.calendar.event/evt1";
 
     beforeEach(async () => {
-      await applyEvents(db, [
+      await ingestRecords(db, [
         makeEvent({ uri: eventUri, rkey: "evt1", record: { name: "Counted Event", mode: "online" } }),
       ]);
     });
 
     it("increments counts on RSVP create", async () => {
-      await applyEvents(db, [
+      await ingestRecords(db, [
         makeEvent({
           uri: "at://did:plc:u1/community.lexicon.calendar.rsvp/r1",
           did: "did:plc:u1",
@@ -227,7 +335,7 @@ if (!PG_URL) {
 
     it("decrements counts on RSVP delete", async () => {
       const rsvpUri = "at://did:plc:u1/community.lexicon.calendar.rsvp/r1";
-      await applyEvents(db, [
+      await ingestRecords(db, [
         makeEvent({
           uri: rsvpUri,
           did: "did:plc:u1",
@@ -245,7 +353,7 @@ if (!PG_URL) {
       expect(result.records[0].counts?.["community.lexicon.calendar.rsvp"]).toBe(1);
 
       // Delete the RSVP
-      await applyEvents(db, [
+      await ingestRecords(db, [
         makeEvent({
           uri: rsvpUri,
           did: "did:plc:u1",
@@ -270,7 +378,7 @@ if (!PG_URL) {
 
   describe("queries", () => {
     beforeEach(async () => {
-      await applyEvents(db, [
+      await ingestRecords(db, [
         makeEvent({ uri: "at://a/community.lexicon.calendar.event/1", rkey: "1", did: "did:plc:alice", record: { name: "Alpha", mode: "online", startsAt: "2026-04-01T10:00:00Z" }, time_us: 1000 }),
         makeEvent({ uri: "at://a/community.lexicon.calendar.event/2", rkey: "2", did: "did:plc:bob", record: { name: "Beta", mode: "in-person", startsAt: "2026-05-01T10:00:00Z" }, time_us: 2000 }),
         makeEvent({ uri: "at://a/community.lexicon.calendar.event/3", rkey: "3", did: "did:plc:alice", record: { name: "Gamma", mode: "online", startsAt: "2026-06-01T10:00:00Z" }, time_us: 3000 }),
@@ -374,7 +482,7 @@ if (!PG_URL) {
 
   describe("full-text search", () => {
     beforeEach(async () => {
-      await applyEvents(db, [
+      await ingestRecords(db, [
         makeEvent({ uri: "at://a/community.lexicon.calendar.event/1", rkey: "1", record: { name: "Rust Meetup", description: "Systems programming", mode: "online" }, time_us: 1000 }),
         makeEvent({ uri: "at://a/community.lexicon.calendar.event/2", rkey: "2", record: { name: "TypeScript Workshop", description: "Learn web dev", mode: "online" }, time_us: 2000 }),
         makeEvent({ uri: "at://a/community.lexicon.calendar.event/3", rkey: "3", record: { name: "Go Conference", description: "Concurrency and systems", mode: "in-person" }, time_us: 3000 }),
@@ -425,11 +533,11 @@ if (!PG_URL) {
     const eventUri2 = "at://did:plc:host/community.lexicon.calendar.event/evt2";
 
     beforeEach(async () => {
-      await applyEvents(db, [
+      await ingestRecords(db, [
         makeEvent({ uri: eventUri1, rkey: "evt1", record: { name: "Event 1", mode: "online" }, time_us: 1000 }),
         makeEvent({ uri: eventUri2, rkey: "evt2", record: { name: "Event 2", mode: "online" }, time_us: 2000 }),
       ]);
-      await applyEvents(db, [
+      await ingestRecords(db, [
         makeEvent({
           uri: "at://did:plc:u1/community.lexicon.calendar.rsvp/r1",
           did: "did:plc:u1",
@@ -481,6 +589,72 @@ if (!PG_URL) {
         expect(refs[rsvp.uri]?.event).toBeDefined();
         expect(refs[rsvp.uri].event.uri).toBe(eventUri1);
       }
+    });
+  });
+
+  describe("durable change consumers", () => {
+    it("claims, hydrates, and acknowledges independently", async () => {
+      await initSchema(db, CHANGE_CONFIG);
+      await ingestRecords(
+        db,
+        [
+          makeEvent({
+            uri: "at://did:plc:test/community.lexicon.calendar.event/change",
+            rkey: "change",
+            cid: "cid-change",
+            record: { name: "Change", mode: "online" },
+            time_us: 100,
+            indexed_at: 100,
+          }),
+        ],
+        CHANGE_CONFIG,
+      );
+
+      const search = await claimChanges(db, "search", { now: 1_000 });
+      const analytics = await claimChanges(db, "analytics", { now: 1_000 });
+      expect(search?.through).toBe("1");
+      expect(analytics?.through).toBe("1");
+      const delivery = await hydrateChanges(db, CHANGE_CONFIG, search!);
+      expect(delivery.currentRecords[0]).toMatchObject({
+        cid: "cid-change",
+        value: { name: "Change", mode: "online" },
+      });
+      await acknowledgeChanges(db, search!, { now: 1_001 });
+      expect((await getChangesStatus(db)).consumers).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "search", position: "1" }),
+          expect.objectContaining({ id: "analytics", position: "0" }),
+        ]),
+      );
+      await acknowledgeChanges(db, analytics!, { now: 1_001 });
+
+      const snapshot = await claimCurrentSnapshotPage(
+        db,
+        CHANGE_CONFIG,
+        "cache",
+        { now: 2_000 },
+      );
+      expect(snapshot?.records).toHaveLength(1);
+      await acknowledgeCurrentSnapshotPage(db, snapshot!, { now: 2_001 });
+      expect(
+        await claimCurrentSnapshotPage(db, CHANGE_CONFIG, "cache", {
+          now: 2_002,
+        }),
+      ).toBeNull();
+      const tail = await claimCurrentBootstrapChanges(db, "cache", {
+        now: 2_003,
+      });
+      expect(tail).toMatchObject({ from: "0", through: "1" });
+      await acknowledgeChanges(db, tail!, { now: 2_004 });
+      const activation = await claimCurrentActivation(db, "cache", {
+        now: 2_005,
+      });
+      await completeCurrentActivation(db, activation!, { now: 2_006 });
+      expect(
+        (await getChangesStatus(db)).consumers.find(
+          (consumer) => consumer.id === "cache",
+        ),
+      ).toMatchObject({ bootstrapState: "ready", position: "1" });
     });
   });
 

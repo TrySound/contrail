@@ -10,6 +10,11 @@ export interface LabelerSource {
   /** Backfill from `cursor=0` on first sight. Defaults to true. Set false
    *  for "start from now" — useful for very chatty labelers. */
   backfill?: boolean;
+  /** Records-backed moderator source; never connect a labeler WebSocket. */
+  records?: boolean;
+  enforce?: boolean;
+  values?: string[];
+  subjects?: "known";
 }
 
 export interface LabelsConfig {
@@ -39,7 +44,7 @@ export interface LabelRow {
   neg: boolean;
   /** Expiry, unix seconds. Past this, hydration drops the row. */
   exp: number | null;
-  /** Creation timestamp, unix seconds — what we collapse on. */
+  /** Creation timestamp, unix milliseconds — what we collapse on. */
   cts: number;
   /** Raw signature bytes. Stored when present so we can re-emit later;
    *  not verified in v1. */
@@ -52,8 +57,4 @@ export interface LabelerCursorRow {
   cursor: number;
   endpoint: string | null;
   resolved_at: number | null;
-}
-
-export interface AdapterContext {
-  db: Database;
 }

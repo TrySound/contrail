@@ -1,9 +1,10 @@
 import { Contrail } from '@atmo-dev/contrail';
 import { createHandler, createServerClient } from '@atmo-dev/contrail/server';
 import type { Client } from '@atcute/client';
+import { lexicons } from '../../../lexicons/generated';
 import { config } from '../contrail.config';
 
-export const contrail = new Contrail(config);
+export const contrail = new Contrail({ ...config, lexicons });
 
 let initialized = false;
 
@@ -14,16 +15,12 @@ export async function ensureInit(db: D1Database) {
 	}
 }
 
-const handle = createHandler(contrail);
+const handle = createHandler(contrail, { lexicons });
 
-/**
- * Typed `@atcute/client` that calls contrail in-process. Pass `did` to act
- * as that user (server-side principal via WeakMap marker — no JWT, no PDS
- * roundtrip). Omit for anonymous calls against public endpoints.
- */
-export function getServerClient(db: D1Database, did?: string): Client {
+/** Typed `@atcute/client` that calls Contrail in-process. */
+export function getServerClient(db: D1Database): Client {
 	return createServerClient(async (req) => {
 		await ensureInit(db);
 		return handle(req, db) as Promise<Response>;
-	}, did);
+	});
 }

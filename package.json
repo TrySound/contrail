@@ -3,19 +3,29 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=22.15.0"
+  },
   "scripts": {
     "build": "turbo run build --filter=./packages/*",
     "build:apps": "turbo run build",
     "test": "turbo run test",
+    "test:built": "pnpm --filter @atmo-dev/contrail test:built",
+    "test:postgres": "pnpm --filter @atmo-dev/contrail test:postgres",
+    "test:workerd": "pnpm --filter @atmo-dev/contrail test:workerd",
+    "bench": "node --no-warnings --experimental-strip-types apps/benchmark/src/bench.ts",
+    "bench:cost": "node --no-warnings --experimental-strip-types apps/benchmark/src/cost.ts",
+    "bench:cost:ci": "pnpm bench:cost --profile ci --baseline apps/benchmark/baselines/cost-ci.json --output apps/benchmark/results/cost-ci.json",
+    "test:cost": "pnpm --filter contrail-backfill-benchmark test:cost",
     "typecheck": "turbo run typecheck",
     "dev": "turbo run dev",
     "clean": "turbo run clean",
     "release": "turbo run build --filter=./packages/* && changeset publish"
   },
   "devDependencies": {
-    "@changesets/cli": "^2.29.4",
-    "turbo": "^2.3.3",
-    "typescript": "^5.7.3"
+    "@changesets/cli": "^2.31.1",
+    "turbo": "^2.10.8",
+    "typescript": "^6.0.3"
   },
   "packageManager": "pnpm@10.30.1"
 }

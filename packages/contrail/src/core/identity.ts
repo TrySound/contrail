@@ -1,7 +1,8 @@
 import type { Did } from "@atcute/lexicons";
-import type { Database, Logger } from "./types";
+import type { ContrailConfig, Database, Logger, Statement } from "./types";
 import { isDid, isHandle } from "@atcute/lexicons/syntax";
 import { resolvePDS } from "./client";
+import { labelBackfillEnqueueStatements } from "./moderation";
 
 const STALE_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -12,13 +13,19 @@ export interface Identity {
   resolved_at: number;
 }
 
-async function saveIdentity(db: Database, identity: Identity): Promise<void> {
-  await db
+async function saveIdentity(db: Database, identity: Identity, config?: ContrailConfig): Promise<void> {
+  const statement = db
     .prepare(
-      "INSERT INTO identities (did, handle, pds, resolved_at) VALUES (?, ?, ?, ?) ON CONFLICT(did) DO UPDATE SET handle = excluded.handle, pds = excluded.pds, resolved_at = excluded.resolved_at"
+      // COALESCE so a null handle/pds from a partial resolution never clobbers
+      // a previously-resolved value (e.g. refreshStaleIdentities passes through
+      // a null handle when slingshot omits it). A fresh non-null value still
+      // overwrites — handle changes apply normally.
+      "INSERT INTO identities (did, handle, pds, resolved_at) VALUES (?, ?, ?, ?) ON CONFLICT(did) DO UPDATE SET handle = COALESCE(excluded.handle, identities.handle), pds = COALESCE(excluded.pds, identities.pds), resolved_at = excluded.resolved_at"
     )
-    .bind(identity.did, identity.handle, identity.pds, identity.resolved_at)
-    .run();
+    .bind(identity.did, identity.handle, identity.pds, identity.resolved_at);
+  const queued = labelBackfillEnqueueStatements(db, [identity.did], config, true);
+  if (queued.length) await db.batch([...queued, statement]);
+  else await statement.run();
 }
 
 function isStale(resolvedAt: number): boolean {
@@ -28,22 +35,24 @@ function isStale(resolvedAt: number): boolean {
 async function fetchAndSave(
   db: Database,
   identifier: string,
-  cached?: Identity | null
+  cached?: Identity | null,
+  config?: ContrailConfig,
 ): Promise<Identity> {
-  const resolved = await resolvePDS(identifier);
+  const resolved = await resolvePDS(identifier, config);
   const identity: Identity = {
     did: resolved?.did ?? identifier,
     handle: resolved?.handle ?? cached?.handle ?? null,
     pds: resolved?.pds ?? cached?.pds ?? null,
     resolved_at: Date.now(),
   };
-  await saveIdentity(db, identity);
+  await saveIdentity(db, identity, config);
   return identity;
 }
 
 export async function resolveIdentity(
   db: Database,
-  did: Did
+  did: Did,
+  config?: ContrailConfig,
 ): Promise<Identity> {
   const cached = await db
     .prepare("SELECT did, handle, pds, resolved_at FROM identities WHERE did = ?")
@@ -52,12 +61,13 @@ export async function resolveIdentity(
 
   if (cached && !isStale(cached.resolved_at)) return cached;
 
-  return fetchAndSave(db, did, cached);
+  return fetchAndSave(db, did, cached, config);
 }
 
 export async function resolveIdentities(
   db: Database,
-  dids: string[]
+  dids: string[],
+  config?: ContrailConfig,
 ): Promise<Map<string, Identity>> {
   const map = new Map<string, Identity>();
   if (dids.length === 0) return map;
@@ -80,7 +90,7 @@ export async function resolveIdentities(
   for (const did of dids) {
     if (map.has(did) || !isDid(did)) continue;
     try {
-      const identity = await fetchAndSave(db, did);
+      const identity = await fetchAndSave(db, did, undefined, config);
       map.set(did, identity);
     } catch {
       // Silently skip unresolvable identities
@@ -92,7 +102,8 @@ export async function resolveIdentities(
 
 export async function resolveActor(
   db: Database,
-  actor: string
+  actor: string,
+  config?: ContrailConfig,
 ): Promise<string | null> {
   if (isDid(actor)) return actor;
   if (!isHandle(actor)) return null;
@@ -106,7 +117,7 @@ export async function resolveActor(
   if (cached && !isStale(cached.resolved_at)) return cached.did;
 
   // Resolve via slingshot
-  const resolved = await resolvePDS(actor);
+  const resolved = await resolvePDS(actor, config);
   if (!resolved?.did || !isDid(resolved.did)) return null;
 
   await saveIdentity(db, {
@@ -114,7 +125,7 @@ export async function resolveActor(
     handle: resolved.handle ?? actor,
     pds: resolved.pds ?? null,
     resolved_at: Date.now(),
-  });
+  }, config);
 
   return resolved.did;
 }
@@ -126,20 +137,29 @@ export async function resolveActor(
  * partial rows confuse the rest of the pipeline). PDS column is left
  * untouched; it gets refreshed lazily via `getPDS` / next slingshot resolve.
  */
+export function applyIdentityEventStatement(
+  db: Database,
+  did: string,
+  handle: string,
+  updatedAt = Date.now(),
+): Statement {
+  return db
+    .prepare("UPDATE identities SET handle = ?, resolved_at = ? WHERE did = ?")
+    .bind(handle, updatedAt, did);
+}
+
 export async function applyIdentityEvent(
   db: Database,
   did: string,
   handle: string
 ): Promise<void> {
-  await db
-    .prepare("UPDATE identities SET handle = ?, resolved_at = ? WHERE did = ?")
-    .bind(handle, Date.now(), did)
-    .run();
+  await applyIdentityEventStatement(db, did, handle).run();
 }
 
 export async function refreshStaleIdentities(
   db: Database,
-  dids: string[]
+  dids: string[],
+  config?: ContrailConfig,
 ): Promise<void> {
   if (dids.length === 0) return;
 
@@ -169,7 +189,7 @@ export async function refreshStaleIdentities(
 
   for (const did of toRefresh) {
     try {
-      await fetchAndSave(db, did);
+      await fetchAndSave(db, did, undefined, config);
     } catch {
       // Silently skip unresolvable identities
     }

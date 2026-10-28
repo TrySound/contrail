@@ -1,4 +1,5 @@
 import type { Database, RecordRow } from "../types";
+import { extractSelfLabels, type SelfLabel } from "../labels/self";
 
 export interface FormattedRecord {
   uri: string;
@@ -8,6 +9,8 @@ export interface FormattedRecord {
   collection: string;
   rkey: string;
   time_us: number;
+  /** Author-declared metadata, independent of accepted labelers. */
+  selfLabels?: SelfLabel[];
   [key: string]: unknown;
 }
 
@@ -20,6 +23,7 @@ export function formatRecord(row: RecordRow): FormattedRecord {
       value = row.record;
     }
   }
+  const selfLabels = extractSelfLabels(value);
   return {
     uri: row.uri,
     cid: row.cid,
@@ -28,7 +32,7 @@ export function formatRecord(row: RecordRow): FormattedRecord {
     collection: row.collection,
     rkey: row.rkey,
     time_us: row.time_us,
-    ...(row.space ? { space: row.space } : {}),
+    ...(selfLabels.length ? { selfLabels } : {}),
   };
 }
 

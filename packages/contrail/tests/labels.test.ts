@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { createSqliteDatabase } from "../src/adapters/sqlite";
-import { initSchema } from "../src/core/db/schema";
-import { resolveConfig, type ContrailConfig } from "../src/core/types";
-import { applyLabels } from "../src/core/labels/apply";
-import { hydrateLabels } from "../src/core/labels/hydrate";
-import { selectAcceptedLabelers } from "../src/core/labels/select";
-import type { LabelsConfig } from "../src/core/labels/types";
+import { initSchema } from "../src/index";
+import { resolveConfig, type ContrailConfig } from "../src/index";
+import { applyLabels } from "../src/index";
+import { hydrateLabels } from "../src/index";
+import { selectAcceptedLabelers } from "../src/index";
+import type { LabelsConfig } from "../src/index";
 
 const SRC_A = "did:plc:labelerA";
 const SRC_B = "did:plc:labelerB";
@@ -65,6 +65,17 @@ describe("labels: applyLabels + hydrate", () => {
     ]);
     const out = await hydrateLabels(db, [URI_X], [SRC_A]);
     expect(out[URI_X] ?? []).toHaveLength(0);
+  });
+
+  it("rejects forward-dated labels beyond clock skew", async () => {
+    const { db } = await setup();
+    const kept = await applyLabels(db, [
+      { src: SRC_A, uri: URI_X, val: "skewed", cts: ctsIso(60) },
+      { src: SRC_A, uri: URI_X, val: "future", cts: ctsIso(3600) },
+    ]);
+    expect(kept).toBe(1);
+    const out = await hydrateLabels(db, [URI_X], [SRC_A]);
+    expect(out[URI_X]?.map((l) => l.val)).toEqual(["skewed"]);
   });
 
   it("re-positive after a negation wins again", async () => {

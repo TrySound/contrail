@@ -1,3 +1,4 @@
+import type { Nsid } from "@atcute/lexicons/syntax";
 import type { Context, Hono } from "hono";
 import type {
   ContrailConfig,
@@ -6,6 +7,7 @@ import type {
   FeedTargetConfig,
 } from "../types";
 import { getDialect } from "../dialect";
+import { isAccountHidden } from "../moderation";
 import {
   DEFAULT_FOLLOW_SHORT,
   feedTargetMaxItems,
@@ -16,6 +18,7 @@ import {
 import { resolveActor } from "../identity";
 import { backfillUser } from "../backfill";
 import { runPipeline } from "./collection";
+import type { ServiceAuthGate } from "../service-auth";
 
 const BACKFILL_TIMEOUT_MS = 30_000;
 const BACKFILL_REQUEST_TIMEOUT_MS = 10_000;
@@ -118,7 +121,7 @@ async function runFeedBackfill(
     const inserted = await backfillUser(
       db,
       actor,
-      followCfg.collection,
+      followCfg.collection ?? followShort,
       Date.now() + BACKFILL_TIMEOUT_MS,
       config,
       {
@@ -223,7 +226,8 @@ async function maybeBackfillFeed(
 export function registerFeedRoutes(
   app: Hono,
   db: Database,
-  config: ContrailConfig
+  config: ContrailConfig,
+  serviceAuth?: ServiceAuthGate | null
 ): void {
   if (!config.feeds) return;
 
@@ -243,9 +247,25 @@ export function registerFeedRoutes(
       return c.json({ error: "Unknown feed" }, 404);
     }
 
-    const did = await resolveActor(db, actor);
-    if (!did) return c.json({ error: "Could not resolve actor" }, 400);
+    const method = `${ns}.getFeed` as Nsid;
+    const authorization = serviceAuth?.protects("getFeed")
+      ? await serviceAuth.authorize(c.req.raw, method)
+      : null;
+    if (authorization?.response) return authorization.response;
 
+    const did = await resolveActor(db, actor, config);
+    if (!did) return c.json({ error: "Could not resolve actor" }, 400);
+    if (
+      authorization?.principal?.issuer !== undefined &&
+      authorization.principal.issuer !== did
+    ) {
+      return c.json(
+        { error: "feed actor must match the service-auth issuer" },
+        403
+      );
+    }
+
+    if (await isAccountHidden(db, did)) return c.json({ records: [] });
     await maybeBackfillFeed(c, db, config, did, feedName, feedConfig);
 
     const targets = feedConfig.targets.map(normalizeFeedTarget);
@@ -285,8 +305,10 @@ export function registerFeedRoutes(
     };
 
     try {
-      const result = await runPipeline(db, config, requestedShort, pipelineParams, source);
-      return c.json(result);
+      const result = await runPipeline(db, config, requestedShort, pipelineParams, source, c.req.raw.headers);
+      const { labelersApplied, ...body } = result;
+      if (labelersApplied?.length) c.header("atproto-content-labelers", labelersApplied.join(","));
+      return c.json(body);
     } catch (e: any) {
       if (e.message === "Could not resolve actor") {
         return c.json({ error: e.message }, 400);

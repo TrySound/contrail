@@ -36,7 +36,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22.14
+          node-version: 22.15
           cache: 'pnpm'
           registry-url: 'https://registry.npmjs.org'
 
@@ -51,6 +51,9 @@ jobs:
 
       - name: Run tests
         run: pnpm test
+
+      - name: Test built Worker in workerd
+        run: pnpm test:workerd
 
       - name: Create Release Pull Request or Publish to npm
         uses: changesets/action@v1

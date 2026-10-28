@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { sqliteDialect, postgresDialect, buildFtsSchema, ftsQueryClause } from "../src/core/dialect";
+import { sqliteDialect, postgresDialect, buildFtsSchema, ftsQueryClause } from "../src/index";
 import { createSqliteDatabase } from "../src/adapters/sqlite";
 
 describe("sqliteDialect", () => {
@@ -43,6 +43,43 @@ describe("Database.dialect", () => {
     const db = createSqliteDatabase(":memory:");
     expect(db.dialect).toBeDefined();
     expect(db.dialect.recordColumnType).toBe("TEXT");
+  });
+
+  it("serializes concurrent SQLite batches without nested transactions", async () => {
+    const db = createSqliteDatabase(":memory:");
+    await db.prepare("CREATE TABLE concurrent_test (value INTEGER UNIQUE)").run();
+
+    await Promise.all(
+      Array.from({ length: 50 }, (_, value) =>
+        db.batch([
+          db
+            .prepare("INSERT INTO concurrent_test (value) VALUES (?)")
+            .bind(value),
+        ])
+      )
+    );
+
+    const row = await db
+      .prepare("SELECT COUNT(*) AS count FROM concurrent_test")
+      .first<{ count: number }>();
+    expect(row?.count).toBe(50);
+  });
+
+  it("rolls back a failed SQLite batch", async () => {
+    const db = createSqliteDatabase(":memory:");
+    await db.prepare("CREATE TABLE values_test (value TEXT UNIQUE)").run();
+
+    await expect(
+      db.batch([
+        db.prepare("INSERT INTO values_test (value) VALUES (?)").bind("one"),
+        db.prepare("INSERT INTO values_test (value) VALUES (?)").bind("one"),
+      ])
+    ).rejects.toThrow();
+
+    const row = await db
+      .prepare("SELECT COUNT(*) AS count FROM values_test")
+      .first<{ count: number }>();
+    expect(row?.count).toBe(0);
   });
 });
 
@@ -103,11 +140,14 @@ describe("indexExpression", () => {
 });
 
 describe("FTS schema generation", () => {
-  it("sqlite generates virtual table", () => {
+  it("sqlite generates a unique URI map and content-only virtual table", () => {
     const stmts = buildFtsSchema(sqliteDialect, "records_community_lexicon_calendar_event", ["name", "description"]);
-    expect(stmts).toHaveLength(1);
-    expect(stmts[0]).toContain("CREATE VIRTUAL TABLE");
-    expect(stmts[0]).toContain("USING fts5");
+    expect(stmts).toHaveLength(2);
+    expect(stmts[0]).toContain("fts_community_lexicon_calendar_event_rows");
+    expect(stmts[0]).toContain("uri TEXT NOT NULL UNIQUE");
+    expect(stmts[1]).toContain("CREATE VIRTUAL TABLE");
+    expect(stmts[1]).toContain("USING fts5(content)");
+    expect(stmts[1]).not.toContain("uri UNINDEXED");
   });
 
   it("postgres generates tsvector column + GIN index", () => {
@@ -121,7 +161,8 @@ describe("FTS schema generation", () => {
 describe("FTS query clause", () => {
   it("sqlite uses FTS5 join and MATCH", () => {
     const clause = ftsQueryClause(sqliteDialect, "records_community_lexicon_calendar_event");
-    expect(clause.join).toContain("JOIN fts_");
+    expect(clause.join).toContain("JOIN fts_community_lexicon_calendar_event_rows");
+    expect(clause.join).toContain("fts.rowid = fts_rows.id");
     expect(clause.condition).toContain("MATCH");
     expect(clause.orderExpr).toBe("fts.rank");
   });

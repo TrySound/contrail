@@ -1,11 +1,398 @@
 # @atmo-dev/contrail
 
+## 0.25.0
+
+### Minor Changes
+
+- 2871a34: Prune only the feeds an ingest batch grew. Before, ingesting any feed-mutating record set off a prune of the next 500 actors' feeds, whether or not those feeds had changed. Now ingest looks up the followers of the batch's authors, adds the batch's new or repointed followers, and prunes just those feeds. Constellation follower backfill prunes the feeds it fills. The rolling sweep still runs as the recovery pass, and when a batch grows more feeds than one slice's budget.
+
+  New exports: `pruneGrownFeeds` (with its `GrownFeedPruneResult` type) and `runGrownFeedPrune`.
+
+  **breaking.** `runGatedFeedPrune` now takes the applied events instead of a `feedTouched` boolean. If you call it yourself, pass the events instead of the flag:
+
+  ```ts
+  // before
+  await runGatedFeedPrune(
+    db,
+    config,
+    applied.some((e) => feedMutatingNsids.has(e.collection))
+  );
+  // after
+  await runGatedFeedPrune(db, config, applied);
+  ```
+
+## 0.24.0
+
+### Minor Changes
+
+- b9502a2: Expose canonical author declarations as a separate optional `selfLabels` field on record, profile, feed, relation/reference and private moderator preview views. Normalize current record metadata without database writes or extra queries; self-labels never enforce visibility or depend on accepted labelers. Export `extractSelfLabels` and `SelfLabel`, update generated view contracts, and bundle the standard label definitions as an offline fallback for complete service/type-generation bundles.
+- bcd84f8: Add moderation: public moderator action records (`tools.atmo.moderation.action`) with overrides, per-source label trust (`enforce`, `values`, `subjects: "known"` with bounded first-seen `queryLabels` backfill), enforced SQL visibility, private method-bound report endpoints, and Jetstream v2 account lifecycle state.
+
+  - Enforcement uses an indexed, materialized `moderation_hidden` table, updated in the same transaction as each label, action, override or account change. Built-in queries, hydration, feeds, search, profiles and stored relation counts exclude hidden actors and records. Custom SQL can use the exported `visibleRecordSql(alias)`.
+  - Account lifecycle applies to every instance, with or without moderation config: deactivated, deleted, taken-down and suspended actors this instance holds data for are hidden, and reactivation restores their retained data. Scheduled drains gain a separate `maxAccountUpdates` budget (default 500).
+  - Moderator and label-source policy is tracked outside the schema fingerprint and applied by a bounded, resumable job, so policy edits never rebuild search indexes. `init()` accepts `deferModerationPolicyJob` to leave that job to moderation cycles; `createWorker` uses it for requests.
+  - Reports can live in stable instance-owned storage (`reportsDb`, `createWorker({ reportsBinding })`). Client helpers for reports, moderator inboxes and action records are available from `@atmo-dev/contrail/moderation`. Account-report previews include CID-filtered labels on displayed profile records, and bounded request bodies accommodate valid reasons including JSON escaping.
+  - Moderator reconciliation bounds local lookups and shares its mutation budget between updates and missed deletions. Large local deletion backlogs drain over repeated complete fresh listings.
+  - Label `cts` values more than five minutes in the future are rejected, and label creation timestamps keep millisecond precision.
+  - Known-subject label backfill restarts pagination after an explicit `InvalidCursor` error; transient failures keep the saved cursor.
+
+  Schema version 17 adds the moderation, lifecycle and report tables and converts stored label creation timestamps from seconds to milliseconds exactly once. Stop older Contrail processes before upgrading, and run `contrail lexicons generate` after enabling moderation.
+
+### Patch Changes
+
+- 96f336e: Fix `contrail append-scheduled` for adapter-cloudflare 8 / SvelteKit 3 Worker output. The command now accesses the Worker's public default export through a live ESM self-import instead of assuming a generated variable named `worker_default`. Older bundled default exports remain supported, and no extra files are added to the public assets directory.
+
+  Preserve authenticated cron forwarding and existing Worker handlers. Safely quote custom cron paths and secret environment-variable names in the generated JavaScript.
+
+- 4197137: Reduce unrelated-data reads during record deletion and equality-filtered listing. Feed items now have a URI index, and equality-queryable fields use `(field, time_us DESC, uri ASC)` indexes instead of redundant single-field indexes. Range indexes are unchanged. Chronological cursors expose their time bound so filtered deep pages can seek past newer matches while preserving URI tie-breaking and moderation visibility.
+
+  For an unchanged configuration, the preceding schema upgrades indexes in place without rebuilding FTS, recounting records, or resetting records and source progress. Replacement indexes are created before old indexes are removed, and interrupted upgrades can retry. Index construction incurs one-time database work; the feed URI index adds ongoing index writes per feed entry.
+
+- dc087b1: Pump external labelers concurrently during scheduled ingestion so a long-lived first stream cannot starve later sources. Include endpoint resolution in each cycle's time budget. Honor explicit labeler endpoint overrides when resuming cursor-only checkpoints or replacing a cached endpoint.
+
+  With `backfill: false`, a quiet labeler whose first "from now" connection saw no frame no longer skips labels issued between scheduled cycles: the next cycle replays from the beginning, keeping only labels created after that first connection (allowing five minutes of clock skew). The cutoff persists across partial replay cycles and reconnects, even after a nonzero cursor is saved.
+
+## 0.23.0
+
+### Minor Changes
+
+- e050b0b: Add verified Lexicon-prefix initialization with CID-pinned dependency bundles, automatic safe query fields, and optional reference/relation prompts.
+
+## 0.22.1
+
+### Patch Changes
+
+- 825aa85: Keep optional CPU telemetry and Jetstream v2 cursor preflights compatible with Cloudflare Workers. Exposed but unimplemented `process.cpuUsage` methods now degrade to `null`, and cursor probes use a receiver-safe fetch call with fail-closed manual redirect handling.
+
+## 0.22.0
+
+### Minor Changes
+
+- b851583: Switch scheduled and persistent live ingestion to Jetstream v2 using the official `@bsky/jetstream` client. Live cursors now use instance-local sequence numbers, one normalized v2 service is durably pinned to each generation, legacy timestamp cursors transition atomically into the seq domain, and existing PDS/Alluvium historical acquisition remains unchanged. Alluvium bootstrap now has a separate `sourceUrl`/`--alluvium-source-url` for its legacy v1 manifest identity. Unscoped `getCursor` responses now return `{ cursor }`; ordered-source responses retain their opaque `{ source, epoch, cursor }` position. The minimum supported Node.js version is now 22.15.
+
+### Patch Changes
+
+- 28f94c9: Allow config-backed `contrail dev` and `contrail connect` to continue after confirmation when configured Lexicons cannot yet be resolved, omitting incomplete schema closures and generating untyped values for affected records.
+
+## 0.21.2
+
+### Patch Changes
+
+- 60e7b3a: Run Atcute's Lexicon CLI with an explicit module redirect for its byte-array helper so `contrail dev` works with pnpm's strictly isolated global package links.
+
+## 0.21.1
+
+### Patch Changes
+
+- de3f48a: Declare the byte-array helper used by Atcute's Lexicon CLI so `contrail dev` can resolve Lexicons in isolated `pnpx` installs.
+
+## 0.21.0
+
+### Minor Changes
+
+- 2202c5e: Add `contrail init [directory]` to create a ready-to-run starter `contrail.config.ts` without overwriting an existing config.
+
+## 0.20.1
+
+### Patch Changes
+
+- 92fedb0: Bound scheduled Jetstream cycles by retained candidate count, distinct identity updates, and serialized bytes; batch identity writes; drop exact transport observations before admission; preserve same-timestamp observations and durable actor scope across capped restarts; capture empty initial cursors safely; reject rollback-prone endpoint pools in scheduled mode; and emit one bounded aggregate cycle summary.
+
+## 0.20.0
+
+### Minor Changes
+
+- bc2f4c1: Add the first transactional projection change-log milestone. Optional static consumer definitions now create a fresh-generation log, durable registrations, and collection/phase coverage ledger. Winning logical URI changes append compact references atomically with canonical records, derived projections, tombstones, and source checkpoints; disabled configurations create no log tables or append writes.
+
+  Harden all projection writers with transaction-time predecessor guards and bounded conflict retries so overlapping cron, persistent, notify, and backfill work cannot commit stale canonical or derived state. Add independent bounded consumer leases, filtered/coalesced claims, set-oriented current-state hydration, CAS acknowledgement, failure backoff, lease renewal, private status, and manual retry APIs. Add crash-safe current-state snapshot/tail/activation bootstrap, safe additive consumers over existing coverage, required-consumer readiness gates, consumer-aware bounded pruning, and audited explicit skip operations. Current-state consumers require both projection phases, and candidate destination tokens are scoped strictly to bootstrap deliveries. Private `contrail changes` commands cover status, retry, prune, and skip. Add fair bounded Worker delivery after ingestion/retries, best-effort immediate notify wakes, runtime handler validation, deadline cancellation, isolated retry scheduling, and a persistent delivery supervisor. Include an app-owned atmo.rsvp Meilisearch reference consumer with task-success acknowledgement, hidden/delete convergence, candidate-index snapshot/tail bootstrap, and idempotent generation-marker activation. Enabling or expanding log coverage on a populated generation fails closed pending explicit quiet-boundary migration tooling.
+
+## 0.19.0
+
+### Minor Changes
+
+- 2e01ffe: Correct service auth to use an exact fragmented DID service audience and deterministic least-privilege OAuth RPC scope. Discovery, provider locks, generated clients, and DID documents now distinguish the base service DID from the JWT audience and pin the protected method set. Existing consumers must reconnect, regenerate, and reauthorize; old plain-DID/wildcard OAuth grants are not compatible.
+
+## 0.18.0
+
+### Minor Changes
+
+- 4b420c6: Remove whole-service contract digests with clean version-2 service manifests and provider locks. Anonymous generated clients now call providers without a discovery preflight, while content-addressed Lexicon verification and service-auth discovery remain. `contrail connect` now accepts owned config files or directories to generate a local typed API without changing the deployment lock, generated clients expose local/target factories, and `contrail dev` no longer writes consumer connection artifacts.
+
+## 0.17.1
+
+### Patch Changes
+
+- 0039ab2: Replace SQLite and D1 full-text-search URI scans with an ordinary unique URI-to-rowid mapping and direct FTS5 rowid mutations. Existing URI-bearing FTS tables are rebuilt transactionally from canonical records, stale-fingerprint projections are rebuilt and verified before acceptance, duplicate search rows are removed, and incremental/rebuild whitespace normalization now agrees. PostgreSQL search remains unchanged.
+
+## 0.17.0
+
+### Minor Changes
+
+- a5ebbba: Add an optional experimental Alluvium fresh-generation adapter plus D1 and SQLite `contrail backfill --alluvium` workflows. Add a zero-configuration SQLite `contrail dev` service with automatic Lexicon resolution, backfill, bounded live ingestion, localhost public-service discovery, stable local consumer lock/type/client generation, and loopback-only open notify without fictitious service auth. Add per-collection `validate: true`, bound to the exact generated runtime bundle with shared CID/strictness knobs; omitted or false collections remain unvalidated. Auto-added profile/follow collections no longer create generic public methods. The Alluvium adapter pins compatible version-1 collection manifests, verifies immutable gzip objects before projection, resumes multipart bases, replays archived puts/deletes, and atomically seeds the normal live cursor at the archive boundary under an operator-owned continuity epoch.
+
+## 0.16.0
+
+### Minor Changes
+
+- 9baa877: Add discoverable AT Protocol service authentication, unified authenticated clients for PDS and provider methods, and automatic authoritative update notifications after tracked record writes.
+- 6d6c750: Restore deterministic query-Lexicon generation from Contrail config, add drift checking, and orchestrate source pulling and TypeScript generation through Atcute.
+- aad30e2: Add self-describing anonymous read-through services with verified contracts, durable ordered-source positions, cacheable Lexicon discovery, and a safe `contrail connect` workflow for typed independent clients.
+
+## 0.15.0
+
+### Minor Changes
+
+- e5a3e49: Add source-neutral snapshot and ordered-change contracts, capture-first bootstrap orchestration, and a database-backed target that commits projection progress atomically for fresh generations. Persist source continuity epochs and the capture mark before snapshot preparation. Add resumable, host-aware relay/PDS snapshots plus source-confirmed Jetstream marks, bounded ordered replay, retention-expiry detection, required source-semantics gates, durable bounded failure categories, aggregate candidate verification, and an immutable deployment-tuple registry with compare-and-swap activation and rollback retention.
+
+## 0.14.1
+
+### Patch Changes
+
+- 2826860: Remove the best-effort post-commit sink API. Contrail now limits core ingestion to transactional SQL projection instead of invoking external callbacks after live or historical commits.
+
+## 0.14.0
+
+### Minor Changes
+
+- 0b36208: Add opt-in strict runtime Lexicon validation and canonical DAG-CBOR CID verification to the shared ingestion path. Route profile enrichment and Constellation follows through the same admission, source-ordering, projection, and sink behavior; expose bounded aggregate rejection diagnostics; and keep bulk backfill efficient by prefiltering out-of-scope dependencies, treating successful PDS pages as authoritative observations, and flushing diagnostics once per run.
+
+## 0.13.1
+
+### Patch Changes
+
+- b4a0125: Add durable source ordering metadata and tombstones so stale creates, updates, and deletes cannot replace newer state. Commit live Jetstream cursors atomically with projection, checkpoint only yielded events, preserve failed persistent batches, separate record time from source time, migrate existing rows to version metadata, and update supported dependencies.
+
+## 0.13.0
+
+### Minor Changes
+
+- 8c5cea6: Collapse Contrail into one public package and one AppView implementation. Remove the spaces, authority, record-host, community, realtime, sync, and custom Lexicon-tooling products. Route Jetstream, persistent, backfill, and immediate synchronization records through the shared `ingestRecords` admission and projection path. Make materialized relation counts converge when children arrive before parents, and prevent transient PDS failures from being interpreted as authoritative deletions. Keep dependent-subject filtering scoped to dependent collections and restore typed example XRPC clients with Atcute's generator. Preserve `node:sqlite` in the published adapter, make all query and search cursors stable across tied and typed/null rows, use Worker-safe cursor encoding, and bound the complete notify resolution/fetch/body operation. Admit newly discovered actors and their dependent mutations as one batch, and keep subject decisions mutation-local so deletes always pass. Existing pagination cursors from 0.12 are intentionally invalidated by the new stable cursor format; clients should discard persisted cursor tokens when upgrading. Local development now launches Wrangler through the workspace's pnpm installation instead of invoking `npx`.
+- a8a2b45: Remove the incomplete `refresh` PDS sweep from the public API, CLI, Wrangler helpers, examples, and documentation. Normal ingestion resumes from its saved source cursor; deployments whose source history has expired should rebuild into a fresh database rather than rely on partial reconciliation that cannot safely infer deletions.
+
+### Patch Changes
+
+- ad9557c: Keep failed PDS and relay work pending with bounded retries instead of marking account rows complete. Retry due PDS accounts automatically in small scheduled slices with persisted exponential backoff up to 48 hours, a ten-scheduled-attempt limit, and an overlap lease. Add durable backfill and discovery state to the JSON overview and `/status` endpoint, including running/complete state, retry timing, per-collection progress, and mutually exclusive complete/pending/retrying/failed account counts.
+- c74aec5: Group historical fetches by PDS with bounded per-host concurrency, stream resolved identities directly into host workers, cancel timed-out requests, defer failed initial accounts to scheduled retries, atomically commit canonical pages with cursor checkpoints, and rebuild FTS and relation counts with set-based SQL after canonical bulk loading. SQLite batches now use synchronous transactions so concurrent backfill work cannot overlap or partially commit.
+
+## 0.12.2
+
+### Patch Changes
+
+- Updated dependencies [32ace91]
+  - @atmo-dev/contrail-appview@0.12.2
+  - @atmo-dev/contrail-base@0.12.2
+  - @atmo-dev/contrail-authority@0.12.2
+  - @atmo-dev/contrail-record-host@0.12.2
+
+## 0.12.1
+
+### Patch Changes
+
+- Updated dependencies [833a659]
+- Updated dependencies [74a2d3d]
+- Updated dependencies [9e01ada]
+- Updated dependencies [9894787]
+  - @atmo-dev/contrail-appview@0.12.1
+  - @atmo-dev/contrail-base@0.12.1
+  - @atmo-dev/contrail-record-host@0.12.1
+  - @atmo-dev/contrail-authority@0.12.1
+
+## 0.12.0
+
+### Patch Changes
+
+- Updated dependencies [91278c6]
+- Updated dependencies [6b34d87]
+  - @atmo-dev/contrail-appview@0.12.0
+  - @atmo-dev/contrail-base@0.12.0
+  - @atmo-dev/contrail-authority@0.12.0
+  - @atmo-dev/contrail-record-host@0.12.0
+
+## 0.11.0
+
+### Patch Changes
+
+- Updated dependencies [1aeee9a]
+  - @atmo-dev/contrail-appview@0.11.0
+  - @atmo-dev/contrail-base@0.11.0
+  - @atmo-dev/contrail-authority@0.11.0
+  - @atmo-dev/contrail-record-host@0.11.0
+
+## 0.10.0
+
+### Patch Changes
+
+- Updated dependencies [89aee1b]
+  - @atmo-dev/contrail-appview@0.10.0
+  - @atmo-dev/contrail-base@0.10.0
+  - @atmo-dev/contrail-authority@0.10.0
+  - @atmo-dev/contrail-record-host@0.10.0
+
+## 0.9.1
+
+### Patch Changes
+
+- Updated dependencies [4c8fedb]
+  - @atmo-dev/contrail-base@0.9.1
+  - @atmo-dev/contrail-appview@0.9.1
+  - @atmo-dev/contrail-authority@0.9.1
+  - @atmo-dev/contrail-record-host@0.9.1
+
+## 0.9.0
+
+### Patch Changes
+
+- Updated dependencies [8f0b87e]
+  - @atmo-dev/contrail-appview@0.9.0
+  - @atmo-dev/contrail-base@0.9.0
+  - @atmo-dev/contrail-authority@0.9.0
+  - @atmo-dev/contrail-record-host@0.9.0
+
+## 0.8.0
+
+### Minor Changes
+
+- bea0dd2: A third community-creation mode: **provision**. alongside the existing `adopt` (caller already has a `did:plc`) and `mint` (caller wants a DID but brings their own PDS) modes, contrail can now provision a community on a stock `@atproto/pds` end-to-end — minting the `did:plc`, creating and activating the PDS account, generating an app password, and persisting credentials so the existing `community.putRecord` / `.deleteRecord` publish path keeps working. contrail never holds PDS admin credentials.
+
+  **`xrpc/{ns}.community.provision`** runs the five-step PLC + PDS dance (key generation → PLC genesis → `createAccount` → `getRecommendedDidCredentials` + signed PLC update op → `activateAccount`), persists each step in a new `provision_attempts` table so a partially-failed attempt can be resumed, mints an app password, and seeds the session cache.
+
+  **`contrail-community reap [--all-stuck] [--older-than <minutes>] [--db <url>] [--dry-run]`** new CLI (a bin shipped by `@atmo-dev/contrail-community`) that cleans up provision attempts which didn't reach `status='activated'` by tombstoning their PLC entries. `--dry-run` is the default; per-row confirmation is required for live reaping unless `--all-stuck` is given. `--all-stuck` only acts on rows idle at least `--older-than` minutes (default 30) so a bulk run can't tombstone an in-flight provision. Runs against the Cloudflare D1 binding by default, or against the decoupled Postgres index when `--db`/`DATABASE_URL` is set. It ships as a contrail-community bin because the PR #30 package split removed contrail's edge into community code: under pnpm's isolated `node_modules` the core `contrail` CLI can't resolve `@atmo-dev/contrail-community`, so `contrail reap` only registers in hoisted installs where both packages sit together.
+
+  custody model: the caller supplies a `rotationKey` and that key sits at `rotationKeys[0]` — the highest-priority rotation slot on the resulting DID. contrail generates a subordinate keypair and persists it (AES-GCM-encrypted under `masterKey`) at `rotationKeys[1]`, so it can submit later PLC ops on the community's behalf — most importantly the post-activation PLC update during provision, and the tombstone op that `reap` issues to clean up stuck DIDs.
+
+  the caller's key dominates: PLC's 72-hour nullification window means any op contrail signs with its subordinate key can be overridden within 72h by an op signed with the caller's key. with this caveat: a tombstone is irrevocable. a malicious or compromised contrail instance could tombstone any DID it provisioned. there is no managed code path, no shared rotation, and `rootCredentials` are returned to the caller in the response so they can also be persisted out-of-band.
+
+  what you need to configure / know:
+
+  - new `community` config block: `masterKey` (32-byte AES-GCM envelope key for the encrypted credential columns), `allowedProvisionPdsEndpoints` (URL-origin matching, collapses scheme case / default ports / trailing slash / IDN), optional `plcDirectory` override.
+
+  - **provisioning fails closed.** When `allowProvisioning` is true, `allowedProvisionPdsEndpoints` MUST be non-empty — a missing/empty allowlist no longer means "accept any PDS" (that was a fail-open hole: any caller could have a PLC genesis op signed by Contrail's rotation key against an attacker-chosen PDS). To deliberately accept any endpoint, set the separate, loud `allowAnyProvisionPdsEndpoint: true`. The field was renamed from `allowedPdsEndpoints` to make clear it gates _provisioning_ only, not which PDSes Contrail reads/indexes.
+
+  - new tables `provision_attempts` and `community_credentials`. credentials are stored AES-GCM-encrypted under that key; lose the key, lose the ability to mint sessions for previously-provisioned communities.
+
+### Patch Changes
+
+- Updated dependencies [d7e0936]
+  - @atmo-dev/contrail-base@0.8.0
+  - @atmo-dev/contrail-appview@0.8.0
+  - @atmo-dev/contrail-authority@0.8.0
+  - @atmo-dev/contrail-record-host@0.8.0
+
+## 0.7.0
+
+### Minor Changes
+
+- 7e3145b: Spaces refactor: split authority + record host into independently runnable
+  roles, add space credentials, extract community into its own package.
+
+  **Breaking — config shape**
+
+  `spaces` is no longer flat — split into `authority` and `recordHost`:
+
+  ```ts
+  // before
+  spaces: {
+    type: "com.example.event.space",
+    serviceDid: "did:web:example.com",
+    blobs: { adapter, maxSize },
+  }
+
+  // after
+  spaces: {
+    authority: {
+      type: "com.example.event.space",
+      serviceDid: "did:web:example.com",
+      signing: await generateAuthoritySigningKey(),
+    },
+    recordHost: {
+      blobs: { adapter, maxSize },
+    },
+  }
+  ```
+
+  **Breaking — community moved to its own package**
+
+  Community has been extracted to `@atmo-dev/contrail-community`. Wire it via
+  `createCommunityIntegration`:
+
+  ```ts
+  import { Contrail, resolveConfig } from "@atmo-dev/contrail";
+  import { createCommunityIntegration } from "@atmo-dev/contrail-community";
+
+  const resolved = resolveConfig(config);
+  const communityIntegration = createCommunityIntegration({
+    db,
+    config: resolved,
+  });
+  const contrail = new Contrail({ ...config, communityIntegration });
+  ```
+
+  The community config (`config.community`) stays the same; only the wiring
+  moves. Imports of `CommunityAdapter`, `registerCommunityRoutes`,
+  `reconcile`, etc. now come from `@atmo-dev/contrail-community` instead of
+  `@atmo-dev/contrail`.
+
+  **New — space credentials (`X-Space-Credential`)**
+
+  The space authority issues short-lived ES256 JWTs (default 2h TTL) via
+  `<ns>.space.getCredential` and `refreshCredential`. The record host accepts
+  them on read/write paths in lieu of per-request service-auth JWTs. Skips
+  DID-doc fetches and member checks; the credential's signature is the proof.
+
+  Generate a signing key once at deploy time:
+
+  ```ts
+  import { generateAuthoritySigningKey } from "@atmo-dev/contrail";
+  const signing = await generateAuthoritySigningKey();
+  // Store the JWK; pass to spaces.authority.signing.
+  ```
+
+  **New — binding resolution**
+
+  Verifiers can resolve "which authority signs for this space?" from three
+  sources, in order: local enrollment table, PDS records at
+  `at://<owner>/<type>/<key>`, DID-doc `#atproto_space_authority` service
+  entry, owner-self fallback. Lets user-owned DIDs authorize a third-party
+  authority via a normal PDS write — no DID-doc surgery.
+
+  **New — independent deployments + enrollment**
+
+  The authority and record host can run as separate processes/operators.
+  A new `<ns>.recordHost.enroll` endpoint lets owners (or authorities)
+  register a space onto a host. In-process deployments auto-enroll on
+  `createSpace`; nothing changes for single-instance setups.
+
+  See `docs/10-deployment-shapes.md` for all-in-one / authority-only /
+  host-only configurations and when to choose each.
+
+  **Migration**
+
+  For most deployments running spaces today, the migration is:
+
+  1. Update the config: split `spaces.{type, serviceDid, blobs}` into
+     `spaces.authority.{type, serviceDid}` and `spaces.recordHost.{blobs}`.
+  2. Generate and store an authority signing key
+     (`generateAuthoritySigningKey()`); add to `spaces.authority.signing`.
+  3. If using community: install `@atmo-dev/contrail-community`, build
+     `createCommunityIntegration({ db, config })`, pass via
+     `new Contrail({ communityIntegration })` (or `createApp({ community })`).
+
+  Existing service-auth JWT clients keep working as a fallback path.
+  Migrate to space credentials when convenient — exchange a JWT for a
+  credential once via `getCredential`, then reuse it.
+
+### Patch Changes
+
+- @atmo-dev/contrail-base@0.7.0
+- @atmo-dev/contrail-authority@0.7.0
+- @atmo-dev/contrail-record-host@0.7.0
+- @atmo-dev/contrail-appview@0.7.0
+
 ## 0.6.0
 
 ### Minor Changes
 
 - af24714: Add per-collection `recordFilter` and apply Jetstream `#identity` handle changes during ingest.
-
   - `CollectionConfig.recordFilter?: (record) => boolean` runs against each create/update during ingest; returning false drops the record before it reaches the DB. Useful for narrowing high-volume collections to just the records you care about (e.g. only `app.bsky.feed.post` records mentioning a particular URL). Deletes are not filtered, so they still tear down any record the filter previously let through. Throws are caught, logged, and treated as drops.
   - Jetstream `#identity` events (handle changes) now flow through to the `identities` table via a new `applyIdentityEvent` helper. UPDATE-only — unknown DIDs are no-ops so we don't materialize partial rows lacking PDS.
 

@@ -1,251 +1,803 @@
-import { JetstreamSubscription } from "@atcute/jetstream";
+import {
+  JetstreamLiveSubscription,
+  advanceJetstreamCursor,
+  isJetstreamTimestampCursor,
+} from "./jetstream-live";
 import type { ContrailConfig, IngestEvent, Database, Logger } from "./types";
 import {
+  DEFAULT_JETSTREAMS,
   getCollectionNsids,
   getDependentNsids,
-  shortNameForNsid,
+  jetstreamService,
   buildFeedTargetCaps,
+  optimizeEnabled,
+  optimizeIntervalMs,
+  optimizeAnalysisLimit,
 } from "./types";
-import { initSchema, getLastCursor, saveCursor, applyEvents, pruneFeedItems } from "./db";
-import { refreshStaleIdentities, applyIdentityEvent } from "./identity";
+import { assertJetstreamServiceCompatibility, assertServingSourceCompatibility, initSchema, getLastCursor, loadKnownActorDids, saveJetstreamCursorStatement, saveJetstreamCursorObservationStatements, saveOrderedSourcePositionStatement, sweepFeedItems, pruneGrownFeeds, getFeedPruneCursor, saveFeedPruneCursor, getMetaNumber, setMeta, optimizeDatabase } from "./db";
+import {
+  createIngestEvent,
+  ingestRecords,
+  recordTimeUs,
+  type IngestDropCounts,
+  type IngestWarningSamples,
+} from "./ingest";
+import {
+  refreshStaleIdentities,
+  applyIdentityEventStatement,
+} from "./identity";
 import { backfillFollowersFromConstellation } from "./constellation";
+import {
+  runtimeCpuUsage,
+  type RuntimeCpuUsageProcess,
+} from "./runtime-telemetry";
+
+import { accountUpdateStatements, knownAccountDids, MODERATION_ACTION_NSID, type AccountUpdate } from "./moderation";
 
 const BATCH_SIZE = 50;
-const FEED_PRUNE_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+
+/** Fixed estimate for the URI, source position, revision, CID, and other
+ * metadata retained beside each serialized record body. Deletes consume only
+ * this allowance. The byte budget is intentionally an admission threshold: the
+ * candidate that reaches it is retained, bounding overshoot to one record plus
+ * this allowance. */
+export const SCHEDULED_INGEST_METADATA_BYTES = 512;
+
+/** Conservative defaults for one D1/Worker scheduled drain. Persistent
+ * ingestion has its own streaming lifecycle and does not use these limits. */
+export const DEFAULT_SCHEDULED_INGEST_BUDGET = Object.freeze({
+  maxDrainMs: 25_000,
+  maxCandidates: 250,
+  maxIdentityUpdates: 250,
+  maxAccountUpdates: 500,
+  maxSerializedBytes: 4 * 1024 * 1024,
+}) satisfies ScheduledIngestBudget;
+
+export interface ScheduledIngestBudget {
+  maxDrainMs: number;
+  maxCandidates: number;
+  maxIdentityUpdates: number;
+  maxAccountUpdates: number;
+  maxSerializedBytes: number;
+}
+
+export interface ScheduledIngestOptions {
+  /** Maximum wall time spent requesting source items. Default: 25 seconds. */
+  maxDrainMs?: number;
+  /** Maximum unique commit candidates retained by one drain. Default: 250. */
+  maxCandidates?: number;
+  /** Maximum distinct handle updates retained by one drain. Default: 250. */
+  maxIdentityUpdates?: number;
+  /** Maximum distinct-actor account events retained by one drain; reaching
+   * it ends the drain so no lifecycle event is skipped. Default: 500. */
+  maxAccountUpdates?: number;
+  /** UTF-8 record bytes plus metadata allowances. Default: 4 MiB. */
+  maxSerializedBytes?: number;
+  /** @deprecated Compatibility alias for maxDrainMs. */
+  timeoutMs?: number;
+}
+
+export type ScheduledIngestStopReason =
+  | "head"
+  | "idle"
+  | "count"
+  | "bytes"
+  | "drain-time"
+  | "cancelled";
+
+export interface ScheduledIngestCollectionStats {
+  observedSourceItems: number;
+  commitObservations: number;
+  identityObservations: number;
+  retainedCandidates: number;
+  retainedIdentityUpdates: number;
+  identityUpdatesOmitted: number;
+  /** Account events for actors this instance holds no data for. */
+  accountUpdatesFiltered: number;
+  exactDuplicatesDropped: number;
+  cursorBoundaryDuplicatesDropped: number;
+  resumeOverlapDropped: number;
+  sourceScopeFiltered: number;
+  sourceInconsistencies: number;
+  serializedCandidateBytes: number;
+  startingCursor: number | null;
+  lastAccountedCursor: number | null;
+  safeEndingCursor: number | null;
+  stopReason: ScheduledIngestStopReason;
+  connections: number;
+  connectionCloses: number;
+  connectionErrors: number;
+  diagnosticSamples: string[];
+  diagnosticSamplesOmitted: number;
+}
+
+function positiveInteger(value: number, label: string): number {
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+    throw new TypeError(`${label} must be a positive finite integer`);
+  }
+  return value;
+}
+
+/** Resolve and validate every scheduled collection threshold. */
+export function resolveScheduledIngestBudget(
+  value?: ScheduledIngestOptions | ScheduledIngestBudget | number,
+): ScheduledIngestBudget {
+  if (typeof value === "number") {
+    return {
+      ...DEFAULT_SCHEDULED_INGEST_BUDGET,
+      maxDrainMs: positiveInteger(value, "maxDrainMs"),
+    };
+  }
+  const options = (value ?? {}) as ScheduledIngestOptions;
+  if (options.timeoutMs !== undefined) {
+    positiveInteger(options.timeoutMs, "timeoutMs");
+  }
+  return {
+    maxDrainMs: positiveInteger(
+      options.maxDrainMs ??
+        options.timeoutMs ??
+        DEFAULT_SCHEDULED_INGEST_BUDGET.maxDrainMs,
+      "maxDrainMs",
+    ),
+    maxCandidates: positiveInteger(
+      options.maxCandidates ?? DEFAULT_SCHEDULED_INGEST_BUDGET.maxCandidates,
+      "maxCandidates",
+    ),
+    maxIdentityUpdates: positiveInteger(
+      options.maxIdentityUpdates ??
+        DEFAULT_SCHEDULED_INGEST_BUDGET.maxIdentityUpdates,
+      "maxIdentityUpdates",
+    ),
+    maxAccountUpdates: positiveInteger(
+      options.maxAccountUpdates ??
+        DEFAULT_SCHEDULED_INGEST_BUDGET.maxAccountUpdates,
+      "maxAccountUpdates",
+    ),
+    maxSerializedBytes: positiveInteger(
+      options.maxSerializedBytes ??
+        DEFAULT_SCHEDULED_INGEST_BUDGET.maxSerializedBytes,
+      "maxSerializedBytes",
+    ),
+  };
+}
+
+/** Distinct actors pruned per ingest tick by the rolling feed sweep. Each
+ *  actor costs a handful of index-backed O(cap) deletes, so this bounds the
+ *  prune's per-tick CPU regardless of how large feed_items grows. */
+export const FEED_PRUNE_SWEEP_ACTORS = 500;
+
+/** How long after a completed full pass the recovery sweep becomes due again,
+ *  even when no feed-relevant records are ingested, so over-cap rows that
+ *  predate a config change (e.g. a lowered cap) or a bulk import still drain.
+ *  Once due, the pass advances one slice per tick, so a full pass *completes*
+ *  roughly every (this interval + lap time), where lap time is
+ *  ceil(actors / FEED_PRUNE_SWEEP_ACTORS) ticks. Steady-state pruning is driven
+ *  by ingest; this is only the safety net. */
+export const FEED_PRUNE_RECOVERY_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
+
+/** `_contrail_meta` key for the wall-clock (ms) at which the rolling feed sweep
+ *  last *completed a full pass* over every actor, so a recycled cron isolate can
+ *  honor the recovery interval across ticks. Tracking pass completion (not the
+ *  last slice) is what keeps the recovery interval measuring from a real drain
+ *  rather than from one bounded slice — without it, a single slice resets the
+ *  clock and a feed touched just after the cursor passed it could wait many
+ *  intervals to be revisited. */
+const FEED_PRUNE_LAST_FULL_PASS_META = "feed_prune_last_full_pass_ms";
+
+/** `_contrail_meta` key for the persisted optimize cadence (so recycled cron
+ *  isolates don't re-run it every tick — the in-memory-state bug we hit with
+ *  the feed prune). Shared by the persistent loop. */
+export const OPTIMIZE_LAST_MS_KEY = "optimize_last_ms";
+
+/** Run the opt-in planner-stat maintenance if enabled and its persisted
+ *  interval has elapsed. Bounded + no-op on Postgres (see optimizeDatabase).
+ *  Wrapped by callers so a pragma-unsupported environment can't break ingest. */
+export async function maybeOptimize(db: Database, config: ContrailConfig, log: Logger): Promise<void> {
+  if (!optimizeEnabled(config)) return;
+  const last = await getMetaNumber(db, OPTIMIZE_LAST_MS_KEY);
+  if (Date.now() - (last ?? 0) <= optimizeIntervalMs(config)) return;
+  // Claim the interval up front so a failing/unsupported pragma can't re-run
+  // every tick — it retries only after the next interval elapses.
+  await setMeta(db, OPTIMIZE_LAST_MS_KEY, String(Date.now()));
+  try {
+    await optimizeDatabase(db, optimizeAnalysisLimit(config));
+    log.log("[maintenance] refreshed planner stats (PRAGMA optimize)");
+  } catch (err) {
+    log.warn(`[maintenance] optimize failed: ${err}`);
+  }
+}
+
+/** One bounded feed-prune slice: advances the persisted rolling cursor by up to
+ *  {@link FEED_PRUNE_SWEEP_ACTORS} actors and reports whether the slice reached
+ *  the end of the actor list (i.e. a full pass just completed and the cursor
+ *  wrapped). Callers decide WHEN to sweep (ingest-dirty vs recovery); this owns
+ *  the slice + cursor mechanics so the cron loop, the persistent loop, and the
+ *  notify path all prune identically. No-op (done) when no feed caps apply. */
+export async function runFeedPruneSlice(
+  db: Database,
+  config: ContrailConfig
+): Promise<{ pruned: number; done: boolean }> {
+  const caps = buildFeedTargetCaps(config);
+  if (caps.size === 0) return { pruned: 0, done: true };
+  const cursor = await getFeedPruneCursor(db);
+  const { pruned, nextCursor, done } = await sweepFeedItems(
+    db,
+    caps,
+    cursor,
+    FEED_PRUNE_SWEEP_ACTORS
+  );
+  await saveFeedPruneCursor(db, nextCursor);
+  return { pruned, done };
+}
+
+/** Prune the feeds an applied batch grew (see pruneGrownFeeds), within the
+ *  statement budget of one sweep slice: {@link FEED_PRUNE_SWEEP_ACTORS} actors
+ *  times each capped collection. Returns true when the batch's fan-out
+ *  overflowed that budget, which the caller answers with a sweep slice. No
+ *  queries at all for a batch that grew no feed. */
+export async function runGrownFeedPrune(
+  db: Database,
+  config: ContrailConfig,
+  applied: readonly IngestEvent[]
+): Promise<boolean> {
+  const caps = buildFeedTargetCaps(config);
+  if (caps.size === 0) return false;
+  const { pruned, overflow } = await pruneGrownFeeds(
+    db,
+    config,
+    applied,
+    FEED_PRUNE_SWEEP_ACTORS * caps.size
+  );
+  if (pruned > 0) {
+    getLogger(config).log(`Pruned ${pruned} feed items (grown feeds)`);
+  }
+  return overflow;
+}
+
+/** Prune after an ingest batch against the *persisted* recovery clock — shared
+ *  by the recycling cron isolate and the stateless `notifyOfUpdate` path (the
+ *  long-lived persistent loop uses its in-memory clocks instead).
+ *
+ *  The feeds `applied` grew are pruned directly ({@link runGrownFeedPrune}). A
+ *  sweep slice runs only when a full pass is overdue or the batch's fan-out
+ *  overflowed the grown-feed budget. It records pass completion so the recovery
+ *  clock measures from a real drain (one slice per tick until the cursor wraps)
+ *  rather than resetting on a single slice. The recovery pass remains the
+ *  safety net for anything the grown-feed prune doesn't see: a lowered cap, a
+ *  bulk import, a follower past the budget, a failed Constellation backfill, an
+ *  ingest path that doesn't prune. No-op when feeds are unconfigured. */
+export async function runGatedFeedPrune(
+  db: Database,
+  config: ContrailConfig,
+  applied: readonly IngestEvent[]
+): Promise<void> {
+  if (!config.feeds) return;
+  if (buildFeedTargetCaps(config).size === 0) return;
+  const overflow = await runGrownFeedPrune(db, config, applied);
+  const nowMs = Date.now();
+  const lastFullPassMs =
+    (await getMetaNumber(db, FEED_PRUNE_LAST_FULL_PASS_META)) ?? 0;
+  const recoveryDue = nowMs - lastFullPassMs >= FEED_PRUNE_RECOVERY_INTERVAL_MS;
+  if (!overflow && !recoveryDue) return;
+  const { pruned, done } = await runFeedPruneSlice(db, config);
+  if (done) await setMeta(db, FEED_PRUNE_LAST_FULL_PASS_META, String(nowMs));
+  if (pruned > 0) {
+    const reason = overflow ? "overflow" : "recovery";
+    getLogger(config).log(`Pruned ${pruned} feed items (sweep, reason=${reason})`);
+  }
+}
 
 /** Mutable state that persists across ingest cycles within the same process. */
 export interface IngestState {
   cachedKnownDids?: Set<string>;
   schemaInitialized: boolean;
-  lastFeedPruneMs: number;
+  /** Wall-clock of the last feed sweep slice — used only by the long-lived
+   *  persistent loop to throttle ingest-driven slices; the recycling cron
+   *  isolate persists its clocks in `_contrail_meta` instead. */
+  lastFeedSweepMs: number;
+  /** Wall-clock at which the persistent loop last *completed a full sweep pass*
+   *  over every actor. Drives the recovery interval (a fresh pass becomes due
+   *  {@link FEED_PRUNE_RECOVERY_INTERVAL_MS} after the last one completed, then
+   *  laps one slice per tick), independent of the ingest-driven throttle above.
+   *  The cron isolate persists the equivalent in
+   *  `_contrail_meta`. */
+  lastFullFeedPassMs: number;
+  /** Set by the persistent loop when a flushed batch's fan-out overflowed the
+   *  grown-feed prune's budget, or the grown-feed prune failed, so the next
+   *  sweep window runs a slice. Cleared
+   *  when the sweep runs. The cron path makes the same decision per-tick and
+   *  doesn't need the flag. */
+  feedDirty: boolean;
 }
 
 export function createIngestState(): IngestState {
-  return { schemaInitialized: false, lastFeedPruneMs: 0 };
+  return {
+    schemaInitialized: false,
+    lastFeedSweepMs: 0,
+    lastFullFeedPassMs: 0,
+    feedDirty: false,
+  };
 }
 
 function getLogger(config: ContrailConfig): Logger {
   return config.logger ?? console;
 }
 
+/** Sentinel returned by `nextWithDeadline` when the wait timed out. */
+const INGEST_TIMEOUT = Symbol("ingest-timeout");
+
+/** Await the iterator's next value, but give up after `ms`. Without this a
+ * quiet Jetstream can hold a scheduled drain past its deadline. */
+function nextWithDeadline<T>(
+  iterator: AsyncIterator<T>,
+  ms: number,
+): Promise<IteratorResult<T> | typeof INGEST_TIMEOUT> {
+  let timer: ReturnType<typeof setTimeout>;
+  const next = iterator.next();
+  // If the timer wins, cancellation is triggered by ingestEvents' cleanup.
+  // Swallow that later abort rejection because this race has already settled.
+  next.catch(() => {});
+  const timeout = new Promise<typeof INGEST_TIMEOUT>((resolve) => {
+    timer = setTimeout(() => resolve(INGEST_TIMEOUT), ms);
+  });
+  return Promise.race([next, timeout]).finally(() => clearTimeout(timer));
+}
+
+const utf8 = new TextEncoder();
+const MAX_DIAGNOSTIC_SAMPLES = 5;
+const MAX_DIAGNOSTIC_SAMPLE_LENGTH = 320;
+
+function addDiagnosticSample(
+  stats: Pick<
+    ScheduledIngestCollectionStats,
+    "diagnosticSamples" | "diagnosticSamplesOmitted"
+  >,
+  message: string,
+): void {
+  if (stats.diagnosticSamples.length >= MAX_DIAGNOSTIC_SAMPLES) {
+    stats.diagnosticSamplesOmitted++;
+    return;
+  }
+  stats.diagnosticSamples.push(message.slice(0, MAX_DIAGNOSTIC_SAMPLE_LENGTH));
+}
+
+/** JSON normalization used only for transport-observation fingerprints. The
+ * Jetstream payload has already been decoded from JSON, so sorting object keys
+ * makes semantically identical payloads stable across decoder/property order. */
+function normalizedJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    const encoded = JSON.stringify(value);
+    return encoded === undefined ? "null" : encoded;
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => normalizedJson(item)).join(",")}]`;
+  }
+  const fields: string[] = [];
+  for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+    const field = (value as Record<string, unknown>)[key];
+    if (field === undefined) continue;
+    fields.push(`${JSON.stringify(key)}:${normalizedJson(field)}`);
+  }
+  return `{${fields.join(",")}}`;
+}
+
+interface JetstreamCommitObservation {
+  /** One logical Jetstream source slot, before source ID/epoch prefixing. */
+  key: string;
+  /** Stable operation/CID/normalized-payload identity for that slot. */
+  fingerprint: string;
+  uri: string;
+}
+
+/** Jetstream owns the transport-specific observation identity. Core collection
+ * adds the configured source ID and epoch before cycle-local deduplication. */
+function jetstreamCommitObservation(
+  event: {
+    did: string;
+    seq: number;
+    time_us: number;
+    commit: {
+      rev?: string;
+      collection: string;
+      rkey: string;
+      operation: string;
+      cid?: string;
+      record?: unknown;
+    };
+  },
+): JetstreamCommitObservation {
+  const { commit } = event;
+  const uri = `at://${event.did}/${commit.collection}/${commit.rkey}`;
+  return {
+    key: String(event.seq),
+    fingerprint: JSON.stringify([
+      uri,
+      commit.rev ?? null,
+      commit.operation,
+      commit.cid ?? null,
+      commit.operation === "delete" ? null : normalizedJson(commit.record),
+    ]),
+    uri,
+  };
+}
+
 export async function ingestEvents(
   config: ContrailConfig,
   cursor: number | null,
-  safetyTimeoutMs: number = 25_000,
-  knownDids?: Set<string>
+  budgetInput: ScheduledIngestOptions | ScheduledIngestBudget | number =
+    DEFAULT_SCHEDULED_INGEST_BUDGET,
+  knownDids?: Set<string>,
+  /** Resolves which account-event actors this instance holds data for. When
+   * set, network-wide account traffic for unknown actors is dropped before it
+   * spends the `maxAccountUpdates` budget. */
+  knownAccounts?: (dids: string[]) => Promise<Set<string>>,
 ): Promise<{
   events: IngestEvent[];
   lastCursor: number | null;
-  newlyKnownDids: string[];
+  cursorObservations: Set<string>;
   identityUpdates: Map<string, string>;
+  accountUpdates: AccountUpdate[];
+  stats: ScheduledIngestCollectionStats;
 }> {
-  const log = getLogger(config);
-  const startTimeUs = Date.now() * 1000;
-  const deadline = Date.now() + safetyTimeoutMs;
+  const budget = resolveScheduledIngestBudget(budgetInput);
+  const deadline = Date.now() + budget.maxDrainMs;
   const collected: IngestEvent[] = [];
 
   const collections = getCollectionNsids(config);
   const dependentCollections = new Set(getDependentNsids(config));
-  const urls = config.jetstreams ?? [];
+  const provisionalKnownDids = knownDids ? new Set(knownDids) : undefined;
+  const urls = config.jetstreams ?? DEFAULT_JETSTREAMS;
+  const sourceId = config.orderedSource?.source ?? "jetstream";
+  const sourceEpoch = config.orderedSource?.epoch ?? null;
 
-  let totalCommits = 0;
-  let filteredUnknownDid = 0;
-  const filteredDidSamples = new Set<string>();
-  let lastYieldedTimeUs: number | null = null;
-  let firstYieldedTimeUs: number | null = null;
-  let connectCount = 0;
-  const seenUris = new Map<string, number>(); // uri -> time_us of first occurrence
-  const duplicateUris: string[] = [];
-  const newlyKnownDids = new Set<string>();
+  const seenObservations = new Map<string, Set<string>>();
   const identityUpdates = new Map<string, string>();
+  // Latest event per actor: the stored state only depends on the newest one.
+  const accountUpdates = new Map<string, AccountUpdate>();
+  // Actors with retained commits this drain; their records commit before the
+  // account statements, so their lifecycle events are kept unresolved.
+  const commitDids = new Set<string>();
+  // Account events awaiting a batched known-actor lookup.
+  const unresolvedAccounts = new Map<string, AccountUpdate>();
+  const retainAccount = (update: AccountUpdate) => {
+    const prior = accountUpdates.get(update.did);
+    if (prior && prior.cursor >= update.cursor) return;
+    accountUpdates.delete(update.did);
+    accountUpdates.set(update.did, update);
+    stats.serializedCandidateBytes += SCHEDULED_INGEST_METADATA_BYTES;
+  };
+  const resolveAccounts = async () => {
+    if (!unresolvedAccounts.size) return;
+    const batch = [...unresolvedAccounts.values()];
+    unresolvedAccounts.clear();
+    const known = await knownAccounts!(batch.map((u) => u.did));
+    for (const update of batch) {
+      if (known.has(update.did) || commitDids.has(update.did)) retainAccount(update);
+      else stats.accountUpdatesFiltered++;
+    }
+  };
+  const stats: ScheduledIngestCollectionStats = {
+    observedSourceItems: 0,
+    commitObservations: 0,
+    identityObservations: 0,
+    retainedCandidates: 0,
+    retainedIdentityUpdates: 0,
+    identityUpdatesOmitted: 0,
+    accountUpdatesFiltered: 0,
+    exactDuplicatesDropped: 0,
+    cursorBoundaryDuplicatesDropped: 0,
+    resumeOverlapDropped: 0,
+    sourceScopeFiltered: 0,
+    sourceInconsistencies: 0,
+    serializedCandidateBytes: 0,
+    startingCursor: cursor,
+    lastAccountedCursor: null,
+    safeEndingCursor: cursor,
+    stopReason: "idle",
+    connections: 0,
+    connectionCloses: 0,
+    connectionErrors: 0,
+    diagnosticSamples: [],
+    diagnosticSamplesOmitted: 0,
+  };
 
-  const subscription = new JetstreamSubscription({
-    url: urls,
+  const requestedCursor = cursor;
+  const subscriptionAbort = new AbortController();
+  const subscription = new JetstreamLiveSubscription({
+    url: jetstreamService(urls),
     wantedCollections: collections,
-    ...(cursor !== null ? { cursor } : {}),
+    ...(requestedCursor !== null ? { cursor: requestedCursor } : {}),
+    signal: subscriptionAbort.signal,
     onConnectionOpen() {
-      connectCount++;
-      log.log(
-        `[ingest] connected to Jetstream #${connectCount} (url=${urls.join("|")}, cursor=${cursor ?? "none"}, wanted=${collections.join(",")})`
-      );
+      stats.connections++;
     },
-    onConnectionClose(event) {
-      log.log(
-        `[ingest] disconnected from Jetstream: ${event.code} ${event.reason}`
-      );
+    onConnectionClose() {
+      stats.connectionCloses++;
     },
     onConnectionError(event) {
-      log.error("[ingest] Jetstream error:", event.error);
+      stats.connectionErrors++;
+      addDiagnosticSample(stats, `Jetstream connection error: ${String(event.error)}`);
     },
   });
 
-  for await (const event of subscription) {
-    if (firstYieldedTimeUs === null) firstYieldedTimeUs = event.time_us;
-    lastYieldedTimeUs = event.time_us;
+  // Capture the adapter's effective lower bound before iteration can buffer
+  // frames and move it ahead. With no durable cursor this is a timestamp-domain
+  // bridge and must be persisted even when the first drain stays empty.
+  const effectiveStartCursor = cursor ?? subscription.cursor ?? null;
+  stats.safeEndingCursor = effectiveStartCursor;
+  // V2 seqs identify individual events, so there are no equal-cursor siblings
+  // to retain across cycles. Returning an empty set also retires any legacy
+  // timestamp-domain observation hashes when the cursor is next committed.
+  const cursorObservations = new Set<string>();
+
+  const iterator = subscription[Symbol.asyncIterator]();
+  type Ev = typeof subscription extends AsyncIterable<infer V> ? V : never;
+
+  const accountSourceItem = (event: Ev): boolean => {
+    // The v2 wire is inclusive. The official client normally removes this
+    // overlap itself; keep the boundary guard so custom/test transports cannot
+    // make the already-committed seq consume a scheduled work budget.
+    if (
+      effectiveStartCursor !== null &&
+      !isJetstreamTimestampCursor(effectiveStartCursor) &&
+      event.seq <= effectiveStartCursor
+    ) {
+      stats.resumeOverlapDropped++;
+      return true;
+    }
+
+    return false;
+  };
+
+  // Fully account for one yielded seq before the loop considers any stop
+  // threshold. The resume overlap is suppressed before evolving source-scope
+  // policy; ordinary cheap filters still precede cycle-local dedupe.
+  const handleEvent = async (event: Ev): Promise<void> => {
     if (event.kind === "commit") {
       const { commit } = event;
-      totalCommits++;
-
-      const uri = `at://${event.did}/${commit.collection}/${commit.rkey}`;
-
-      const short = shortNameForNsid(config, commit.collection);
-      const collectionCfg = short ? config.collections[short] : undefined;
-
-      if (dependentCollections.has(commit.collection) && knownDids) {
-        if (!knownDids.has(event.did)) {
-          filteredUnknownDid++;
-          if (filteredDidSamples.size < 10) filteredDidSamples.add(event.did);
-          continue;
-        }
-        // Subject filter: for collections with subjectField (e.g. follows
-        // pointing at a `subject` DID), drop records whose subject isn't a
-        // DID we care about. Trims network-wide social graph to the
-        // subjects our discoverable users overlap with.
-        const subjectField = collectionCfg?.subjectField;
-        if (subjectField && commit.operation !== "delete") {
-          const subj = (commit.record as Record<string, unknown> | undefined)?.[
-            subjectField
-          ];
-          if (typeof subj === "string" && !knownDids.has(subj)) {
-            continue;
-          }
-        }
+      stats.commitObservations++;
+      const observation = jetstreamCommitObservation(event);
+      const dedupeKey = JSON.stringify([
+        sourceId,
+        sourceEpoch,
+        observation.key,
+      ]);
+      if (accountSourceItem(event)) {
+        return;
       }
 
-      if (collectionCfg?.recordFilter && commit.operation !== "delete") {
-        const rec = commit.record as Record<string, unknown> | undefined;
-        let keep = false;
-        try {
-          keep = !!(rec && collectionCfg.recordFilter(rec));
-        } catch (err) {
-          log.warn(`[ingest] recordFilter threw for ${uri}: ${err}`);
-        }
-        if (!keep) continue;
+      if (commit.collection === MODERATION_ACTION_NSID && !config.moderation?.moderators.includes(event.did)) {
+        stats.sourceScopeFiltered++;
+        return;
+      }
+      if (
+        provisionalKnownDids &&
+        !dependentCollections.has(commit.collection) &&
+        commit.collection !== MODERATION_ACTION_NSID &&
+        commit.operation !== "delete"
+      ) {
+        provisionalKnownDids.add(event.did);
+      }
+      if (
+        dependentCollections.has(commit.collection) &&
+        provisionalKnownDids &&
+        !provisionalKnownDids.has(event.did)
+      ) {
+        stats.sourceScopeFiltered++;
+        return;
       }
 
-      const prev = seenUris.get(uri);
-      if (prev !== undefined) {
-        duplicateUris.push(uri);
-        log.warn(
-          `[ingest] DUPLICATE in cycle: ${uri} first time_us=${prev}, again=${event.time_us}, delta=${event.time_us - prev}us`
+      const fingerprints = seenObservations.get(dedupeKey);
+      if (fingerprints?.has(observation.fingerprint)) {
+        stats.exactDuplicatesDropped++;
+        return;
+      }
+      if (fingerprints) {
+        stats.sourceInconsistencies++;
+        addDiagnosticSample(
+          stats,
+          `source slot changed payload: ${observation.uri} seq=${event.seq}`,
         );
+        fingerprints.add(observation.fingerprint);
       } else {
-        seenUris.set(uri, event.time_us);
+        seenObservations.set(dedupeKey, new Set([observation.fingerprint]));
       }
 
-      const now = Date.now();
-
-      collected.push({
-        uri,
+      const candidate = createIngestEvent({
         did: event.did,
-        time_us: event.time_us,
+        timeUs:
+          commit.operation === "delete"
+            ? event.time_us
+            : recordTimeUs(
+                commit.record,
+                commit.collection,
+                config,
+                event.time_us,
+              ),
         collection: commit.collection,
-        operation: commit.operation as "create" | "update" | "delete",
+        operation: commit.operation,
         rkey: commit.rkey,
         cid: commit.operation === "delete" ? null : commit.cid,
-        record:
-          commit.operation === "delete"
-            ? null
-            : JSON.stringify(commit.record),
-        indexed_at: now * 1000,
+        value: commit.operation === "delete" ? undefined : commit.record,
+        source: {
+          id: sourceId,
+          ...(sourceEpoch === null ? {} : { epoch: sourceEpoch }),
+          time_us: event.time_us,
+          revision: commit.rev,
+          cursor: String(event.seq),
+        },
       });
-
-      log.log(
-        `[ingest] keep: ${commit.operation} ${uri} time_us=${event.time_us}`
-      );
-
-      if (knownDids && !dependentCollections.has(commit.collection)) {
-        if (!knownDids.has(event.did)) {
-          knownDids.add(event.did);
-          newlyKnownDids.add(event.did);
-        }
-      }
+      collected.push(candidate);
+      commitDids.add(event.did);
+      stats.retainedCandidates++;
+      stats.serializedCandidateBytes +=
+        SCHEDULED_INGEST_METADATA_BYTES +
+        (candidate.record === null ? 0 : utf8.encode(candidate.record).byteLength);
     } else if (event.kind === "identity") {
-      identityUpdates.set(event.did, event.identity.handle);
+      stats.identityObservations++;
+      if (accountSourceItem(event)) return;
+      if (event.identity.handle === undefined) return;
+      if (
+        identityUpdates.has(event.did) ||
+        identityUpdates.size < budget.maxIdentityUpdates
+      ) {
+        identityUpdates.set(event.did, event.identity.handle);
+        stats.retainedIdentityUpdates = identityUpdates.size;
+      } else {
+        // Handle updates are best-effort and do not define record projection.
+        // Account overflow so global identity traffic cannot starve commits.
+        stats.identityUpdatesOmitted++;
+      }
+    } else if (event.kind === "account") {
+      if (accountSourceItem(event)) return;
+      const update: AccountUpdate = { did: event.did, active: event.account.active, status: event.account.status, timeUs: event.time_us, cursor: event.seq };
+      if (
+        !knownAccounts ||
+        accountUpdates.has(event.did) ||
+        commitDids.has(event.did) ||
+        knownDids?.has(event.did)
+      ) {
+        retainAccount(update);
+        return;
+      }
+      unresolvedAccounts.delete(event.did);
+      unresolvedAccounts.set(event.did, update);
+      if (unresolvedAccounts.size >= 100) await resolveAccounts();
     }
+  };
 
-    if (event.time_us >= startTimeUs) {
-      log.log(
-        `[ingest] caught up to present, stopping (last time_us=${event.time_us}, startTimeUs=${startTimeUs})`
+  try {
+    for (;;) {
+      // Check the deadline before requesting another item. A hot iterator must
+      // not get one extra next() after any threshold has been reached.
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        stats.stopReason = "drain-time";
+        break;
+      }
+
+      const step = await nextWithDeadline(iterator, remainingMs);
+      if (step === INGEST_TIMEOUT) {
+        stats.stopReason = "drain-time";
+        break;
+      }
+      if (step.done) {
+        stats.stopReason = "idle";
+        break;
+      }
+      const event = step.value;
+      stats.observedSourceItems++;
+
+      await handleEvent(event);
+      // handleEvent either retained, filtered, deduplicated, or deliberately
+      // handled the item. Only now is its cursor safe to checkpoint. Keep the
+      // representable checkpoint monotonic across deliberate overlap replay.
+      stats.lastAccountedCursor = advanceJetstreamCursor(
+        stats.lastAccountedCursor,
+        event.seq,
       );
-      break;
+
+      if (
+        stats.retainedCandidates >= budget.maxCandidates ||
+        accountUpdates.size >= budget.maxAccountUpdates
+      ) {
+        stats.stopReason = "count";
+        break;
+      }
+      if (stats.serializedCandidateBytes >= budget.maxSerializedBytes) {
+        stats.stopReason = "bytes";
+        break;
+      }
     }
-
-    if (Date.now() >= deadline) {
-      log.log(
-        `[ingest] safety timeout reached, stopping (deadline=${deadline}, collected=${collected.length})`
-      );
-      break;
-    }
+  } finally {
+    // Abort first so a pending async-generator pull and the transport's
+    // reconnect loop settle before return() is queued behind that pull.
+    subscriptionAbort.abort();
+    Promise.resolve(iterator.return?.()).catch(() => {});
   }
+  // Every accounted seq's account event is either retained or known to be a
+  // no-op before the drain's cursor can be saved.
+  await resolveAccounts();
 
-  if (filteredUnknownDid > 0) {
-    const sample = [...filteredDidSamples].join(", ");
-    log.log(
-      `[ingest] ${filteredUnknownDid} events filtered (unknown did). sample dids: ${sample}`
-    );
+  // Never read the transport cursor again here: it may have moved when a frame
+  // was buffered but not yielded. The constructor cursor captured above and the
+  // maximum fully-accounted yielded seq are the only safe positions.
+  const lastCursor =
+    stats.lastAccountedCursor === null
+      ? effectiveStartCursor
+      : advanceJetstreamCursor(
+          effectiveStartCursor,
+          stats.lastAccountedCursor,
+        );
+  stats.safeEndingCursor = lastCursor;
+  return {
+    events: collected,
+    lastCursor,
+    cursorObservations,
+    identityUpdates,
+    accountUpdates: [...accountUpdates.values()],
+    stats,
+  };
+}
+
+function emptyDropCounts(): IngestDropCounts {
+  return {
+    unknownCollection: 0,
+    invalidRecord: 0,
+    lexiconValidation: 0,
+    cidMismatch: 0,
+    cidEncoding: 0,
+    missingCid: 0,
+    recordFilter: 0,
+    unknownActor: 0,
+    unknownSubject: 0,
+    superseded: 0,
+  };
+}
+
+function addDropCounts(target: IngestDropCounts, value: IngestDropCounts): void {
+  for (const key of Object.keys(target) as Array<keyof IngestDropCounts>) {
+    target[key] += value[key];
   }
-  const lastCursor = subscription.cursor || null;
+}
 
-  const cursorGap =
-    lastCursor !== null && lastYieldedTimeUs !== null
-      ? lastCursor - lastYieldedTimeUs
-      : null;
-
-  // Detect the library's internal cursor rollback (picks a different URL → rolls
-  // back 10s → first event comes in BEFORE the cursor we asked it to start from).
-  const rolledBackUs =
-    cursor !== null && firstYieldedTimeUs !== null && firstYieldedTimeUs < cursor
-      ? cursor - firstYieldedTimeUs
-      : 0;
-
-  log.log(
-    `[ingest] jetstream loop done. commits_seen=${totalCommits}, filtered=${filteredUnknownDid}, kept=${collected.length}, dupes=${duplicateUris.length}, connects=${connectCount}, first_yielded=${firstYieldedTimeUs ?? "none"}, last_yielded=${lastYieldedTimeUs ?? "none"}, subscription_cursor=${lastCursor ?? "none"}, cursor_gap=${cursorGap ?? "n/a"}us, rolled_back=${rolledBackUs}us`
+function admissionFilteredCount(dropped: IngestDropCounts): number {
+  return Object.entries(dropped).reduce(
+    (total, [key, value]) => key === "superseded" ? total : total + value,
+    0,
   );
-
-  if (cursorGap !== null && cursorGap > 1000) {
-    log.warn(
-      `[ingest] CURSOR GAP: subscription cursor is ${cursorGap}us (${Math.floor(
-        cursorGap / 1000
-      )}ms) ahead of last yielded event — buffered events may be dropped`
-    );
-  }
-
-  if (connectCount > 1) {
-    log.warn(
-      `[ingest] RECONNECTED ${connectCount} times during cycle — each reconnect picks a URL at random and rolls cursor back 10s`
-    );
-  }
-
-  return { events: collected, lastCursor, newlyKnownDids: [...newlyKnownDids], identityUpdates };
 }
 
 // Run a full ingest cycle: init schema, load cursor, ingest, apply, save cursor
 export async function runIngestCycle(
   db: Database,
   config: ContrailConfig,
-  timeoutMs: number = 25_000,
+  budgetInput: ScheduledIngestOptions | ScheduledIngestBudget | number =
+    DEFAULT_SCHEDULED_INGEST_BUDGET,
   state?: IngestState,
-  pubsub?: import("./realtime/types").PubSub
 ): Promise<void> {
   const log = getLogger(config);
+  const budget = resolveScheduledIngestBudget(budgetInput);
+  const scheduledUrls = config.jetstreams ?? DEFAULT_JETSTREAMS;
+  const service = jetstreamService(scheduledUrls);
+  const wallStartedAt = Date.now();
+  const finishCpuUsage = runtimeCpuUsage(
+    (
+      globalThis as typeof globalThis & {
+        process?: RuntimeCpuUsageProcess;
+      }
+    ).process,
+  );
   const s = state ?? createIngestState();
 
   if (!s.schemaInitialized) {
     await initSchema(db, config);
     s.schemaInitialized = true;
   }
+  await assertServingSourceCompatibility(db, config.orderedSource);
+  await assertJetstreamServiceCompatibility(db, service);
 
   const cursor = await getLastCursor(db);
-  const collections = getCollectionNsids(config);
-  const nowUs = Date.now() * 1000;
-  const lagMs = cursor !== null ? Math.floor((nowUs - cursor) / 1000) : null;
-
-  log.log(
-    `[ingest] starting cycle. cursor=${cursor ?? "none"}${
-      lagMs !== null ? ` (lag=${lagMs}ms)` : ""
-    }, timeout=${timeoutMs}ms, collections=${collections.join(", ")}`
-  );
 
   // Load known DIDs for filtering dependent collections
   const dependentCollections = getDependentNsids(config);
@@ -254,98 +806,248 @@ export async function runIngestCycle(
   if (dependentCollections.length > 0) {
     if (s.cachedKnownDids) {
       knownDids = s.cachedKnownDids;
-      log.log(`Using cached known DIDs (${knownDids.size} users)`);
     } else {
-      const result = await db
-        .prepare("SELECT did FROM identities")
-        .all<{ did: string }>();
-      knownDids = new Set((result.results ?? []).map((r) => r.did));
+      knownDids = await loadKnownActorDids(db, config);
       s.cachedKnownDids = knownDids;
-      log.log(`Loaded ${knownDids.size} known DIDs from database`);
     }
   }
 
-  const { events, lastCursor, newlyKnownDids, identityUpdates } = await ingestEvents(
+  const {
+    events,
+    lastCursor,
+    cursorObservations,
+    identityUpdates,
+    accountUpdates,
+    stats,
+  } = await ingestEvents(
     config,
     cursor,
-    timeoutMs,
-    knownDids
+    budget,
+    knownDids,
+    (dids) => knownAccountDids(db, config, dids),
   );
 
-  if (events.length > 0) {
-    const breakdown: Record<string, number> = {};
-    for (const e of events) {
-      const key = `${e.collection}:${e.operation}`;
-      breakdown[key] = (breakdown[key] ?? 0) + 1;
-    }
-    log.log(
-      `[ingest] received ${events.length} events. breakdown=${JSON.stringify(breakdown)}`
-    );
-  } else {
-    log.log(`[ingest] received 0 events from Jetstream`);
-  }
-
+  const accepted: IngestEvent[] = [];
+  const newlyKnownDids: string[] = [];
+  const dropped = emptyDropCounts();
+  let databaseSubBatchesCommitted = 0;
+  const warningSamples: IngestWarningSamples = {
+    maxSamples: MAX_DIAGNOSTIC_SAMPLES,
+    samples: stats.diagnosticSamples,
+    omitted: stats.diagnosticSamplesOmitted,
+  };
   for (let i = 0; i < events.length; i += BATCH_SIZE) {
     const batch = events.slice(i, i + BATCH_SIZE);
-    await applyEvents(db, batch, config, { pubsub });
-  }
-
-  // Apply handle changes from #identity events. UPDATE-only, so unknown
-  // DIDs are no-ops — we don't want to create partial rows lacking PDS.
-  if (identityUpdates.size > 0) {
-    for (const [did, handle] of identityUpdates) {
-      try {
-        await applyIdentityEvent(db, did, handle);
-      } catch (err) {
-        log.warn(`[ingest] identity update failed for ${did}: ${err}`);
+    const isFinalBatch = i + BATCH_SIZE >= events.length;
+    const result = await ingestRecords(db, batch, config, {
+      phase: "live",
+      knownDids,
+      warningSamples,
+      // Earlier batches may commit without moving the cursor. A crash replays
+      // them safely; the final batch atomically commits the exact source cursor.
+      trailingStatements:
+        isFinalBatch && lastCursor !== null
+          ? [
+              ...accountUpdateStatements(db, accountUpdates, config),
+              saveJetstreamCursorStatement(db, lastCursor),
+              ...(config.orderedSource
+                ? [
+                    saveOrderedSourcePositionStatement(
+                      db,
+                      config.orderedSource,
+                      lastCursor,
+                    ),
+                  ]
+                : []),
+              ...saveJetstreamCursorObservationStatements(
+                db,
+                lastCursor,
+                cursorObservations,
+              ),
+            ]
+          : undefined,
+    });
+    databaseSubBatchesCommitted++;
+    accepted.push(...result.accepted);
+    addDropCounts(dropped, result.dropped);
+    if (knownDids) {
+      for (const did of result.discoveredDids) {
+        knownDids.add(did);
+        newlyKnownDids.push(did);
       }
     }
-    log.log(`[ingest] applied ${identityUpdates.size} identity event(s)`);
   }
 
-  // Refresh stale/missing identities for DIDs in this batch
-  const uniqueDids = [...new Set(events.map((e) => e.did))];
+  // Apply the independently capped handle changes in bounded database batches.
+  // UPDATE-only statements make unknown DIDs no-ops without spending one D1
+  // round-trip apiece. Failures are sampled into the bounded cycle summary.
+  let identityUpdateFailures = 0;
+  const identityEntries = [...identityUpdates];
+  for (let index = 0; index < identityEntries.length; index += BATCH_SIZE) {
+    const chunk = identityEntries.slice(index, index + BATCH_SIZE);
+    try {
+      const updatedAt = Date.now();
+      await db.batch(
+        chunk.map(([did, handle]) =>
+          applyIdentityEventStatement(db, did, handle, updatedAt),
+        ),
+      );
+      databaseSubBatchesCommitted++;
+    } catch (error) {
+      identityUpdateFailures += chunk.length;
+      if (warningSamples.samples.length < warningSamples.maxSamples) {
+        warningSamples.samples.push(
+          `identity update batch failed (${chunk.length}, first=${chunk[0]?.[0]}): ${String(error)}`.slice(
+            0,
+            MAX_DIAGNOSTIC_SAMPLE_LENGTH,
+          ),
+        );
+      } else {
+        warningSamples.omitted++;
+      }
+    }
+  }
+
+  // A commit batch saves its source cursor in the projection transaction above.
+  // Identity-only, filtered-only, or otherwise candidate-free accounted ranges
+  // checkpoint only after best-effort identity handling. No observed item means
+  // there is no new source work to save, even if the subscription buffered ahead.
+  if (
+    lastCursor !== null &&
+    events.length === 0 &&
+    // Save an accounted range, or capture Atcute's constructor cursor for an
+    // empty first drain so the next cron cannot silently start later.
+    (stats.lastAccountedCursor !== null || cursor === null)
+  ) {
+    await db.batch([
+      ...accountUpdateStatements(db, accountUpdates, config),
+      saveJetstreamCursorStatement(db, lastCursor),
+      ...(config.orderedSource ? [saveOrderedSourcePositionStatement(db, config.orderedSource, lastCursor)] : []),
+      ...saveJetstreamCursorObservationStatements(db, lastCursor, cursorObservations),
+    ]);
+    databaseSubBatchesCommitted++;
+  }
+
+  // Refresh stale/missing identities for DIDs in this batch (best-effort; runs
+  // after the cursor save so its network latency can't strand forward progress).
+  const uniqueDids = [...new Set(accepted.map((e) => e.did))];
+  let identityRefreshFailures = 0;
   if (uniqueDids.length > 0) {
     try {
-      await refreshStaleIdentities(db, uniqueDids);
-    } catch (err) {
-      log.warn(`Identity refresh failed: ${err}`);
-    }
-  }
-
-  if (lastCursor !== null) {
-    await saveCursor(db, lastCursor);
-    log.log(
-      `[ingest] saved cursor=${lastCursor} (advanced ${
-        cursor !== null ? lastCursor - cursor : "n/a"
-      }us)`
-    );
-  } else {
-    log.log(`[ingest] no cursor returned from subscription; not saving`);
-  }
-
-  // Newly-discovered DIDs: ask Constellation for back-edges so they
-  // immediately appear in existing followers' feeds (best-effort, opt-out).
-  if (config.feeds && newlyKnownDids.length > 0) {
-    for (const subj of newlyKnownDids) {
-      try {
-        await backfillFollowersFromConstellation(db, config, subj);
-      } catch (err) {
-        log.warn(`[constellation] subject=${subj} failed: ${err}`);
+      await refreshStaleIdentities(db, uniqueDids, config);
+    } catch (error) {
+      identityRefreshFailures++;
+      if (warningSamples.samples.length < warningSamples.maxSamples) {
+        warningSamples.samples.push(
+          `identity refresh failed: ${String(error)}`.slice(
+            0,
+            MAX_DIAGNOSTIC_SAMPLE_LENGTH,
+          ),
+        );
+      } else {
+        warningSamples.omitted++;
       }
     }
   }
 
-  // Prune feed items hourly, per-target so high-volume targets don't
-  // squeeze out lower-volume ones.
-  if (config.feeds && Date.now() - s.lastFeedPruneMs > FEED_PRUNE_INTERVAL_MS) {
-    const caps = buildFeedTargetCaps(config);
-    if (caps.size > 0) {
-      const pruned = await pruneFeedItems(db, caps);
-      if (pruned > 0) log.log(`Pruned ${pruned} old feed items`);
+  // Newly-discovered DIDs: ask Constellation for back-edges. Suppress helper
+  // per-subject logs and report bounded aggregate results in the cycle summary.
+  let constellationFailures = 0;
+  let constellationInserted = 0;
+  if (config.feeds && newlyKnownDids.length > 0) {
+    const quietConfig = {
+      ...config,
+      logger: { log() {}, warn() {}, error() {} },
+    };
+    for (const subj of newlyKnownDids) {
+      try {
+        constellationInserted += await backfillFollowersFromConstellation(
+          db,
+          quietConfig,
+          subj,
+        );
+      } catch (error) {
+        constellationFailures++;
+        if (warningSamples.samples.length < warningSamples.maxSamples) {
+          warningSamples.samples.push(
+            `constellation failed for ${subj}: ${String(error)}`.slice(
+              0,
+              MAX_DIAGNOSTIC_SAMPLE_LENGTH,
+            ),
+          );
+        } else {
+          warningSamples.omitted++;
+        }
+      }
     }
-    s.lastFeedPruneMs = Date.now();
   }
 
-  log.log(`[ingest] cycle complete. stored=${events.length}`);
+  // Prune feed_items to per-collection caps. Every statement is index-backed and
+  // O(cap) (see sweepFeedItems), so it can never exhaust D1's per-query CPU
+  // budget and reset the shared DO — unlike the old global window+anti-join.
+  //
+  // A feed only goes over cap right after a row is inserted, and on this path
+  // rows are inserted by this batch's fan-out and follow backfill (Constellation
+  // prunes its own backfill above). So we prune the feeds this batch grew, and
+  // nothing on ticks that ingested nothing feed-relevant — the overwhelming
+  // majority.
+  //
+  // The cron isolate recycles each tick, so the recovery sweep's cursor and
+  // clock live in the DB. The clock tracks when a *full pass* over every actor
+  // last completed, not the last slice: while a pass is overdue we keep slicing
+  // every tick (bounded cost) until the cursor wraps, then reset the clock. So a
+  // feed the grown-feed prune didn't reach (including one a failed Constellation
+  // backfill grew), a lowered cap, or a bulk import all drain within one
+  // recovery interval plus the pass's lap time.
+  if (config.feeds) {
+    await runGatedFeedPrune(db, config, accepted);
+  }
+
+  // Opt-in planner-stat maintenance (gated + persisted cadence; no-op unless
+  // config.maintenance.optimize is set).
+  await maybeOptimize(db, config, log);
+
+  const summary = {
+    observed_source_items: stats.observedSourceItems,
+    commit_observations: stats.commitObservations,
+    identity_observations: stats.identityObservations,
+    retained_account_updates: accountUpdates.length,
+    account_updates_filtered: stats.accountUpdatesFiltered,
+    retained_candidates: stats.retainedCandidates,
+    retained_identity_updates: stats.retainedIdentityUpdates,
+    identity_updates_omitted: stats.identityUpdatesOmitted,
+    exact_duplicates_dropped: stats.exactDuplicatesDropped,
+    cursor_boundary_duplicates_dropped:
+      stats.cursorBoundaryDuplicatesDropped,
+    resume_overlap_dropped: stats.resumeOverlapDropped,
+    source_scope_filtered: stats.sourceScopeFiltered,
+    admission_policy_filtered: admissionFilteredCount(dropped),
+    candidates_superseded: dropped.superseded,
+    source_inconsistencies: stats.sourceInconsistencies,
+    serialized_candidate_bytes: stats.serializedCandidateBytes,
+    max_candidates: budget.maxCandidates,
+    max_identity_updates: budget.maxIdentityUpdates,
+    max_account_updates: budget.maxAccountUpdates,
+    max_serialized_bytes: budget.maxSerializedBytes,
+    max_drain_ms: budget.maxDrainMs,
+    starting_cursor: cursor,
+    last_accounted_cursor: stats.lastAccountedCursor,
+    safe_ending_cursor: stats.safeEndingCursor,
+    stop_reason: stats.stopReason,
+    database_sub_batches_committed: databaseSubBatchesCommitted,
+    projected_mutations_accepted: accepted.length,
+    identity_updates_attempted: identityUpdates.size,
+    identity_update_failures: identityUpdateFailures,
+    identity_refresh_failures: identityRefreshFailures,
+    constellation_inserted: constellationInserted,
+    constellation_failures: constellationFailures,
+    connections: stats.connections,
+    connection_closes: stats.connectionCloses,
+    connection_errors: stats.connectionErrors,
+    wall_ms: Date.now() - wallStartedAt,
+    cpu_ms: finishCpuUsage?.() ?? null,
+    diagnostic_samples: warningSamples.samples,
+    diagnostic_samples_omitted: warningSamples.omitted,
+  };
+  log.log(`[ingest] cycle summary ${JSON.stringify(summary)}`);
 }

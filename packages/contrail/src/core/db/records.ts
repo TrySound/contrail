@@ -1,3 +1,7 @@
+import {
+  JETSTREAM_V2_SEQ_THRESHOLD,
+  isJetstreamTimestampCursor,
+} from "../jetstream-live";
 import type {
   ContrailConfig,
   ResolvedContrailConfig,
@@ -7,6 +11,8 @@ import type {
   IngestEvent,
   RecordRow,
   RecordSource,
+  OrderedSourceConfig,
+  ProjectionPhase,
 } from "../types";
 import {
   getNestedValue,
@@ -15,15 +21,30 @@ import {
   groupedCountColumnName,
   getFeedFollowShortNames,
   recordsTableName,
-  spacesRecordsTableName,
   shortNameForNsid,
+  resolveCollectionKey,
   nsidForShortName,
   normalizeFeedTarget,
   feedTargetMaxItems,
+  buildFeedTargetCaps,
   DEFAULT_FOLLOW_SHORT,
+  changesEnabled,
 } from "../types";
-import { getSearchableFields, ftsTableName, buildFtsContent } from "../search";
-import { ftsQueryClause, getDialect } from "../dialect";
+import {
+  getSearchableFields,
+  ftsRowTableName,
+  ftsTableName,
+  buildFtsContent,
+} from "../search";
+import {
+  ftsQueryClause,
+  getDialect,
+  isPostgresDialect,
+  sqliteFtsContentExpression,
+} from "../dialect";
+import type { SourcePosition } from "../sources";
+import { appendChangeLogStatements } from "../change-log";
+import { actionProjectionStatements, activeHiddenSql, visibleRecordSql, labelBackfillEnqueueStatements } from "../moderation";
 
 // --- Counts ---
 
@@ -55,11 +76,26 @@ function getInboundRelations(
  * The map is keyed by `parentCollection:relationName:targetValue` to deduplicate
  * across the entire batch — so 50 RSVPs to the same event produce one recount, not 50.
  */
+type CountTarget = {
+  parentCollection: string;
+  relationName: string;
+  rel: RelationConfig;
+  targetValue: string;
+};
+
+function addCountTarget(
+  targets: Map<string, CountTarget>,
+  target: CountTarget,
+): void {
+  const key = `${target.parentCollection}:${target.relationName}:${target.targetValue}`;
+  if (!targets.has(key)) targets.set(key, target);
+}
+
 function collectCountTargets(
   event: IngestEvent,
   config: ContrailConfig,
   existingRecordJson: string | null,
-  targets: Map<string, { parentCollection: string; relationName: string; rel: RelationConfig; targetValue: string }>
+  targets: Map<string, CountTarget>
 ): void {
   const childShort = shortNameForNsid(config, event.collection);
   if (!childShort) return;
@@ -85,11 +121,36 @@ function collectCountTargets(
     }
 
     for (const targetValue of values) {
-      const key = `${parentCollection}:${relationName}:${targetValue}`;
-      if (!targets.has(key)) {
-        targets.set(key, { parentCollection, relationName, rel, targetValue });
-      }
+      addCountTarget(targets, {
+        parentCollection,
+        relationName,
+        rel,
+        targetValue,
+      });
     }
+  }
+}
+
+/** Recount a newly arriving parent against children that may already exist. */
+function collectParentCountTargets(
+  event: IngestEvent,
+  config: ContrailConfig,
+  targets: Map<string, CountTarget>,
+): void {
+  if (event.operation === "delete") return;
+  const parentCollection = shortNameForNsid(config, event.collection);
+  if (!parentCollection) return;
+
+  for (const [relationName, rel] of Object.entries(
+    config.collections[parentCollection]?.relations ?? {},
+  )) {
+    if (rel.count === false) continue;
+    addCountTarget(targets, {
+      parentCollection,
+      relationName,
+      rel,
+      targetValue: rel.match === "did" ? event.did : event.uri,
+    });
   }
 }
 
@@ -101,7 +162,7 @@ function collectCountTargets(
 function buildBatchCountStatements(
   db: Database,
   config: ContrailConfig,
-  targets: Map<string, { parentCollection: string; relationName: string; rel: RelationConfig; targetValue: string }>
+  targets: Map<string, CountTarget>
 ): Statement[] {
   const statements: Statement[] = [];
 
@@ -114,16 +175,14 @@ function buildBatchCountStatements(
     const setClauses: string[] = [];
     const setBindings: (string | number)[] = [];
 
-    const countExpr = rel.countDistinct
-      ? `COUNT(DISTINCT ${rel.countDistinct})`
-      : "COUNT(*)";
+    const dialect = getDialect(db);
+    const fieldFilter = { expr: (alias: string) => dialect.jsonExtract(`${alias}.record`, field), value: targetValue };
 
     // Total count
     const totalCol = countColumnName(rel.collection);
-    setClauses.push(
-      `${totalCol} = (SELECT ${countExpr} FROM ${childTable} WHERE ${getDialect(db).jsonExtract('record', field)} = ?)`
-    );
-    setBindings.push(targetValue);
+    const total = visibleChildCountSql(db, childTable, rel.countDistinct, [fieldFilter]);
+    setClauses.push(`${totalCol} = ${total.sql}`);
+    setBindings.push(...total.bindings);
 
     // Grouped counts — column names are `count_<child-short>_<group-key>`; match
     // against the group's full token value in the record.
@@ -132,10 +191,13 @@ function buildBatchCountStatements(
       if (mapping?.groups) {
         for (const [groupKey, fullToken] of Object.entries(mapping.groups)) {
           const groupCol = groupedCountColumnName(rel.collection, groupKey);
-          setClauses.push(
-            `${groupCol} = (SELECT ${countExpr} FROM ${childTable} WHERE ${getDialect(db).jsonExtract('record', field)} = ? AND ${getDialect(db).jsonExtract('record', rel.groupBy)} = ?)`
-          );
-          setBindings.push(targetValue, fullToken);
+          const groupBy = rel.groupBy;
+          const grouped = visibleChildCountSql(db, childTable, rel.countDistinct, [
+            fieldFilter,
+            { expr: (alias) => dialect.jsonExtract(`${alias}.record`, groupBy), value: fullToken },
+          ]);
+          setClauses.push(`${groupCol} = ${grouped.sql}`);
+          setBindings.push(...grouped.bindings);
         }
       }
     }
@@ -154,18 +216,109 @@ function buildBatchCountStatements(
   return statements;
 }
 
+/** Above this many `moderation_hidden` rows, never drive a count from them. */
+const HIDDEN_DRIVE_CAP = 10_000;
+
+/** Public child count: stored counts exclude hidden children, and moderation
+ * visibility changes recount affected parents.
+ *
+ * Probing visibility per child costs a row fetch and two index lookups per
+ * child, which is expensive for parents with many children. So when there are
+ * more children than hidden rows, count the index-only total and subtract the
+ * hidden children found by driving from `moderation_hidden` instead. Distinct
+ * counts cannot be subtracted and only skip the probes when nothing is hidden.
+ * Each filter value is bound once; subqueries read it from `q`. */
+function visibleChildCountSql(
+  db: Database,
+  childTable: string,
+  countDistinct: string | undefined,
+  filters: Array<{ expr: (alias: string) => string; value: string }>,
+): { sql: string; bindings: string[] } {
+  const pg = isPostgresDialect(getDialect(db));
+  // SQLite: unary `+` stops the planner from using the relation index when
+  // driving from hidden rows, so it probes children by did/uri instead.
+  const where = (alias: string, drive = false) =>
+    filters.map((f, i) => `${drive && !pg ? "+" : ""}${f.expr(alias)} = q.v${i}`).join(" AND ");
+  // PostgreSQL needs a parameter type; on SQLite a TEXT affinity would stop
+  // the relation's expression index from matching.
+  const params = `(SELECT ${filters.map((_, i) => `${pg ? "CAST(? AS TEXT)" : "?"} AS v${i}`).join(", ")}) p`;
+  // Keep `q` a materialized row: flattening would evaluate t/h per reference.
+  const fence = pg ? "OFFSET 0" : "LIMIT -1 OFFSET 0";
+  const bindings = filters.map((f) => f.value);
+  const columns = filters.map((_, i) => `p.v${i}`).join(", ");
+  if (countDistinct) {
+    const anyHidden = `EXISTS (SELECT 1 FROM moderation_hidden h WHERE ${activeHiddenSql("h")})`;
+    return {
+      sql: `(SELECT (SELECT COUNT(DISTINCT mc.${countDistinct}) FROM ${childTable} mc
+        WHERE ${where("mc")} AND (NOT ${anyHidden} OR ${visibleRecordSql("mc")}))
+        FROM (SELECT ${columns} FROM ${params}) q)`,
+      bindings,
+    };
+  }
+  const join = pg ? "JOIN" : "CROSS JOIN"; // SQLite: CROSS JOIN fixes join order
+  const perRow = `(SELECT COUNT(*) FROM ${childTable} mc WHERE ${where("mc")} AND ${visibleRecordSql("mc")})`;
+  const hiddenChildren = `(SELECT COUNT(*) FROM (
+      SELECT c.uri FROM moderation_hidden mh ${join} ${childTable} c ON c.did = mh.subject
+      WHERE mh.cid = '' AND ${activeHiddenSql("mh")} AND ${where("c", true)}
+      UNION
+      SELECT c.uri FROM moderation_hidden mh ${join} ${childTable} c
+        ON c.uri = mh.subject AND (mh.cid = '' OR mh.cid = c.cid)
+      WHERE ${activeHiddenSql("mh")} AND ${where("c", true)}
+    ) hidden_children)`;
+  return {
+    sql: `(SELECT CASE WHEN q.h >= ${HIDDEN_DRIVE_CAP} OR q.t <= q.h THEN ${perRow}
+        ELSE q.t - ${hiddenChildren} END
+      FROM (SELECT ${columns},
+        (SELECT COUNT(*) FROM ${childTable} mc WHERE ${filters.map((f, i) => `${f.expr("mc")} = p.v${i}`).join(" AND ")}) AS t,
+        (SELECT COUNT(*) FROM (SELECT 1 FROM moderation_hidden LIMIT ${HIDDEN_DRIVE_CAP}) x) AS h
+        FROM ${params} ${fence}) q)`,
+    bindings,
+  };
+}
+
+/** Recount every parent the given child records point at, under current
+ * moderation visibility. Used when a child's visibility changes. */
+export function childRecountStatements(
+  db: Database,
+  config: ContrailConfig,
+  childShort: string,
+  records: Array<{ record: unknown }>,
+): Statement[] {
+  const targets = new Map<string, CountTarget>();
+  for (const { parentCollection, relationName, rel } of getInboundRelations(
+    config,
+    childShort,
+  )) {
+    if (rel.count === false) continue;
+    for (const row of records) {
+      const record =
+        typeof row.record === "string" ? JSON.parse(row.record) : row.record;
+      const targetValue = record
+        ? getNestedValue(record, getRelationField(rel))
+        : null;
+      if (typeof targetValue === "string" && targetValue)
+        addCountTarget(targets, {
+          parentCollection,
+          relationName,
+          rel,
+          targetValue,
+        });
+    }
+  }
+  return buildBatchCountStatements(db, config, targets);
+}
+
 // --- FTS ---
 
 function buildFtsStatements(
   db: Database,
   event: IngestEvent,
-  config: ContrailConfig,
-  existingMap: Map<string, ExistingRecordInfo>
+  config: ContrailConfig
 ): Statement[] {
   // PostgreSQL: tsvector generated column is auto-maintained, no manual FTS sync
   if (getDialect(db).ftsStrategy === "generated-column") return [];
 
-  const short = shortNameForNsid(config, event.collection);
+  const short = resolveCollectionKey(config, event.collection);
   if (!short) return [];
   const colConfig = config.collections[short];
   if (!colConfig) return [];
@@ -174,27 +327,40 @@ function buildFtsStatements(
   if (!fields || fields.length === 0) return [];
 
   const table = ftsTableName(short);
-  const stmts: Statement[] = [];
+  const rowsTable = ftsRowTableName(short);
+  const deleteFtsRow = () =>
+    db
+      .prepare(
+        `DELETE FROM ${table} WHERE rowid = (SELECT id FROM ${rowsTable} WHERE uri = ?)`,
+      )
+      .bind(event.uri);
+  const deleteMapping = () =>
+    db.prepare(`DELETE FROM ${rowsTable} WHERE uri = ?`).bind(event.uri);
 
   if (event.operation === "delete") {
-    stmts.push(db.prepare(`DELETE FROM ${table} WHERE uri = ?`).bind(event.uri));
-  } else {
-    const record = event.record ? JSON.parse(event.record) : null;
-    if (!record) return [];
-
-    const content = buildFtsContent(record, fields);
-    if (!content) return [];
-
-    // Only delete existing FTS row if this is an update (record already existed)
-    if (existingMap.has(event.uri)) {
-      stmts.push(db.prepare(`DELETE FROM ${table} WHERE uri = ?`).bind(event.uri));
-    }
-    stmts.push(
-      db.prepare(`INSERT INTO ${table} (uri, content) VALUES (?, ?)`).bind(event.uri, content)
-    );
+    return [deleteFtsRow(), deleteMapping()];
   }
 
-  return stmts;
+  const record = event.record ? JSON.parse(event.record) : null;
+  if (!record) return [];
+  const content = buildFtsContent(record, fields);
+  if (!content) {
+    return [deleteFtsRow(), deleteMapping()];
+  }
+
+  return [
+    db
+      .prepare(
+        `INSERT INTO ${rowsTable} (uri) VALUES (?) ON CONFLICT(uri) DO NOTHING`,
+      )
+      .bind(event.uri),
+    deleteFtsRow(),
+    db
+      .prepare(
+        `INSERT INTO ${table} (rowid, content) SELECT id, ? FROM ${rowsTable} WHERE uri = ?`,
+      )
+      .bind(content, event.uri),
+  ];
 }
 
 // --- Feeds ---
@@ -295,50 +461,458 @@ function buildFeedStatements(
 
 // --- Feed pruning ---
 
-/** Prune feed_items per (actor, collection) to the given cap.
+/** db.batch chunk size for the sweep — caps statements per transaction. */
+const SWEEP_BATCH_SIZE = 50;
+/** Actor page size for the full-table {@link pruneFeedItems} recovery loop. */
+const FEED_PRUNE_RECOVERY_BATCH = 200;
+
+/**
+ * Build the bounded per-actor cutoff DELETE for one (actor, collection).
  *
- * - If `caps` is a number: legacy behavior — global per-actor cap across all collections.
- * - If `caps` is a Map<collection-NSID, cap>: each collection is pruned independently per actor,
- *   so high-volume collections (e.g. RSVPs) can't squeeze out lower-volume ones (e.g. events).
- *   Collections not present in the map are left alone.
+ * Deletes everything older than the newest `cap` rows, driven directly by
+ * idx_feed_actor_coll_time(actor, collection, time_us DESC). Cost is
+ * O(cap + deleted) — never O(table). This is the ONLY prune shape contrail
+ * issues: an unbounded window/anti-join over the whole table can exhaust D1's
+ * per-query CPU budget and reset the shared Durable Object, which kills any
+ * concurrent read against the same SQLite instance.
+ *
+ * The cutoff is the cap-th newest row (`OFFSET cap - 1`); we delete strictly
+ * older rows. Actors with `cap` or fewer rows: the OFFSET subquery yields no
+ * row, the cutoff is NULL, and `time_us < NULL` matches nothing — a cheap
+ * index no-op. On a tie at the cutoff time_us we keep the extra rows rather
+ * than risk deleting a row we meant to keep (feed_items is a cache; a few over
+ * cap is harmless, dropping a wanted item is not).
+ */
+function actorCutoffDelete(
+  db: Database,
+  actor: string,
+  collection: string,
+  cap: number
+): Statement {
+  // Plain `?` placeholders (bound repeatedly) rather than numbered params, so
+  // the Postgres adapter's positional `?`→`$n` rewrite stays correct.
+  return db
+    .prepare(
+      `DELETE FROM feed_items
+         WHERE actor = ? AND collection = ?
+           AND time_us < (
+             SELECT time_us FROM feed_items
+             WHERE actor = ? AND collection = ?
+             ORDER BY time_us DESC LIMIT 1 OFFSET ?
+           )`
+    )
+    .bind(actor, collection, actor, collection, Math.max(0, cap - 1));
+}
+
+/** Prune a single actor's feed for one collection to `cap`. Bounded O(cap). */
+export async function pruneActorFeed(
+  db: Database,
+  actor: string,
+  collection: string,
+  cap: number
+): Promise<number> {
+  const result = await actorCutoffDelete(db, actor, collection, cap).run();
+  return (result as any)?.changes ?? 0;
+}
+
+export interface FeedSweepResult {
+  /** Rows deleted this slice. */
+  pruned: number;
+  /** Actor to resume after; null once a full pass completed (wrap to start). */
+  nextCursor: string | null;
+  /** True when this slice reached the end of the actor list. */
+  done: boolean;
+}
+
+/**
+ * One bounded slice of a rolling feed-items prune.
+ *
+ * Pages at most `actorBudget` distinct actors (resuming after `cursor`, via the
+ * feed_items (actor, uri) PK) and applies the per-(actor, collection) cutoff
+ * delete for every cap in `caps`. Every issued statement is index-backed and
+ * O(cap), so the slice's per-query CPU stays flat no matter how large
+ * feed_items grows — the property the old global window query lacked.
+ *
+ * Drive it across ticks with a persisted cursor (see getFeedPruneCursor):
+ * feed back `nextCursor` until `done`, at which point the cursor wraps to null
+ * and the next pass starts from the beginning. Because each pass visits every
+ * actor, this doubles as the recovery path for an already-bloated table.
+ */
+export async function sweepFeedItems(
+  db: Database,
+  caps: Map<string, number>,
+  cursor: string | null,
+  actorBudget: number
+): Promise<FeedSweepResult> {
+  if (caps.size === 0 || actorBudget <= 0) {
+    return { pruned: 0, nextCursor: null, done: true };
+  }
+
+  const actorsRes = cursor
+    ? await db
+        .prepare(
+          "SELECT DISTINCT actor FROM feed_items WHERE actor > ? ORDER BY actor LIMIT ?"
+        )
+        .bind(cursor, actorBudget)
+        .all<{ actor: string }>()
+    : await db
+        .prepare("SELECT DISTINCT actor FROM feed_items ORDER BY actor LIMIT ?")
+        .bind(actorBudget)
+        .all<{ actor: string }>();
+
+  const actors = (actorsRes.results ?? []).map((r) => r.actor);
+  if (actors.length === 0) {
+    // Ran off the end (cursor pointed past the last actor) — wrap next tick.
+    return { pruned: 0, nextCursor: null, done: true };
+  }
+
+  const stmts: Statement[] = [];
+  for (const actor of actors) {
+    for (const [collection, cap] of caps) {
+      stmts.push(actorCutoffDelete(db, actor, collection, cap));
+    }
+  }
+
+  let pruned = 0;
+  for (let i = 0; i < stmts.length; i += SWEEP_BATCH_SIZE) {
+    const results = await db.batch(stmts.slice(i, i + SWEEP_BATCH_SIZE));
+    for (const r of results) pruned += (r as any)?.changes ?? 0;
+  }
+
+  // A short page means we exhausted the actor list this slice.
+  const done = actors.length < actorBudget;
+  return { pruned, nextCursor: done ? null : actors[actors.length - 1], done };
+}
+
+/**
+ * Prune the ENTIRE feed_items table to the per-collection `caps` by looping the
+ * bounded {@link sweepFeedItems} until a full pass completes.
+ *
+ * Every statement is O(cap) and safe against D1's per-query CPU limit, but the
+ * statement count is O(distinct actors), so keep this OFF the hot ingest path —
+ * the cron/persistent loops issue a single bounded slice per tick instead. Use
+ * it for one-shot recovery or admin tooling.
  */
 export async function pruneFeedItems(
   db: Database,
-  caps: number | Map<string, number>
+  caps: Map<string, number>
 ): Promise<number> {
-  if (typeof caps === "number") {
-    const result = await db
-      .prepare(
-        `DELETE FROM feed_items WHERE (actor, uri) NOT IN (
-           SELECT actor, uri FROM (
-             SELECT actor, uri, ROW_NUMBER() OVER (PARTITION BY actor ORDER BY time_us DESC) as rn
-             FROM feed_items
-           ) sub WHERE rn <= ?
-         )`
-      )
-      .bind(caps)
-      .run();
-    return (result as any)?.changes ?? 0;
-  }
   let total = 0;
-  for (const [collection, cap] of caps) {
-    const result = await db
-      .prepare(
-        `DELETE FROM feed_items WHERE collection = ? AND (actor, uri) NOT IN (
-           SELECT actor, uri FROM (
-             SELECT actor, uri, ROW_NUMBER() OVER (PARTITION BY actor ORDER BY time_us DESC) as rn
-             FROM feed_items WHERE collection = ?
-           ) sub WHERE rn <= ?
-         )`
-      )
-      .bind(collection, collection, cap)
-      .run();
-    total += (result as any)?.changes ?? 0;
+  let cursor: string | null = null;
+  for (;;) {
+    const res = await sweepFeedItems(db, caps, cursor, FEED_PRUNE_RECOVERY_BATCH);
+    total += res.pruned;
+    if (res.done) break;
+    cursor = res.nextCursor;
   }
   return total;
 }
 
-// --- Cursor ---
+/** Subjects per follower lookup in {@link pruneGrownFeeds}, under D1's limit of
+ *  100 bound parameters per statement. */
+const GROWN_FEED_SUBJECT_CHUNK = 50;
+
+export interface GrownFeedPruneResult {
+  /** Rows deleted. */
+  pruned: number;
+  /** True when the batch grew more than `limit` feeds. Only `limit` of them were
+   *  pruned; the caller should fall back to the rolling sweep. */
+  overflow: boolean;
+}
+
+/**
+ * Prune only the feeds an applied ingest batch can have grown.
+ *
+ * A feed grows only through the two inserts in buildFeedStatements: a target
+ * create/update fans out to the author's followers, and a follow create
+ * backfills the subject's recent items into the follower's feed. Deletes only
+ * shrink feeds. So this looks up the followers of the batch's target authors,
+ * adds the batch's new followers, and runs the cutoff delete for those
+ * (actor, collection) pairs only, rather than for a slice of every actor.
+ *
+ * A follow update counts as a new follower too. The cron path applies a batch
+ * in several transactions and prunes once at the end, so a fan-out to a
+ * follower can precede an update that repoints their follow; the lookup by
+ * subject would then no longer find them.
+ *
+ * A popular author's fan-out has no upper bound, so at most `limit` feeds are
+ * pruned and `overflow` reports the rest. feed_items is a soft cache, so a feed
+ * left a few rows over cap until the sweep reaches it is harmless.
+ */
+export async function pruneGrownFeeds(
+  db: Database,
+  config: ContrailConfig,
+  events: readonly IngestEvent[],
+  limit: number
+): Promise<GrownFeedPruneResult> {
+  const caps = buildFeedTargetCaps(config);
+  if (!config.feeds || caps.size === 0 || limit <= 0) {
+    return { pruned: 0, overflow: false };
+  }
+
+  const grown = new Map<string, { actor: string; collection: string }>();
+  const add = (actor: string, collection: string) => {
+    if (caps.has(collection)) {
+      grown.set(`${actor}\0${collection}`, { actor, collection });
+    }
+  };
+  let overflow = false;
+
+  for (const feedConfig of Object.values(config.feeds)) {
+    const followShort = feedConfig.follow ?? DEFAULT_FOLLOW_SHORT;
+    const targets = feedConfig.targets.map(normalizeFeedTarget);
+    const targetShorts = targets.map((t) => t.collection);
+    // Target authors in this batch -> the collections they wrote to.
+    const authors = new Map<string, Set<string>>();
+
+    for (const e of events) {
+      const short = shortNameForNsid(config, e.collection);
+      if (!short) continue;
+      if (
+        targetShorts.includes(short) &&
+        (e.operation === "create" || e.operation === "update")
+      ) {
+        const written = authors.get(e.did) ?? new Set<string>();
+        written.add(e.collection);
+        authors.set(e.did, written);
+      }
+      if (
+        short === followShort &&
+        (e.operation === "create" || e.operation === "update")
+      ) {
+        for (const target of targets) {
+          add(e.did, nsidForShortName(config, target.collection) ?? target.collection);
+        }
+      }
+    }
+
+    const subjectExpr = getDialect(db).jsonExtract("r.record", "subject");
+    const subjects = [...authors.keys()];
+    for (let i = 0; i < subjects.length && !overflow; i += GROWN_FEED_SUBJECT_CHUNK) {
+      const chunk = subjects.slice(i, i + GROWN_FEED_SUBJECT_CHUNK);
+      const res = await db
+        .prepare(
+          `SELECT r.did AS actor, ${subjectExpr} AS subject
+           FROM ${recordsTableName(followShort)} r
+           WHERE ${subjectExpr} IN (${chunk.map(() => "?").join(", ")})
+           LIMIT ?`
+        )
+        .bind(...chunk, limit + 1)
+        .all<{ actor: string; subject: string }>();
+      const followers = res.results ?? [];
+      for (const row of followers) {
+        for (const collection of authors.get(row.subject) ?? []) {
+          add(row.actor, collection);
+        }
+      }
+      if (followers.length > limit) overflow = true;
+    }
+    if (grown.size > limit) overflow = true;
+  }
+
+  const stmts = [...grown.values()]
+    .slice(0, limit)
+    .map(({ actor, collection }) =>
+      actorCutoffDelete(db, actor, collection, caps.get(collection)!)
+    );
+  let pruned = 0;
+  for (let i = 0; i < stmts.length; i += SWEEP_BATCH_SIZE) {
+    const results = await db.batch(stmts.slice(i, i + SWEEP_BATCH_SIZE));
+    for (const r of results) pruned += (r as any)?.changes ?? 0;
+  }
+  return { pruned, overflow };
+}
+
+// --- Feed prune cursor ---
+
+/** Last actor swept by the rolling feed prune; null = start of a fresh pass. */
+export async function getFeedPruneCursor(db: Database): Promise<string | null> {
+  const row = await db
+    .prepare("SELECT actor FROM feed_prune_cursor WHERE id = 1")
+    .first<{ actor: string | null }>();
+  return row?.actor ?? null;
+}
+
+export async function saveFeedPruneCursor(
+  db: Database,
+  actor: string | null
+): Promise<void> {
+  await db
+    .prepare(
+      "INSERT INTO feed_prune_cursor (id, actor) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET actor = excluded.actor"
+    )
+    .bind(actor)
+    .run();
+}
+
+// --- Cursor and ordered source position ---
+
+export interface ServingSourcePosition {
+  position: SourcePosition;
+  updatedAt: number;
+}
+
+export async function getServingSourcePosition(
+  db: Database,
+): Promise<ServingSourcePosition | null> {
+  const row = await db
+    .prepare(
+      "SELECT source, epoch, cursor, updated_at FROM source_position WHERE id = 1",
+    )
+    .first<{
+      source: string;
+      epoch: string;
+      cursor: string;
+      updated_at: number;
+    }>();
+  return row
+    ? {
+        position: {
+          source: row.source,
+          epoch: row.epoch,
+          cursor: row.cursor,
+        },
+        updatedAt: Number(row.updated_at),
+      }
+    : null;
+}
+
+export function saveServingSourcePositionStatement(
+  db: Database,
+  position: SourcePosition,
+  updatedAt = Date.now(),
+): Statement {
+  return db
+    .prepare(
+      `INSERT INTO source_position (id, source, epoch, cursor, updated_at)
+       VALUES (1, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         source = excluded.source,
+         epoch = excluded.epoch,
+         cursor = excluded.cursor,
+         updated_at = excluded.updated_at`,
+    )
+    .bind(position.source, position.epoch, position.cursor, updatedAt);
+}
+
+export const JETSTREAM_V2_SERVICE_META_KEY = "jetstream_v2_service";
+
+/** Bind instance-local v2 seqs to one normalized service origin. A legacy
+ * timestamp bridge may acquire its binding before transition; an unbound seq
+ * cursor is rejected because its originating instance cannot be recovered. */
+export async function assertJetstreamServiceCompatibility(
+  db: Database,
+  service: string,
+): Promise<void> {
+  let existing = await db
+    .prepare("SELECT value FROM _contrail_meta WHERE key = ?")
+    .bind(JETSTREAM_V2_SERVICE_META_KEY)
+    .first<{ value: string }>();
+
+  if (!existing) {
+    const cursor = await getLastCursor(db);
+    if (cursor !== null && !isJetstreamTimestampCursor(cursor)) {
+      throw new Error(
+        `durable Jetstream v2 seq cursor ${cursor} has no pinned service identity; ` +
+          "rebuild or explicitly migrate the generation",
+      );
+    }
+    await db
+      .prepare(
+        "INSERT INTO _contrail_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+      )
+      .bind(JETSTREAM_V2_SERVICE_META_KEY, service)
+      .run();
+    existing = await db
+      .prepare("SELECT value FROM _contrail_meta WHERE key = ?")
+      .bind(JETSTREAM_V2_SERVICE_META_KEY)
+      .first<{ value: string }>();
+  }
+
+  if (existing?.value !== service) {
+    throw new Error(
+      `configured Jetstream v2 service ${service} does not match durable service ` +
+        `${existing?.value ?? "<missing>"}; seq cursors are instance-local`,
+    );
+  }
+}
+
+export async function assertServingSourceCompatibility(
+  db: Database,
+  orderedSource?: OrderedSourceConfig,
+): Promise<void> {
+  if (!orderedSource) return;
+  let existing = await getServingSourcePosition(db);
+  if (!existing) {
+    await db
+      .prepare(
+        `INSERT INTO source_position (id, source, epoch, cursor, updated_at)
+         SELECT 1, ?, ?, CAST(time_us AS TEXT), ? FROM cursor WHERE id = 1
+         ON CONFLICT(id) DO NOTHING`,
+      )
+      .bind(orderedSource.source, orderedSource.epoch, Date.now())
+      .run();
+    existing = await getServingSourcePosition(db);
+    if (!existing) return;
+  }
+  if (
+    existing.position.source !== orderedSource.source ||
+    existing.position.epoch !== orderedSource.epoch
+  ) {
+    const sourcePositionCursor = Number(existing.position.cursor);
+    const liveCursor = await getLastCursor(db);
+    const pendingV2Transition =
+      existing.position.source === orderedSource.source &&
+      Number.isSafeInteger(sourcePositionCursor) &&
+      isJetstreamTimestampCursor(sourcePositionCursor) &&
+      liveCursor !== null &&
+      isJetstreamTimestampCursor(liveCursor);
+    if (pendingV2Transition) return;
+    throw new Error(
+      `configured ordered source ${orderedSource.source}/${orderedSource.epoch} ` +
+        `does not match durable source position ` +
+        `${existing.position.source}/${existing.position.epoch}`,
+    );
+  }
+}
+
+export function orderedSourcePosition(
+  orderedSource: OrderedSourceConfig,
+  cursor: number | string,
+): SourcePosition {
+  return {
+    source: orderedSource.source,
+    epoch: orderedSource.epoch,
+    cursor: String(cursor),
+  };
+}
+
+export function saveOrderedSourcePositionStatement(
+  db: Database,
+  orderedSource: OrderedSourceConfig,
+  timeUs: number,
+  updatedAt = Date.now(),
+): Statement {
+  const position = orderedSourcePosition(orderedSource, timeUs);
+  return db
+    .prepare(
+      `INSERT INTO source_position (id, source, epoch, cursor, updated_at)
+       SELECT 1, ?, ?, ?, ?
+       WHERE (SELECT time_us FROM cursor WHERE id = 1) = ?
+       ON CONFLICT(id) DO UPDATE SET
+         source = excluded.source,
+         epoch = excluded.epoch,
+         cursor = excluded.cursor,
+         updated_at = excluded.updated_at`,
+    )
+    .bind(
+      position.source,
+      position.epoch,
+      position.cursor,
+      updatedAt,
+      timeUs,
+    );
+}
 
 export async function getLastCursor(db: Database): Promise<number | null> {
   const row = await db
@@ -347,16 +921,168 @@ export async function getLastCursor(db: Database): Promise<number | null> {
   return row ? row.time_us : null;
 }
 
-export async function saveCursor(
+/** Load durable actor-acquisition scope. Identity resolution is best-effort, so
+ * visible discoverable records and relay backfill rows are also authoritative
+ * evidence that an actor is known. This keeps dependent collection filtering
+ * stable across process restarts even when profile resolution failed. */
+export async function loadKnownActorDids(
   db: Database,
-  timeUs: number
-): Promise<void> {
-  await db
+  config: ContrailConfig,
+): Promise<Set<string>> {
+  const known = new Set<string>();
+  const durableRows = await db
+    .prepare("SELECT did FROM identities UNION SELECT did FROM backfills")
+    .all<{ did: string }>();
+  for (const row of durableRows.results ?? []) known.add(row.did);
+
+  for (const [shortName, collection] of Object.entries(config.collections)) {
+    if (collection.discover === false) continue;
+    const rows = await db
+      .prepare(`SELECT DISTINCT did FROM ${recordsTableName(shortName)}`)
+      .all<{ did: string }>();
+    for (const row of rows.results ?? []) known.add(row.did);
+  }
+  return known;
+}
+
+/** Save a legacy timestamp cursor monotonically without allowing an old
+ * writer to move a database that has transitioned to the v2 seq domain back
+ * into the timestamp domain. */
+export function saveCursorStatement(
+  db: Database,
+  timeUs: number,
+): Statement {
+  return db
     .prepare(
-      "INSERT INTO cursor (id, time_us) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET time_us = excluded.time_us"
+      `INSERT INTO cursor (id, time_us) VALUES (1, ?)
+       ON CONFLICT(id) DO UPDATE SET time_us = CASE
+         WHEN cursor.time_us < ${JETSTREAM_V2_SEQ_THRESHOLD}
+          AND excluded.time_us >= ${JETSTREAM_V2_SEQ_THRESHOLD}
+           THEN cursor.time_us
+         WHEN excluded.time_us > cursor.time_us THEN excluded.time_us
+         ELSE cursor.time_us
+       END`,
+    )
+    .bind(timeUs);
+}
+
+/** Save a Jetstream v2 cursor monotonically while permitting the one-way
+ * legacy timestamp -> v2 seq transition. A stale timestamp-domain writer can
+ * never move an already-transitioned seq cursor back into the old domain. */
+export function saveJetstreamCursorStatement(
+  db: Database,
+  cursor: number,
+): Statement {
+  return db
+    .prepare(
+      `INSERT INTO cursor (id, time_us) VALUES (1, ?)
+       ON CONFLICT(id) DO UPDATE SET time_us = CASE
+         WHEN cursor.time_us >= ${JETSTREAM_V2_SEQ_THRESHOLD}
+          AND excluded.time_us < ${JETSTREAM_V2_SEQ_THRESHOLD}
+           THEN excluded.time_us
+         WHEN cursor.time_us < ${JETSTREAM_V2_SEQ_THRESHOLD}
+          AND excluded.time_us >= ${JETSTREAM_V2_SEQ_THRESHOLD}
+           THEN cursor.time_us
+         WHEN excluded.time_us > cursor.time_us THEN excluded.time_us
+         ELSE cursor.time_us
+       END`,
+    )
+    .bind(cursor);
+}
+
+/** Legacy timestamp-domain observation hashes. V2 seqs are unique and live
+ * ingestion clears these rows when it next commits; the reader remains for
+ * schema/API compatibility during the transition. */
+export async function getCursorObservations(
+  db: Database,
+  timeUs: number,
+): Promise<Set<string>> {
+  const rows = await db
+    .prepare(
+      "SELECT observation FROM cursor_observations WHERE time_us = ?",
     )
     .bind(timeUs)
-    .run();
+    .all<{ observation: string }>();
+  return new Set((rows.results ?? []).map((row) => row.observation));
+}
+
+/** Statements that atomically retire observations behind the monotonic cursor
+ * and union observations accounted for at its current timestamp. Inserts are
+ * conditional so an older concurrent cycle cannot attach hashes to a newer
+ * checkpoint. */
+export function saveCursorObservationStatements(
+  db: Database,
+  timeUs: number,
+  observations: Iterable<string>,
+): Statement[] {
+  return [
+    db.prepare(
+      "DELETE FROM cursor_observations WHERE time_us < (SELECT time_us FROM cursor WHERE id = 1)",
+    ),
+    ...[...new Set(observations)].map((observation) =>
+      db
+        .prepare(
+          "INSERT INTO cursor_observations (time_us, observation) SELECT ?, ? WHERE (SELECT time_us FROM cursor WHERE id = 1) = ? ON CONFLICT(time_us, observation) DO NOTHING",
+        )
+        .bind(timeUs, observation, timeUs),
+    ),
+  ];
+}
+
+/** V2 may move once from a large timestamp cursor to a smaller seq. Retain
+ * observations only at the exact resulting cursor so timestamp-domain rows do
+ * not survive that numeric decrease indefinitely. */
+export function saveJetstreamCursorObservationStatements(
+  db: Database,
+  cursor: number,
+  observations: Iterable<string>,
+): Statement[] {
+  return [
+    db.prepare(
+      "DELETE FROM cursor_observations WHERE time_us <> (SELECT time_us FROM cursor WHERE id = 1)",
+    ),
+    ...[...new Set(observations)].map((observation) =>
+      db
+        .prepare(
+          "INSERT INTO cursor_observations (time_us, observation) SELECT ?, ? WHERE (SELECT time_us FROM cursor WHERE id = 1) = ? ON CONFLICT(time_us, observation) DO NOTHING",
+        )
+        .bind(cursor, observation, cursor),
+    ),
+  ];
+}
+
+export async function saveCursor(
+  db: Database,
+  timeUs: number,
+  orderedSource?: OrderedSourceConfig,
+  observations: Iterable<string> = [],
+): Promise<void> {
+  const statements = [saveCursorStatement(db, timeUs)];
+  if (orderedSource) {
+    statements.push(
+      saveOrderedSourcePositionStatement(db, orderedSource, timeUs),
+    );
+  }
+  statements.push(...saveCursorObservationStatements(db, timeUs, observations));
+  await db.batch(statements);
+}
+
+export async function saveJetstreamCursor(
+  db: Database,
+  cursor: number,
+  orderedSource?: OrderedSourceConfig,
+  observations: Iterable<string> = [],
+): Promise<void> {
+  const statements = [saveJetstreamCursorStatement(db, cursor)];
+  if (orderedSource) {
+    statements.push(
+      saveOrderedSourcePositionStatement(db, orderedSource, cursor),
+    );
+  }
+  statements.push(
+    ...saveJetstreamCursorObservationStatements(db, cursor, observations),
+  );
+  await db.batch(statements);
 }
 
 // --- Existing record lookup ---
@@ -367,6 +1093,178 @@ export interface ExistingRecordInfo {
   /** When the row was last written to our DB (microseconds). Populated
    *  whenever `lookupExistingRecords` runs, regardless of `includeRecord`. */
   indexed_at: number | null;
+}
+
+export interface RecordVersionInfo {
+  uri: string;
+  did: string;
+  collection: string;
+  rkey: string;
+  operation: "create" | "update" | "delete";
+  cid: string | null;
+  source_id: string;
+  source_epoch: string | null;
+  source_revision: string | null;
+  source_time_us: number;
+  source_cursor: string | null;
+  indexed_at: number;
+  /** Opaque optimistic-concurrency token; not part of source ordering. */
+  projection_token: string;
+}
+
+type ComparableRecordVersion = Omit<RecordVersionInfo, "projection_token">;
+
+function versionForEvent(event: IngestEvent): ComparableRecordVersion {
+  const source = event.source;
+  return {
+    uri: event.uri,
+    did: event.did,
+    collection: event.collection,
+    rkey: event.rkey,
+    operation: event.operation,
+    cid: event.cid,
+    source_id: source?.id ?? "legacy-caller",
+    source_epoch: source?.epoch ?? null,
+    // Before 0.13.1 callers had no separate source clock, so time_us is the
+    // least surprising compatibility fallback for hand-built IngestEvents.
+    source_time_us: source?.time_us ?? event.time_us,
+    source_revision: source?.revision ?? null,
+    source_cursor: source?.cursor ?? null,
+    indexed_at: event.indexed_at,
+  };
+}
+
+function comparePositionStrings(left: string, right: string): number {
+  if (/^\d+$/.test(left) && /^\d+$/.test(right)) {
+    if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+  }
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function operationRank(operation: RecordVersionInfo["operation"]): number {
+  if (operation === "delete") return 3;
+  if (operation === "update") return 2;
+  return 1;
+}
+
+/**
+ * Compare two observations of one canonical URI. Repository revisions are the
+ * strongest signal when both sides have one. Otherwise source event/observation
+ * time orders adapters consistently. Remaining comparisons are deterministic
+ * tie-breakers; notably a delete wins an exact tie so replay cannot resurrect it.
+ */
+export function compareRecordVersions(
+  left: ComparableRecordVersion,
+  right: ComparableRecordVersion,
+): number {
+  if (
+    left.source_revision !== null &&
+    right.source_revision !== null &&
+    left.source_revision !== right.source_revision
+  ) {
+    return comparePositionStrings(left.source_revision, right.source_revision);
+  }
+  if (left.source_time_us !== right.source_time_us) {
+    return left.source_time_us < right.source_time_us ? -1 : 1;
+  }
+  if ((left.source_revision === null) !== (right.source_revision === null)) {
+    return left.source_revision === null ? -1 : 1;
+  }
+  if (
+    left.source_id === right.source_id &&
+    left.source_epoch === right.source_epoch &&
+    left.source_cursor !== null &&
+    right.source_cursor !== null &&
+    left.source_cursor !== right.source_cursor
+  ) {
+    return comparePositionStrings(left.source_cursor, right.source_cursor);
+  }
+  const operationDifference =
+    operationRank(left.operation) - operationRank(right.operation);
+  if (operationDifference !== 0) return operationDifference;
+  const leftCid = left.cid ?? "";
+  const rightCid = right.cid ?? "";
+  if (leftCid !== rightCid) return leftCid < rightCid ? -1 : 1;
+  if (left.source_id !== right.source_id) {
+    return left.source_id < right.source_id ? -1 : 1;
+  }
+  const leftEpoch = left.source_epoch ?? "";
+  const rightEpoch = right.source_epoch ?? "";
+  if (leftEpoch !== rightEpoch) return leftEpoch < rightEpoch ? -1 : 1;
+  return 0;
+}
+
+export async function lookupRecordVersions(
+  db: Database,
+  uris: Iterable<string>,
+): Promise<Map<string, RecordVersionInfo>> {
+  const uniqueUris = [...new Set(uris)];
+  const versions = new Map<string, RecordVersionInfo>();
+  for (let index = 0; index < uniqueUris.length; index += 50) {
+    const chunk = uniqueUris.slice(index, index + 50);
+    const placeholders = chunk.map(() => "?").join(",");
+    const rows = await db
+      .prepare(
+        `SELECT uri, did, collection, rkey, operation, cid, source_id, source_epoch, source_revision, source_time_us, source_cursor, indexed_at, projection_token FROM record_versions WHERE uri IN (${placeholders})`,
+      )
+      .bind(...chunk)
+      .all<RecordVersionInfo>();
+    for (const row of rows.results ?? []) versions.set(row.uri, row);
+  }
+  return versions;
+}
+
+export interface MutationSelection {
+  applied: IngestEvent[];
+  superseded: number;
+}
+
+export function selectMutationWinners(
+  events: IngestEvent[],
+  durable: ReadonlyMap<string, RecordVersionInfo>,
+): MutationSelection {
+  const winners = new Map<
+    string,
+    { event: IngestEvent; version: ComparableRecordVersion; index: number }
+  >();
+  let superseded = 0;
+
+  for (let index = 0; index < events.length; index++) {
+    const event = events[index];
+    const version = versionForEvent(event);
+    const batchWinner = winners.get(event.uri);
+    const current = batchWinner?.version ?? durable.get(event.uri);
+    if (current && compareRecordVersions(version, current) <= 0) {
+      superseded++;
+      continue;
+    }
+    if (batchWinner) superseded++;
+    winners.set(event.uri, { event, version, index });
+  }
+
+  return {
+    applied: [...winners.values()]
+      .sort((left, right) => left.index - right.index)
+      .map((winner) => winner.event),
+    superseded,
+  };
+}
+
+/** Deduplicate one authoritative source observation without a durable lookup. */
+export function selectAuthoritativeMutations(
+  events: IngestEvent[],
+): MutationSelection {
+  return selectMutationWinners(events, new Map());
+}
+
+/** Select one newest mutation per URI and reject rows older than durable state. */
+export async function selectCurrentMutations(
+  db: Database,
+  events: IngestEvent[],
+): Promise<MutationSelection> {
+  if (events.length === 0) return { applied: [], superseded: 0 };
+  const durable = await lookupRecordVersions(db, events.map((event) => event.uri));
+  return selectMutationWinners(events, durable);
 }
 
 /**
@@ -386,7 +1284,7 @@ export async function lookupExistingRecords(
   // Group by short name (config lookup); skip events for collections not in our config.
   const byShort = new Map<string, string[]>();
   for (const e of events) {
-    const short = config ? shortNameForNsid(config, e.collection) : e.collection;
+    const short = config ? resolveCollectionKey(config, e.collection) : e.collection;
     if (!short) continue;
     const uris = byShort.get(short) ?? [];
     uris.push(e.uri);
@@ -423,41 +1321,252 @@ export async function lookupExistingRecords(
 
 // --- Events ---
 
-export async function applyEvents(
+// D1 accepts at most 100 bound parameters per statement. A record upsert uses
+// seven, so fourteen rows fit while leaving the same SQL valid for SQLite and
+// PostgreSQL. Packing rows avoids one prepared statement per record during
+// backfill without changing the admission or derived-projection path.
+const MAX_STATEMENT_BINDINGS = 100;
+const RECORD_UPSERT_BINDINGS = 7;
+const RECORD_UPSERT_ROWS = Math.floor(
+  MAX_STATEMENT_BINDINGS / RECORD_UPSERT_BINDINGS
+);
+const RECORD_VERSION_BINDINGS = 13;
+const RECORD_VERSION_ROWS = Math.floor(
+  MAX_STATEMENT_BINDINGS / RECORD_VERSION_BINDINGS,
+);
+const PROJECTION_GUARD_URIS = 40;
+
+interface StorageMutation {
+  event: IngestEvent;
+  table: string;
+}
+
+function buildRecordVersionStatements(
   db: Database,
   events: IngestEvent[],
-  config?: ContrailConfig,
+  existing: Map<string, ExistingRecordInfo>,
+  projectionTokens: ReadonlyMap<string, string>,
+): Statement[] {
+  const statements: Statement[] = [];
+  for (let index = 0; index < events.length; index += RECORD_VERSION_ROWS) {
+    const chunk = events.slice(index, index + RECORD_VERSION_ROWS);
+    const values = chunk
+      .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .join(", ");
+    statements.push(
+      db
+        .prepare(
+          `INSERT INTO record_versions (uri, did, collection, rkey, operation, cid, source_id, source_epoch, source_revision, source_time_us, source_cursor, indexed_at, projection_token) VALUES ${values} ON CONFLICT(uri) DO UPDATE SET did = excluded.did, collection = excluded.collection, rkey = excluded.rkey, operation = excluded.operation, cid = excluded.cid, source_id = excluded.source_id, source_epoch = excluded.source_epoch, source_revision = excluded.source_revision, source_time_us = excluded.source_time_us, source_cursor = excluded.source_cursor, indexed_at = excluded.indexed_at, projection_token = excluded.projection_token`,
+        )
+        .bind(
+          ...chunk.flatMap((event) => {
+            const version = versionForEvent(event);
+            const retainedCid =
+              event.operation === "delete"
+                ? (version.cid ?? existing.get(event.uri)?.cid ?? null)
+                : version.cid;
+            return [
+              version.uri,
+              version.did,
+              version.collection,
+              version.rkey,
+              version.operation,
+              retainedCid,
+              version.source_id,
+              version.source_epoch,
+              version.source_revision,
+              version.source_time_us,
+              version.source_cursor,
+              version.indexed_at,
+              projectionTokens.get(event.uri)!,
+            ];
+          }),
+        ),
+    );
+  }
+  return statements;
+}
+
+function buildRecordMutationStatements(
+  db: Database,
+  mutations: Iterable<StorageMutation>
+): Statement[] {
+  const byTable = new Map<
+    string,
+    { upserts: IngestEvent[]; deletes: IngestEvent[] }
+  >();
+  for (const { event, table } of mutations) {
+    const group = byTable.get(table) ?? { upserts: [], deletes: [] };
+    if (event.operation === "delete") group.deletes.push(event);
+    else group.upserts.push(event);
+    byTable.set(table, group);
+  }
+
+  const statements: Statement[] = [];
+  for (const [table, { upserts, deletes }] of byTable) {
+    for (let index = 0; index < upserts.length; index += RECORD_UPSERT_ROWS) {
+      const chunk = upserts.slice(index, index + RECORD_UPSERT_ROWS);
+      const values = chunk.map(() => "(?, ?, ?, ?, ?, ?, ?)").join(", ");
+      statements.push(
+        db
+          .prepare(
+            `INSERT INTO ${table} (uri, did, rkey, cid, record, time_us, indexed_at) VALUES ${values} ON CONFLICT(uri) DO UPDATE SET cid = excluded.cid, record = excluded.record, time_us = excluded.time_us, indexed_at = excluded.indexed_at`
+          )
+          .bind(
+            ...chunk.flatMap((event) => [
+              event.uri,
+              event.did,
+              event.rkey,
+              event.cid,
+              event.record,
+              event.time_us,
+              event.indexed_at,
+            ])
+          )
+      );
+    }
+
+    for (let index = 0; index < deletes.length; index += MAX_STATEMENT_BINDINGS) {
+      const chunk = deletes.slice(index, index + MAX_STATEMENT_BINDINGS);
+      const placeholders = chunk.map(() => "?").join(", ");
+      statements.push(
+        db
+          .prepare(`DELETE FROM ${table} WHERE uri IN (${placeholders})`)
+          .bind(...chunk.map((event) => event.uri))
+      );
+    }
+  }
+  return statements;
+}
+
+function buildProjectionGuardStatements(
+  db: Database,
+  events: IngestEvent[],
+  predecessors: ReadonlyMap<string, RecordVersionInfo>,
+): Statement[] {
+  const uris = [...new Set(events.map((event) => event.uri))];
+  const statements: Statement[] = [
+    db.prepare(
+      `INSERT INTO _contrail_projection_state (id, revision, guard)
+       VALUES (1, 0, 1) ON CONFLICT(id) DO NOTHING`,
+    ),
+    // PostgreSQL takes a row lock here. The following statement then receives a
+    // fresh READ COMMITTED snapshot after any earlier projector commits. SQLite
+    // and D1 already serialize the containing write batch.
+    db.prepare(
+      `UPDATE _contrail_projection_state
+       SET revision = revision + 1
+       WHERE id = 1`,
+    ),
+  ];
+  for (let index = 0; index < uris.length; index += PROJECTION_GUARD_URIS) {
+    const chunk = uris.slice(index, index + PROJECTION_GUARD_URIS);
+    const conditions: string[] = [];
+    const bindings: string[] = [];
+    for (const uri of chunk) {
+      const predecessor = predecessors.get(uri);
+      if (!predecessor) {
+        conditions.push(
+          "NOT EXISTS (SELECT 1 FROM record_versions WHERE uri = ?)",
+        );
+        bindings.push(uri);
+        continue;
+      }
+      if (!predecessor.projection_token) {
+        throw new Error(`Record version ${uri} has no projection token`);
+      }
+      conditions.push(
+        "EXISTS (SELECT 1 FROM record_versions WHERE uri = ? AND projection_token = ?)",
+      );
+      bindings.push(uri, predecessor.projection_token);
+    }
+    statements.push(
+      db
+        .prepare(
+          `UPDATE _contrail_projection_state
+           SET guard = CASE WHEN ${conditions.join(" AND ")} THEN 1 ELSE 0 END
+           WHERE id = 1`,
+        )
+        .bind(...bindings),
+    );
+  }
+  return statements;
+}
+
+/** Adapter-neutral classification for the named optimistic guard constraint. */
+export function isProjectionConflictError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { code?: unknown; constraint?: unknown; message?: unknown };
+  return (
+    (candidate.code === "23514" &&
+      candidate.constraint === "projection_guard_valid") ||
+    /projection_guard_valid/i.test(String(candidate.message ?? ""))
+  );
+}
+
+export async function projectEvents(
+  db: Database,
+  events: IngestEvent[],
+  config: ContrailConfig,
   options?: {
     skipReplayDetection?: boolean;
     skipFeedFanout?: boolean;
-    /** Pre-fetched existing records — skips the internal lookup when provided */
+    /** Skip FTS and relation-count maintenance during canonical bulk loading. */
+    skipDerivedProjections?: boolean;
+    /** @deprecated Existing rows are re-read for transaction conflict safety. */
     existing?: Map<string, ExistingRecordInfo>;
-    /** When provided, publish `collection:<nsid>` and `actor:<did>` realtime
-     *  events for each applied event. Space-scoped publishing happens elsewhere
-     *  (see `realtime/publishing-adapter.ts`); public topics carry public
-     *  records only, which is exactly the scope of this function. */
-    pubsub?: import("../realtime/types").PubSub;
-  }
-): Promise<void> {
-  if (events.length === 0) return;
+    /** Statements committed after projection in the same database batch. */
+    trailingStatements?: Statement[];
+    /** Internal: ingestRecords already checked durable source order. */
+    sourceOrderingChecked?: boolean;
+    /** Durable versions observed while selecting source winners. */
+    predecessors?: ReadonlyMap<string, RecordVersionInfo>;
+    /** Acquisition phase persisted on an optional change batch. */
+    phase?: ProjectionPhase;
+  },
+): Promise<MutationSelection> {
+  if (events.length === 0) return { applied: [], superseded: 0 };
 
-  const followCollections = config ? getFeedFollowShortNames(config) : [];
-  const hasCountingRelations = config ? Object.values(config.collections).some(c =>
-    Object.values(c.relations ?? {}).some(r => r.count !== false)
-  ) : false;
-  const needRecordContent = followCollections.length > 0 || hasCountingRelations;
-
-  // Use pre-fetched data or look up existing records
-  let existingMap: Map<string, ExistingRecordInfo>;
-  if (options?.existing) {
-    existingMap = options.existing;
-  } else if (config && !options?.skipReplayDetection) {
-    existingMap = await lookupExistingRecords(db, events, needRecordContent, config);
-  } else {
-    existingMap = new Map();
+  const predecessors =
+    options?.predecessors ??
+    (await lookupRecordVersions(db, events.map((event) => event.uri)));
+  const selection = options?.sourceOrderingChecked
+    ? { applied: events, superseded: 0 }
+    : selectMutationWinners(events, predecessors);
+  events = selection.applied;
+  if (events.length === 0) {
+    if (options?.trailingStatements?.length) {
+      await db.batch(options.trailingStatements);
+    }
+    return selection;
   }
+
+  const followCollections = getFeedFollowShortNames(config);
+  const hasCountingRelations =
+    !options?.skipDerivedProjections &&
+    Object.values(config.collections).some((collection) =>
+      Object.values(collection.relations ?? {}).some(
+        (relation) => relation.count !== false
+      )
+    );
+  const needRecordContent =
+    followCollections.length > 0 ||
+    hasCountingRelations ||
+    changesEnabled(config);
+
+  // Existing state must be read after predecessor selection. A caller-provided
+  // map can predate that selection and would make derived changes incorrect
+  // even when the optimistic token guard itself succeeds.
+  const needExistingState =
+    !options?.skipReplayDetection || needRecordContent || changesEnabled(config);
+  const existingMap = needExistingState
+    ? await lookupExistingRecords(db, events, needRecordContent, config)
+    : new Map<string, ExistingRecordInfo>();
 
   const batch: Statement[] = [];
+  // Keep only the final storage mutation for a URI within this atomic batch.
+  // Derived projections still inspect every admitted event below.
+  const storageMutations = new Map<string, StorageMutation>();
 
   // Build a record-content map for feed statements (needs string values)
   const existingRecordStrings = new Map<string, string | null>();
@@ -466,106 +1575,215 @@ export async function applyEvents(
   }
 
   // Collect all count recount targets across the batch, deduplicated
-  const countTargets = new Map<string, { parentCollection: string; relationName: string; rel: RelationConfig; targetValue: string }>();
+  const countTargets = new Map<string, CountTarget>();
 
   for (const e of events) {
-    // Event's collection is an NSID. Look up the short name from config.
-    // If no config or not found, treat collection string as-is (for tests that pre-populate tables).
-    const short = config
-      ? shortNameForNsid(config, e.collection) ?? (config.collections[e.collection] ? e.collection : null)
-      : e.collection;
+    // Event's collection is an NSID. Resolve its storage key from config.
+    const short = resolveCollectionKey(config, e.collection);
     if (!short) {
-      (config?.logger ?? console).warn(
-        `[ingest] drop (unknown collection in applyEvents): ${e.operation} ${e.uri} collection=${e.collection}`
+      (config.logger ?? console).warn(
+        `[ingest] drop (unknown collection in projection): ${e.operation} ${e.uri} collection=${e.collection}`
       );
       continue;
     }
     const table = recordsTableName(short);
+    storageMutations.set(`${table}\0${e.uri}`, { event: e, table });
 
-    if (e.operation === "delete") {
-      batch.push(db.prepare(`DELETE FROM ${table} WHERE uri = ?`).bind(e.uri));
-    } else {
-      batch.push(
-        db.prepare(
-          `INSERT INTO ${table} (uri, did, rkey, cid, record, time_us, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(uri) DO UPDATE SET cid = excluded.cid, record = excluded.record, time_us = excluded.time_us, indexed_at = excluded.indexed_at`
-        ).bind(
-          e.uri,
-          e.did,
-          e.rkey,
-          e.cid,
-          e.record,
-          e.time_us,
-          e.indexed_at
-        )
-      );
-    }
-
-    if (config) {
+    if (!options?.skipDerivedProjections) {
       // Collect count targets (deduplicated across the whole batch)
       const existingRecordJson = existingMap.get(e.uri)?.record ?? null;
       collectCountTargets(e, config, existingRecordJson, countTargets);
+      collectParentCountTargets(e, config, countTargets);
+    }
 
-      // Feed fanout still needs replay detection
-      const existingInfo = existingMap.get(e.uri);
-      const isReplay =
-        e.operation === "delete"
-          ? existingInfo === undefined
-          : existingInfo?.cid === e.cid;
+    // Feed fanout still needs replay detection
+    const existingInfo = existingMap.get(e.uri);
+    const isReplay =
+      e.operation === "delete"
+        ? existingInfo === undefined
+        : existingInfo?.cid === e.cid;
 
-      if (!isReplay && !options?.skipFeedFanout) {
-        batch.push(...buildFeedStatements(db, e, config, existingRecordStrings));
-      }
-      batch.push(...buildFtsStatements(db, e, config, existingMap));
+    if (!isReplay && !options?.skipFeedFanout) {
+      batch.push(...buildFeedStatements(db, e, config, existingRecordStrings));
+    }
+    if (!options?.skipDerivedProjections) {
+      batch.push(...buildFtsStatements(db, e, config));
     }
   }
 
-  // Build deduplicated count statements — one UPDATE per unique target
-  if (config) {
-    batch.push(...buildBatchCountStatements(db, config, countTargets));
+  const projectionTokens = new Map(
+    events.map((event) => [event.uri, crypto.randomUUID()] as const),
+  );
+
+  // Lock, verify the exact durable predecessors selected by the caller, then
+  // write storage and version metadata. Any changed token violates the named
+  // guard constraint and rolls the complete database batch back.
+  batch.unshift(
+    ...buildProjectionGuardStatements(db, events, predecessors),
+    ...buildRecordMutationStatements(db, storageMutations.values()),
+    ...buildRecordVersionStatements(
+      db,
+      events,
+      existingMap,
+      projectionTokens,
+    ),
+  );
+
+  // Build deduplicated count statements, then append the compact change batch.
+  // Caller-provided source checkpoints deliberately remain last.
+  // Counts (parent rows) precede moderation writes (moderation lock, then
+  // recount queue rows). PostgreSQL writers then share one lock order: parent
+  // rows -> moderation lock -> recount queue, matching moderation recounts and
+  // trailing lifecycle statements. Visibility changed by this batch's actions
+  // reaches parent counts through the recount queue.
+  batch.push(...buildBatchCountStatements(db, config, countTargets));
+  batch.push(...actionProjectionStatements(db, events, config));
+  batch.push(...labelBackfillEnqueueStatements(db, events.filter((e) => e.operation !== "delete").map((e) => e.did), config));
+  batch.push(
+    ...appendChangeLogStatements(
+      db,
+      events,
+      existingMap,
+      config,
+      options?.phase ?? "live",
+    ),
+  );
+  if (options?.trailingStatements?.length) {
+    batch.push(...options.trailingStatements);
   }
 
   await db.batch(batch);
+  return selection;
+}
 
-  // Publish realtime events for public records (collection: and actor:).
-  // Space records publish via the wrapping adapter; this path is public-only.
-  if (options?.pubsub) {
-    const pubsub = options.pubsub;
-    const ts = Date.now();
-    for (const e of events) {
-      if (e.operation === "delete") {
-        const payload = {
-          uri: e.uri,
-          did: e.did,
-          collection: e.collection,
-          rkey: e.rkey,
-        };
-        await pubsub.publish({ topic: `collection:${e.collection}`, kind: "record.deleted", payload, ts });
-        await pubsub.publish({ topic: `actor:${e.did}`, kind: "record.deleted", payload, ts });
-      } else {
-        const record = e.record ? safeParseJson(e.record) : {};
-        const payload = {
-          uri: e.uri,
-          did: e.did,
-          collection: e.collection,
-          rkey: e.rkey,
-          cid: e.cid,
-          record,
-          time_us: e.time_us,
-        };
-        await pubsub.publish({ topic: `collection:${e.collection}`, kind: "record.created", payload, ts });
-        await pubsub.publish({ topic: `actor:${e.did}`, kind: "record.created", payload, ts });
+/** Rebuild projections that are intentionally skipped during canonical bulk
+ * loading. Live ingestion and scheduled retries continue maintaining them
+ * incrementally after this set-based catch-up. */
+export async function rebuildDerivedProjections(
+  db: Database,
+  config: ContrailConfig
+): Promise<void> {
+  const dialect = getDialect(db);
+
+  if (dialect.ftsStrategy === "virtual-table") {
+    for (const [short, collection] of Object.entries(config.collections)) {
+      const fields = getSearchableFields(short, collection);
+      if (!fields || fields.length === 0) continue;
+
+      const ftsTable = ftsTableName(short);
+      const rowsTable = ftsRowTableName(short);
+      const recordsTable = recordsTableName(short);
+      const content = sqliteFtsContentExpression(fields);
+      try {
+        await db.batch([
+          db.prepare(`DELETE FROM ${ftsTable}`),
+          db.prepare(`DELETE FROM ${rowsTable}`),
+          db.prepare(
+            `INSERT INTO ${rowsTable} (uri)
+             SELECT uri FROM (
+               SELECT uri, ${content} AS content FROM ${recordsTable}
+             ) rebuilt
+             WHERE content <> ''
+             ORDER BY uri`,
+          ),
+          db.prepare(
+            `INSERT INTO ${ftsTable} (rowid, content)
+             SELECT fts_rows.id, rebuilt.content
+             FROM (
+               SELECT uri, ${content} AS content FROM ${recordsTable}
+             ) rebuilt
+             JOIN ${rowsTable} fts_rows ON fts_rows.uri = rebuilt.uri
+             WHERE rebuilt.content <> ''`,
+          ),
+        ]);
+      } catch {
+        // FTS5 is optional in some SQLite builds, matching schema initialization.
       }
     }
   }
-}
 
-function safeParseJson(s: string): Record<string, unknown> {
-  try {
-    const v = JSON.parse(s);
-    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
-  } catch {
-    return {};
+  const countStatements: Statement[] = [];
+  for (const [parentShort, parentConfig] of Object.entries(config.collections)) {
+    const parentTable = recordsTableName(parentShort);
+    for (const [relationName, relation] of Object.entries(
+      parentConfig.relations ?? {}
+    )) {
+      if (relation.count === false) continue;
+
+      const childTable = recordsTableName(relation.collection);
+      const childTarget = dialect.jsonExtract(
+        "child.record",
+        getRelationField(relation)
+      );
+      const parentTarget = relation.match === "did" ? "did" : "uri";
+      const distinctExpression = relation.countDistinct
+        ? ["uri", "did", "rkey"].includes(relation.countDistinct)
+          ? `child.${relation.countDistinct}`
+          : dialect.jsonExtract("child.record", relation.countDistinct)
+        : null;
+      const totalCount = distinctExpression
+        ? `COUNT(DISTINCT ${distinctExpression})`
+        : "COUNT(*)";
+      const totalColumn = countColumnName(relation.collection);
+      const projections = [`${totalCount} AS ${totalColumn}`];
+      const columns = [totalColumn];
+      const bindings: string[] = [];
+
+      const mapping = (config as ResolvedContrailConfig)._resolved?.relations[
+        parentShort
+      ]?.[relationName];
+      if (relation.groupBy && mapping?.groups) {
+        const childGroup = dialect.jsonExtract(
+          "child.record",
+          relation.groupBy
+        );
+        for (const [groupKey, token] of Object.entries(mapping.groups)) {
+          const column = groupedCountColumnName(
+            relation.collection,
+            groupKey
+          );
+          const groupedCount = distinctExpression
+            ? `COUNT(DISTINCT CASE WHEN ${childGroup} = ? THEN ${distinctExpression} END)`
+            : `SUM(CASE WHEN ${childGroup} = ? THEN 1 ELSE 0 END)`;
+          projections.push(`${groupedCount} AS ${column}`);
+          columns.push(column);
+          bindings.push(token);
+        }
+      }
+
+      // Reset parents with no matching children, then update only parents that
+      // appear in one grouped child scan. This avoids N parents × M correlated
+      // COUNT subqueries during a historical rebuild.
+      countStatements.push(
+        db.prepare(
+          `UPDATE ${parentTable} SET ${columns
+            .map((column) => `${column} = 0`)
+            .join(", ")}`
+        )
+      );
+      const aggregateUpdate = db.prepare(
+        `WITH derived AS (
+           SELECT ${childTarget} AS target, ${projections.join(", ")}
+           FROM ${childTable} child
+           WHERE ${visibleRecordSql("child")}
+           GROUP BY ${childTarget}
+         )
+         UPDATE ${parentTable} AS parent
+         SET ${columns
+           .map((column) => `${column} = derived.${column}`)
+           .join(", ")}
+         FROM derived
+         WHERE parent.${parentTarget} = derived.target`
+      );
+      countStatements.push(
+        bindings.length > 0
+          ? aggregateUpdate.bind(...bindings)
+          : aggregateUpdate
+      );
+    }
   }
+
+  if (countStatements.length > 0) await db.batch(countStatements);
 }
 
 // --- Count columns ---
@@ -621,13 +1839,13 @@ export interface SortOption {
   direction: "asc" | "desc";
 }
 
-/** Opaque keyset cursor. `t` is the tiebreaker (time_us of the last row),
- *  `v` is the sort-key value (string for record fields, number for counts),
- *  `k` identifies the sort so we can reject mismatched cursors. */
+/** Opaque keyset cursor. `v` is the primary sort value, `t` is time,
+ *  and `u` is the final unique tiebreaker. */
 interface CursorPayload {
   t: number;
-  v?: string | number;
-  k: "time" | string; // "time" | `field:<name>` | `count:<type>`
+  u: string;
+  v?: string | number | null;
+  k: "time" | "search" | string;
 }
 
 function sortKind(sort?: SortOption): "time" | string {
@@ -636,15 +1854,40 @@ function sortKind(sort?: SortOption): "time" | string {
   return "time";
 }
 
+function encodeBase64Url(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  }
+  return btoa(binary)
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/, "");
+}
+
+function decodeBase64Url(value: string): string {
+  const base64 = value.replaceAll("-", "+").replaceAll("_", "/");
+  const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+  const binary = atob(padded);
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
 function encodeCursor(payload: CursorPayload): string {
-  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  return encodeBase64Url(JSON.stringify(payload));
 }
 
 function decodeCursor(cursor: string): CursorPayload | null {
   try {
-    const json = Buffer.from(cursor, "base64url").toString("utf8");
-    const p = JSON.parse(json);
-    if (typeof p?.t !== "number" || typeof p?.k !== "string") return null;
+    const p = JSON.parse(decodeBase64Url(cursor));
+    if (
+      typeof p?.t !== "number" ||
+      typeof p?.u !== "string" ||
+      typeof p?.k !== "string"
+    ) {
+      return null;
+    }
     return p as CursorPayload;
   } catch {
     return null;
@@ -662,9 +1905,6 @@ export interface QueryOptions {
   sort?: SortOption;
   search?: string;
   source?: RecordSource;
-  /** When set, query the per-space table (`spaces_records_<short>`) instead of the
-   *  public `records_<short>` table, scoped to rows where `space_uri = ?`. */
-  spaceUri?: string;
 }
 
 export async function queryRecords(
@@ -683,7 +1923,6 @@ export async function queryRecords(
     sort,
     search,
     source,
-    spaceUri,
   } = options;
 
   // Accept either the short name (canonical) or the full NSID for convenience.
@@ -692,15 +1931,10 @@ export async function queryRecords(
       ? collectionInput
       : shortNameForNsid(config, collectionInput) ?? collectionInput;
 
-  const table = spaceUri ? spacesRecordsTableName(collection) : recordsTableName(collection);
+  const table = recordsTableName(collection);
   const limit = Math.min(Math.max(1, rawLimit ?? 50), 200);
-  const conditions: string[] = [];
+  const conditions: string[] = [visibleRecordSql("r")];
   const bindings: (string | number)[] = [];
-
-  if (spaceUri) {
-    conditions.push("r.space_uri = ?");
-    bindings.push(spaceUri);
-  }
 
   if (source?.conditions) conditions.push(...source.conditions);
   if (source?.params) bindings.push(...source.params);
@@ -712,44 +1946,109 @@ export async function queryRecords(
     bindings.push(did);
   }
 
-  // Opaque keyset cursor encoding { t, v?, k }. Silently ignored if it doesn't
-  // match the current sort — callers shouldn't mix sort params with stale cursors.
-  const expectedKind = sortKind(sort);
+  const dialect = getDialect(db);
+  let ftsJoin = "";
+  let ftsClause: ReturnType<typeof ftsQueryClause> | null = null;
+  if (search) {
+    const collectionConfig = config.collections[collection];
+    const fields = collectionConfig
+      ? getSearchableFields(collection, collectionConfig)
+      : null;
+    if (fields && fields.length > 0) {
+      ftsClause = ftsQueryClause(dialect, recordsTableName(collection));
+      ftsJoin = ftsClause.join;
+      conditions.push(ftsClause.condition);
+      bindings.push(search);
+    }
+  }
+
+  // Cursors are accepted only for the ordering that created them. URI is the
+  // final key so rows with identical sort values and timestamps cannot vanish.
+  const expectedKind = sort
+    ? sortKind(sort)
+    : ftsClause
+      ? "search"
+      : "time";
   if (cursor) {
     const payload = decodeCursor(cursor);
     if (payload && payload.k === expectedKind) {
+      const stableTail =
+        "(r.time_us < ? OR (r.time_us = ? AND r.uri > ?))";
       if (sort?.recordField) {
-        const sortExpr = getDialect(db).jsonExtract('r.record', sort.recordField);
-        const cmp = sort.direction === "desc" ? "<" : ">";
-        conditions.push(`(${sortExpr} ${cmp} ? OR (${sortExpr} = ? AND r.time_us < ?))`);
-        const v = payload.v ?? "";
-        bindings.push(v as string | number, v as string | number, payload.t);
+        const sortExpr = dialect.jsonExtract("r.record", sort.recordField);
+        if (payload.v === null) {
+          conditions.push(`(${sortExpr} IS NULL AND ${stableTail})`);
+          bindings.push(payload.t, payload.t, payload.u);
+        } else if (payload.v !== undefined) {
+          const cmp = sort.direction === "desc" ? "<" : ">";
+          conditions.push(
+            `(${sortExpr} ${cmp} ? OR (${sortExpr} = ? AND ${stableTail}) OR ${sortExpr} IS NULL)`,
+          );
+          bindings.push(
+            payload.v,
+            payload.v,
+            payload.t,
+            payload.t,
+            payload.u,
+          );
+        }
       } else if (sort?.countType) {
         const sortCol = countColumnForType(config, collection, sort.countType);
         if (!sortCol) throw new Error(`Unknown countType: ${sort.countType}`);
         const cmp = sort.direction === "desc" ? "<" : ">";
-        conditions.push(`(r.${sortCol} ${cmp} ? OR (r.${sortCol} = ? AND r.time_us < ?))`);
-        const v = Number(payload.v ?? 0);
-        bindings.push(v, v, payload.t);
-      } else {
-        conditions.push("r.time_us < ?");
-        bindings.push(payload.t);
+        const value = Number(payload.v ?? 0);
+        conditions.push(
+          `(r.${sortCol} ${cmp} ? OR (r.${sortCol} = ? AND ${stableTail}))`,
+        );
+        bindings.push(value, value, payload.t, payload.t, payload.u);
+      } else if (ftsClause && search && typeof payload.v === "number") {
+        const rankExpr = ftsClause.orderExpr;
+        const cmp = ftsClause.orderDirection === "desc" ? "<" : ">";
+        conditions.push(
+          `(${rankExpr} ${cmp} ? OR (${rankExpr} = ? AND ${stableTail}))`,
+        );
+        if (dialect.ftsStrategy === "generated-column") {
+          bindings.push(
+            search,
+            payload.v,
+            search,
+            payload.v,
+            payload.t,
+            payload.t,
+            payload.u,
+          );
+        } else {
+          bindings.push(
+            payload.v,
+            payload.v,
+            payload.t,
+            payload.t,
+            payload.u,
+          );
+        }
+      } else if (!ftsClause) {
+        // Expose the time bound outside the tie-breaking OR so an equality
+        // filter's (field, time_us DESC, uri ASC) index can seek to a deep page
+        // instead of visiting every earlier match. The tail still preserves
+        // every URI when records share the cursor timestamp.
+        conditions.push(`(r.time_us <= ? AND ${stableTail})`);
+        bindings.push(payload.t, payload.t, payload.t, payload.u);
       }
     }
   }
 
   for (const [field, value] of Object.entries(filters)) {
-    conditions.push(`${getDialect(db).jsonExtract('r.record', field)} = ?`);
+    conditions.push(`${dialect.jsonExtract("r.record", field)} = ?`);
     bindings.push(value);
   }
 
   for (const [field, range] of Object.entries(rangeFilters)) {
     if (range.min != null) {
-      conditions.push(`${getDialect(db).jsonExtract('r.record', field)} >= ?`);
+      conditions.push(`${dialect.jsonExtract("r.record", field)} >= ?`);
       bindings.push(range.min);
     }
     if (range.max != null) {
-      conditions.push(`${getDialect(db).jsonExtract('r.record', field)} <= ?`);
+      conditions.push(`${dialect.jsonExtract("r.record", field)} <= ?`);
       bindings.push(range.max);
     }
   }
@@ -761,61 +2060,56 @@ export async function queryRecords(
     bindings.push(minCount);
   }
 
-  // FTS search. Not supported in space mode yet (would need composite keying
-  // because the same at-URI can appear in multiple spaces).
-  let ftsJoin = "";
-  let ftsClause: ReturnType<typeof ftsQueryClause> | null = null;
-  if (search && !spaceUri) {
-    const colConfig2 = config.collections[collection];
-    const fields = colConfig2 ? getSearchableFields(collection, colConfig2) : null;
-    if (fields && fields.length > 0) {
-      ftsClause = ftsQueryClause(getDialect(db), recordsTableName(collection));
-      ftsJoin = ftsClause.join;
-      conditions.push(ftsClause.condition);
-      // SECURITY: `search` is user input bound as a parameter, not interpolated.
-      bindings.push(search);
-    }
-  }
-
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
   const countSelect = countCols.length > 0
     ? ", " + countCols.map(({ column }) => `r.${column}`).join(", ")
     : "";
-  const select = `r.uri, r.did, r.rkey, r.cid, r.record, r.time_us, r.indexed_at${countSelect}`;
+  const selectBindings: (string | number)[] = [];
+  const fieldSortSelect = sort?.recordField
+    ? `, ${dialect.jsonExtract("r.record", sort.recordField)} AS __sort_value`
+    : "";
+  let searchRankSelect = "";
+  if (expectedKind === "search" && ftsClause && search) {
+    searchRankSelect = `, ${ftsClause.orderExpr} AS __search_rank`;
+    if (dialect.ftsStrategy === "generated-column") {
+      selectBindings.push(search);
+    }
+  }
+  const select = `r.uri, r.did, r.rkey, r.cid, r.record, r.time_us, r.indexed_at${countSelect}${fieldSortSelect}${searchRankSelect}`;
 
   const join = [source?.joins, ftsJoin].filter(Boolean).join(" ");
+  const orderBindings: (string | number)[] = [];
 
   let orderBy: string;
   if (sort?.recordField) {
     const dir = sort.direction === "desc" ? "DESC" : "ASC";
-    orderBy = `${getDialect(db).jsonExtract('r.record', sort.recordField)} ${dir}, r.time_us DESC`;
+    orderBy = `${dialect.jsonExtract("r.record", sort.recordField)} ${dir} NULLS LAST, r.time_us DESC, r.uri ASC`;
   } else if (sort?.countType) {
     const dir = sort.direction === "desc" ? "DESC" : "ASC";
     const sortCol = countColumnForType(config, collection, sort.countType);
     if (!sortCol) throw new Error(`Unknown countType: ${sort.countType}`);
-    orderBy = `r.${sortCol} ${dir}, r.time_us DESC`;
+    orderBy = `r.${sortCol} ${dir}, r.time_us DESC, r.uri ASC`;
   } else if (ftsClause) {
-    orderBy = `${ftsClause.orderExpr}, r.time_us DESC`;
-    // PG ts_rank needs the search term bound again for ORDER BY
-    if (getDialect(db).ftsStrategy === "generated-column" && search) {
-      bindings.push(search);
+    const dir = ftsClause.orderDirection.toUpperCase();
+    orderBy = `${ftsClause.orderExpr} ${dir}, r.time_us DESC, r.uri ASC`;
+    if (dialect.ftsStrategy === "generated-column" && search) {
+      orderBindings.push(search);
     }
   } else {
-    orderBy = "r.time_us DESC";
+    orderBy = "r.time_us DESC, r.uri ASC";
   }
-
-  bindings.push(limit);
 
   const query = `SELECT ${select} FROM ${table} r ${join} ${where} ORDER BY ${orderBy} LIMIT ?`;
 
   const result = await db
     .prepare(query)
-    .bind(...bindings)
+    .bind(...selectBindings, ...bindings, ...orderBindings, limit)
     .all<any>();
+  const rows = result.results ?? [];
 
   const nsid = nsidForShortName(config, collection) ?? collection;
-  const records = (result.results ?? []).map((row: any) => {
+  const records = rows.map((row: any) => {
     const rec: RecordRow & { counts?: Record<string, number> } = {
       uri: row.uri,
       did: row.did,
@@ -825,7 +2119,6 @@ export async function queryRecords(
       record: row.record,
       time_us: row.time_us,
       indexed_at: row.indexed_at,
-      ...(spaceUri ? { space: spaceUri } : {}),
     };
     if (countCols.length > 0) {
       const counts: Record<string, number> = {};
@@ -840,7 +2133,13 @@ export async function queryRecords(
 
   const nextCursor =
     records.length === limit
-      ? buildCursor(records[records.length - 1], sort, expectedKind)
+      ? buildCursor(
+          records[records.length - 1],
+          sort,
+          expectedKind,
+          rows[rows.length - 1]?.__sort_value,
+          rows[rows.length - 1]?.__search_rank,
+        )
       : undefined;
 
   return { records, cursor: nextCursor };
@@ -850,79 +2149,29 @@ export async function queryRecords(
 function buildCursor(
   row: RecordRow & { counts?: Record<string, number> },
   sort: SortOption | undefined,
-  kind: string
+  kind: string,
+  fieldSortValue?: unknown,
+  searchRank?: unknown,
 ): string {
   const t = Number(row.time_us);
+  const u = row.uri;
   if (sort?.recordField) {
-    const parsed = row.record ? JSON.parse(row.record) : null;
-    const v = parsed ? getNestedValue(parsed, sort.recordField) : undefined;
-    return encodeCursor({ t, v: v == null ? "" : String(v), k: kind });
+    const v =
+      fieldSortValue === null ||
+      typeof fieldSortValue === "string" ||
+      typeof fieldSortValue === "number"
+        ? fieldSortValue
+        : null;
+    return encodeCursor({ t, u, v, k: kind });
   }
   if (sort?.countType) {
     const v = row.counts?.[sort.countType] ?? 0;
-    return encodeCursor({ t, v, k: kind });
+    return encodeCursor({ t, u, v, k: kind });
   }
-  return encodeCursor({ t, k: kind });
+  if (kind === "search") {
+    const v = Number(searchRank);
+    if (!Number.isFinite(v)) throw new Error("Search rank missing from result");
+    return encodeCursor({ t, u, v, k: kind });
+  }
+  return encodeCursor({ t, u, k: kind });
 }
-
-/** Compare two rows according to the active sort order. Returns negative if
- *  `a` should come before `b`, positive otherwise. Matches the SQL ORDER BY. */
-function compareRows(
-  a: RecordRow & { counts?: Record<string, number> },
-  b: RecordRow & { counts?: Record<string, number> },
-  sort: SortOption | undefined
-): number {
-  const timeCmp = Number(b.time_us) - Number(a.time_us); // time_us DESC
-  if (sort?.recordField) {
-    const ar = a.record ? JSON.parse(a.record) : null;
-    const br = b.record ? JSON.parse(b.record) : null;
-    const av = ar ? getNestedValue(ar, sort.recordField) : undefined;
-    const bv = br ? getNestedValue(br, sort.recordField) : undefined;
-    const dir = sort.direction === "desc" ? -1 : 1;
-    const cmp = (av === bv ? 0 : (av! < bv! ? -1 : 1)) * dir;
-    return cmp !== 0 ? cmp : timeCmp;
-  }
-  if (sort?.countType) {
-    const av = a.counts?.[sort.countType] ?? 0;
-    const bv = b.counts?.[sort.countType] ?? 0;
-    const dir = sort.direction === "desc" ? -1 : 1;
-    const cmp = (av === bv ? 0 : (av < bv ? -1 : 1)) * dir;
-    return cmp !== 0 ? cmp : timeCmp;
-  }
-  return timeCmp;
-}
-
-/** Run a listRecords query across the public table and a set of per-space tables
- *  in parallel, then merge according to the active sort order. The cursor is a
- *  shared keyset cursor — every sub-query applies the same `WHERE` keyset, so
- *  pagination is consistent across sources. */
-export async function queryAcrossSources(
-  db: Database,
-  config: ContrailConfig,
-  options: QueryOptions,
-  spaceUris: string[]
-): Promise<{ records: (RecordRow & { counts?: Record<string, number> })[]; cursor?: string }> {
-  if (spaceUris.length === 0) {
-    return queryRecords(db, config, options);
-  }
-  const limit = Math.min(Math.max(1, options.limit ?? 50), 200);
-  const perSourceLimit = limit; // each source fetches up to `limit`; we trim after merge
-
-  const tasks: Promise<{ records: (RecordRow & { counts?: Record<string, number> })[] }>[] = [
-    queryRecords(db, config, { ...options, limit: perSourceLimit }),
-  ];
-  for (const spaceUri of spaceUris) {
-    tasks.push(queryRecords(db, config, { ...options, spaceUri, limit: perSourceLimit }));
-  }
-  const results = await Promise.all(tasks);
-  const merged = results.flatMap((r) => r.records);
-  merged.sort((a, b) => compareRows(a, b, options.sort));
-  const trimmed = merged.slice(0, limit);
-  const kind = sortKind(options.sort);
-  const cursor =
-    trimmed.length === limit ? buildCursor(trimmed[trimmed.length - 1], options.sort, kind) : undefined;
-  return { records: trimmed, cursor };
-}
-
-// --- Users ---
-

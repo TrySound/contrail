@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import type { Database, RecordRow, RelationConfig, ReferenceConfig } from "../src/core/types";
-import { recordsTableName } from "../src/core/types";
-import { parseHydrateParams, resolveHydrates, resolveReferences } from "../src/core/router/hydrate";
+import type { Database, RecordRow, RelationConfig, ReferenceConfig } from "../src/index";
+import { recordsTableName } from "../src/index";
+import { parseHydrateParams, resolveHydrates, resolveReferences } from "../src/index";
 import { createTestDbWithSchema, makeEvent, TEST_CONFIG } from "./helpers";
-import { applyEvents } from "./helpers";
+import { ingestRecords } from "./helpers";
 
 describe("parseHydrateParams", () => {
   const relations: Record<string, RelationConfig> = {
@@ -79,21 +79,24 @@ describe("resolveHydrates", () => {
     expect(result).toEqual({});
   });
 
-  it("hydrates related records", async () => {
+  it("maps grouped Lexicon tokens to their configured short names", async () => {
     const eventUri = "at://did:plc:test/community.lexicon.calendar.event/evt1";
 
     // Insert event
-    await applyEvents(db, [makeEvent({ uri: eventUri, rkey: "evt1", time_us: 1000 })]);
+    await ingestRecords(db, [makeEvent({ uri: eventUri, rkey: "evt1", time_us: 1000 })]);
 
-    // Insert RSVPs
+    // Insert RSVPs using the full token stored in real Lexicon records.
     for (let i = 0; i < 3; i++) {
-      await applyEvents(db, [
+      await ingestRecords(db, [
         makeEvent({
           uri: `at://did:plc:user${i}/community.lexicon.calendar.rsvp/r${i}`,
           did: `did:plc:user${i}`,
           collection: "rsvp",
           rkey: `r${i}`,
-          record: { subject: { uri: eventUri }, status: "going" },
+          record: {
+            subject: { uri: eventUri },
+            status: "community.lexicon.calendar.rsvp#going",
+          },
           time_us: 2000 + i,
         }),
       ]);
@@ -114,10 +117,10 @@ describe("resolveHydrates", () => {
 
   it("respects hydrate limit", async () => {
     const eventUri = "at://did:plc:test/community.lexicon.calendar.event/evt1";
-    await applyEvents(db, [makeEvent({ uri: eventUri, rkey: "evt1", time_us: 1000 })]);
+    await ingestRecords(db, [makeEvent({ uri: eventUri, rkey: "evt1", time_us: 1000 })]);
 
     for (let i = 0; i < 5; i++) {
-      await applyEvents(db, [
+      await ingestRecords(db, [
         makeEvent({
           uri: `at://did:plc:user${i}/community.lexicon.calendar.rsvp/r${i}`,
           did: `did:plc:user${i}`,
@@ -145,10 +148,10 @@ describe("resolveHydrates", () => {
     const eventUri = `at://${did}/community.lexicon.calendar.event/evt1`;
 
     // Insert event owned by this DID
-    await applyEvents(db, [makeEvent({ uri: eventUri, did, rkey: "evt1", time_us: 1000 })]);
+    await ingestRecords(db, [makeEvent({ uri: eventUri, did, rkey: "evt1", time_us: 1000 })]);
 
     // Insert a related record whose "author" field contains the parent's DID
-    await applyEvents(db, [
+    await ingestRecords(db, [
       makeEvent({
         uri: `at://did:plc:other/community.lexicon.calendar.rsvp/r1`,
         did: "did:plc:other",
@@ -179,13 +182,13 @@ describe("resolveHydrates", () => {
     const eventUri = "at://did:plc:test/community.lexicon.calendar.event/evt1";
 
     // Insert event
-    await applyEvents(db, [
+    await ingestRecords(db, [
       makeEvent({ uri: eventUri, rkey: "evt1", record: { name: "My Event" }, time_us: 1000 }),
     ]);
 
     // Insert RSVP pointing at the event
     const rsvpUri = "at://did:plc:user1/community.lexicon.calendar.rsvp/r1";
-    await applyEvents(db, [
+    await ingestRecords(db, [
       makeEvent({
         uri: rsvpUri,
         did: "did:plc:user1",
@@ -215,7 +218,7 @@ describe("resolveHydrates", () => {
     const eventUri2 = "at://did:plc:test/community.lexicon.calendar.event/evt2";
 
     // Insert two events
-    await applyEvents(db, [
+    await ingestRecords(db, [
       makeEvent({ uri: eventUri1, rkey: "evt1", record: { name: "Event 1" }, time_us: 1000 }),
       makeEvent({ uri: eventUri2, rkey: "evt2", record: { name: "Event 2" }, time_us: 1001 }),
     ]);
@@ -223,7 +226,7 @@ describe("resolveHydrates", () => {
     // Insert RSVPs pointing at different events
     const rsvpUri1 = "at://did:plc:user1/community.lexicon.calendar.rsvp/r1";
     const rsvpUri2 = "at://did:plc:user2/community.lexicon.calendar.rsvp/r2";
-    await applyEvents(db, [
+    await ingestRecords(db, [
       makeEvent({
         uri: rsvpUri1,
         did: "did:plc:user1",
@@ -259,10 +262,10 @@ describe("resolveHydrates", () => {
   it("groups into 'other' when groupBy value is null", async () => {
     const eventUri = "at://did:plc:test/community.lexicon.calendar.event/evt1";
 
-    await applyEvents(db, [makeEvent({ uri: eventUri, rkey: "evt1", time_us: 1000 })]);
+    await ingestRecords(db, [makeEvent({ uri: eventUri, rkey: "evt1", time_us: 1000 })]);
 
     // Insert RSVP without a status field — groupBy "status" should fall back to "other"
-    await applyEvents(db, [
+    await ingestRecords(db, [
       makeEvent({
         uri: "at://did:plc:user1/community.lexicon.calendar.rsvp/r1",
         did: "did:plc:user1",

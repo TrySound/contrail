@@ -1,0 +1,519 @@
+import { isAtprotoWebDid, webDidToDocumentUrl } from "@atcute/identity";
+import {
+  isNsid,
+  type AtprotoAudience,
+  type AtprotoDid,
+} from "@atcute/lexicons/syntax";
+import type { ContrailConfig } from "./core/types.js";
+import {
+  compareCanonical,
+  formatServiceOAuthScope,
+  parseServiceAudience,
+  parseServiceOAuthScope,
+  type ServiceOAuthScope,
+} from "./service-auth-contract.js";
+import {
+  getCollectionMethods,
+  nsidForShortName,
+  resolveConfig,
+} from "./core/types.js";
+
+export interface PublicServiceOptions {
+  /** Canonical public HTTPS origin, for example `https://api.example.com`. */
+  endpoint: string;
+  /** Permit plain HTTP only on a loopback host for local development. */
+  allowInsecureHttp?: boolean;
+}
+
+export interface PublicServiceCollection {
+  alias: string;
+  nsid: string;
+  methods: string[];
+  queryable: string[];
+  searchable: string[];
+  relations: string[];
+  references: string[];
+}
+
+export interface PublicServiceProtectedMethod {
+  id: string;
+  type: "query" | "procedure";
+}
+
+export interface PublicServiceAuthContract {
+  type: "atproto-service-auth";
+  serviceDid: AtprotoDid;
+  audience: AtprotoAudience;
+  scope: ServiceOAuthScope;
+  methods: PublicServiceProtectedMethod[];
+}
+
+export interface PublicServiceManifest {
+  format: "contrail.service";
+  version: 2;
+  endpoint: string;
+  namespace: string;
+  lexicons: { url: string; digest: string };
+  status: { url: string };
+  collections: PublicServiceCollection[];
+  methods: string[];
+  serviceAuth?: PublicServiceAuthContract | null;
+}
+
+export interface LexiconDocument {
+  lexicon?: number;
+  id: string;
+  [key: string]: unknown;
+}
+
+export interface PublicServiceDescription {
+  endpoint: string;
+  lexicons: LexiconDocument[];
+  manifest: PublicServiceManifest;
+  canonicalLexicons: string;
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  return (
+    hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]"
+  );
+}
+
+export function normalizePublicServiceEndpoint(
+  value: string,
+  options: { allowInsecureHttp?: boolean } = {},
+): string {
+  const url = new URL(value);
+  const insecureLoopback =
+    options.allowInsecureHttp === true &&
+    url.protocol === "http:" &&
+    isLoopbackHostname(url.hostname);
+  if (url.protocol !== "https:" && !insecureLoopback) {
+    throw new Error(
+      options.allowInsecureHttp
+        ? "public service endpoint must use HTTPS or loopback HTTP"
+        : "public service endpoint must use HTTPS",
+    );
+  }
+  if (url.username || url.password) {
+    throw new Error("public service endpoint must not contain credentials");
+  }
+  if (url.pathname !== "/" || url.search || url.hash) {
+    throw new Error(
+      "public service endpoint must be an origin without a path, query, or fragment",
+    );
+  }
+  return url.origin;
+}
+
+/** Whether this endpoint is the origin that hosts the base DID's document, and
+ * therefore whether Contrail should publish one at `/.well-known/did.json`. */
+export function hostsServiceDidDocument(
+  serviceDid: AtprotoDid,
+  endpoint: string,
+): boolean {
+  if (!isAtprotoWebDid(serviceDid)) return false;
+  return (
+    webDidToDocumentUrl(serviceDid).href ===
+    new URL("/.well-known/did.json", endpoint).href
+  );
+}
+
+export function validatePublicServiceAuthEndpoint(
+  config: ContrailConfig,
+  options: PublicServiceOptions,
+): void {
+  if (!config.serviceAuth) return;
+  const endpoint = normalizePublicServiceEndpoint(options.endpoint, options);
+  const { serviceDid, audience } = parseServiceAudience(
+    config.serviceAuth.audience,
+  );
+  if (!isAtprotoWebDid(serviceDid)) return;
+
+  if (!hostsServiceDidDocument(serviceDid, endpoint)) {
+    throw new Error(
+      `serviceAuth audience ${audience} resolves its DID document to ${webDidToDocumentUrl(serviceDid).href}, not ${new URL("/.well-known/did.json", endpoint).href}`,
+    );
+  }
+}
+
+function normalizeJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(normalizeJson);
+  if (value && typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort()) {
+      const child = (value as Record<string, unknown>)[key];
+      if (child !== undefined) result[key] = normalizeJson(child);
+    }
+    return result;
+  }
+  return value;
+}
+
+export function canonicalJson(value: unknown): string {
+  return JSON.stringify(normalizeJson(value));
+}
+
+export async function sha256(value: string): Promise<string> {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return `sha256:${Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("")}`;
+}
+
+export function normalizeLexiconDocuments(
+  values: readonly object[],
+): LexiconDocument[] {
+  const byId = new Map<string, LexiconDocument>();
+  for (const value of values) {
+    const id = (value as { id?: unknown }).id;
+    if (typeof id !== "string" || !isNsid(id)) {
+      throw new Error("public service lexicons must each have a valid NSID id");
+    }
+    if (byId.has(id)) {
+      throw new Error(`duplicate public service lexicon: ${id}`);
+    }
+    byId.set(id, value as LexiconDocument);
+  }
+  return [...byId.values()].sort((a, b) => compareCanonical(a.id, b.id));
+}
+
+function publicCollections(config: ContrailConfig): PublicServiceCollection[] {
+  return Object.keys(config.collections)
+    .sort()
+    .map((alias) => {
+      const collection = config.collections[alias]!;
+      const standardMethods = getCollectionMethods(collection).map(
+        (method) => `${config.namespace}.${alias}.${method}`,
+      );
+      const customMethods = [
+        ...Object.keys(collection.queries ?? {}),
+        ...Object.keys(collection.pipelineQueries ?? {}),
+      ].map((method) => `${config.namespace}.${alias}.${method}`);
+      return {
+        alias,
+        nsid: nsidForShortName(config, alias) ?? alias,
+        methods: [...new Set([...standardMethods, ...customMethods])].sort(),
+        queryable: Object.keys(collection.queryable ?? {}).sort(),
+        searchable:
+          collection.searchable === false
+            ? []
+            : [...(collection.searchable ?? [])].sort(),
+        relations: Object.keys(collection.relations ?? {}).sort(),
+        references: Object.keys(collection.references ?? {}).sort(),
+      };
+    });
+}
+
+function publicTopLevelMethods(config: ContrailConfig): string[] {
+  const methods = [`${config.namespace}.getCursor`];
+  if ((config.profiles?.length ?? 0) > 0) {
+    methods.push(`${config.namespace}.getProfile`);
+  }
+  if (config.feeds && Object.keys(config.feeds).length > 0) {
+    methods.push(`${config.namespace}.getFeed`);
+  }
+  return methods;
+}
+
+function publicServiceAuth(
+  config: ContrailConfig,
+): PublicServiceAuthContract | null {
+  if (!config.serviceAuth || config.serviceAuth.methods.length === 0)
+    return null;
+  const methods = config.serviceAuth.methods
+    .map((method): PublicServiceProtectedMethod => ({
+      id: method === "createReport" ? "com.atproto.moderation.createReport"
+        : method === "listReports" || method === "resolveReport" ? `${config.namespace}.moderation.${method}`
+        : `${config.namespace}.${method}`,
+      type: method === "getFeed" || method === "listReports" ? "query" : "procedure",
+    }))
+    .sort((left, right) => compareCanonical(left.id, right.id));
+  const { serviceDid, audience } = parseServiceAudience(
+    config.serviceAuth.audience,
+  );
+  return {
+    type: "atproto-service-auth",
+    serviceDid,
+    audience,
+    scope: formatServiceOAuthScope(
+      audience,
+      methods.map((method) => method.id),
+    ),
+    methods,
+  };
+}
+
+interface PublicServiceMetadata {
+  namespace: string;
+  collections: PublicServiceCollection[];
+  methods: string[];
+  serviceAuth: PublicServiceAuthContract | null;
+}
+
+function createPublicServiceMetadata(
+  config: ContrailConfig,
+): PublicServiceMetadata {
+  const resolved = resolveConfig(config);
+  const collections = publicCollections(resolved);
+  const serviceAuth = publicServiceAuth(resolved);
+  const protectedMethods = new Set(
+    serviceAuth?.methods.map((method) => method.id) ?? [],
+  );
+  const methods = [
+    ...publicTopLevelMethods(resolved),
+    ...collections.flatMap((collection) => collection.methods),
+  ].filter((method) => !protectedMethods.has(method));
+  return {
+    namespace: resolved.namespace,
+    collections,
+    methods: [...new Set(methods)].sort(),
+    serviceAuth,
+  };
+}
+
+function validateServiceLexicons(
+  service: Pick<PublicServiceMetadata, "methods" | "serviceAuth">,
+  values: readonly object[],
+): LexiconDocument[] {
+  const lexicons = normalizeLexiconDocuments(values);
+  if (lexicons.length === 0) {
+    throw new Error("public service requires a non-empty Lexicon bundle");
+  }
+  const byId = new Map(lexicons.map((document) => [document.id, document]));
+  for (const method of service.methods) {
+    const document = byId.get(method) as
+      { defs?: { main?: { type?: unknown } } } | undefined;
+    if (document?.defs?.main?.type !== "query") {
+      throw new Error(
+        `public method requires a matching query Lexicon: ${method}`,
+      );
+    }
+  }
+  for (const method of service.serviceAuth?.methods ?? []) {
+    const document = byId.get(method.id) as
+      { defs?: { main?: { type?: unknown } } } | undefined;
+    if (document?.defs?.main?.type !== method.type) {
+      throw new Error(
+        `protected method requires a matching ${method.type} Lexicon: ${method.id}`,
+      );
+    }
+  }
+  return lexicons;
+}
+
+function assertPublicServiceSource(config: ContrailConfig): void {
+  if (!config.orderedSource) {
+    throw new Error(
+      "public service mode requires orderedSource so getCursor has a durable continuity identity",
+    );
+  }
+}
+
+export function validatePublicServiceLexicons(
+  config: ContrailConfig,
+  values: readonly object[],
+): LexiconDocument[] {
+  assertPublicServiceSource(config);
+  return validateServiceLexicons(createPublicServiceMetadata(config), values);
+}
+
+export async function digestLexiconDocuments(
+  values: readonly object[],
+): Promise<{
+  lexicons: LexiconDocument[];
+  canonicalLexicons: string;
+  digest: string;
+}> {
+  const lexicons = normalizeLexiconDocuments(values);
+  const canonicalLexicons = canonicalJson({ lexicons });
+  return {
+    lexicons,
+    canonicalLexicons,
+    digest: await sha256(canonicalLexicons),
+  };
+}
+
+export async function describePublicService(
+  config: ContrailConfig,
+  options: PublicServiceOptions,
+  values: readonly object[],
+): Promise<PublicServiceDescription> {
+  assertPublicServiceSource(config);
+  const endpoint = normalizePublicServiceEndpoint(options.endpoint, options);
+  const {
+    lexicons,
+    canonicalLexicons,
+    digest: lexiconDigest,
+  } = await digestLexiconDocuments(values);
+  const service = createPublicServiceMetadata(config);
+  validateServiceLexicons(service, lexicons);
+  const manifest: PublicServiceManifest = {
+    format: "contrail.service",
+    version: 2,
+    endpoint,
+    namespace: service.namespace,
+    lexicons: {
+      url: `${endpoint}/lexicons/${lexiconDigest}`,
+      digest: lexiconDigest,
+    },
+    status: { url: `${endpoint}/status` },
+    collections: service.collections,
+    methods: service.methods,
+    serviceAuth: service.serviceAuth,
+  };
+  return { endpoint, lexicons, manifest, canonicalLexicons };
+}
+
+function uniqueStrings(values: string[]): boolean {
+  return new Set(values).size === values.length;
+}
+
+export function validateServiceManifest(
+  manifest: PublicServiceManifest,
+  values: readonly object[],
+): LexiconDocument[] {
+  if (!isPublicServiceAuthContract(manifest.serviceAuth)) {
+    throw new Error("service manifest contains invalid service auth");
+  }
+  if (!uniqueStrings(manifest.methods)) {
+    throw new Error("service manifest contains duplicate methods");
+  }
+  const aliases = manifest.collections.map((collection) => collection.alias);
+  if (!uniqueStrings(aliases)) {
+    throw new Error("service manifest contains duplicate collection aliases");
+  }
+  const prefix = `${manifest.namespace}.`;
+  if (manifest.methods.some((method) => !method.startsWith(prefix))) {
+    throw new Error("service manifest method is outside its namespace");
+  }
+  const protectedMethods = manifest.serviceAuth?.methods ?? [];
+  const protectedIds = protectedMethods.map((method) => method.id);
+  if (!uniqueStrings(protectedIds)) {
+    throw new Error("service manifest contains duplicate protected methods");
+  }
+  if (protectedIds.some((method) => !method.startsWith(prefix))) {
+    throw new Error(
+      "service manifest protected method is outside its namespace",
+    );
+  }
+  if (protectedIds.some((method) => manifest.methods.includes(method))) {
+    throw new Error(
+      "service manifest method cannot be both anonymous and protected",
+    );
+  }
+  const advertised = new Set(manifest.methods);
+  for (const collection of manifest.collections) {
+    if (!uniqueStrings(collection.methods)) {
+      throw new Error(
+        `service manifest collection ${collection.alias} contains duplicate methods`,
+      );
+    }
+    for (const method of collection.methods) {
+      if (!advertised.has(method)) {
+        throw new Error(
+          `collection ${collection.alias} advertises an unknown method: ${method}`,
+        );
+      }
+    }
+  }
+  return validateServiceLexicons(
+    { methods: manifest.methods, serviceAuth: manifest.serviceAuth ?? null },
+    values,
+  );
+}
+
+export function isPublicServiceAuthContract(
+  value: unknown,
+): value is PublicServiceAuthContract | null | undefined {
+  if (value === null || value === undefined) return true;
+  if (!value || typeof value !== "object") return false;
+  const auth = value as Partial<PublicServiceAuthContract>;
+  if (
+    auth.type !== "atproto-service-auth" ||
+    typeof auth.serviceDid !== "string" ||
+    typeof auth.audience !== "string" ||
+    typeof auth.scope !== "string" ||
+    !Array.isArray(auth.methods) ||
+    !auth.methods.every(
+      (method) =>
+        !!method &&
+        typeof method === "object" &&
+        typeof method.id === "string" &&
+        isNsid(method.id) &&
+        (method.type === "query" || method.type === "procedure"),
+    )
+  ) {
+    return false;
+  }
+
+  try {
+    const audience = parseServiceAudience(auth.audience);
+    const parsedScope = parseServiceOAuthScope(auth.scope);
+    const methodIds = auth.methods.map((method) => method.id);
+    const sortedMethodIds = [...methodIds].sort(compareCanonical);
+    return (
+      new Set(methodIds).size === methodIds.length &&
+      methodIds.every((method, index) => method === sortedMethodIds[index]) &&
+      auth.serviceDid === audience.serviceDid &&
+      parsedScope.audience === audience.audience &&
+      parsedScope.canonicalScope === auth.scope &&
+      formatServiceOAuthScope(audience.audience, methodIds) === auth.scope
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function isPublicServiceManifest(
+  value: unknown,
+): value is PublicServiceManifest {
+  if (!value || typeof value !== "object") return false;
+  const manifest = value as Partial<PublicServiceManifest>;
+  const digest = /^sha256:[0-9a-f]{64}$/;
+  if (
+    manifest.format !== "contrail.service" ||
+    manifest.version !== 2 ||
+    "contract" in manifest ||
+    typeof manifest.endpoint !== "string" ||
+    typeof manifest.namespace !== "string" ||
+    !isNsid(`${manifest.namespace}.method`) ||
+    typeof manifest.lexicons?.url !== "string" ||
+    typeof manifest.lexicons?.digest !== "string" ||
+    !digest.test(manifest.lexicons.digest) ||
+    typeof manifest.status?.url !== "string" ||
+    !Array.isArray(manifest.collections) ||
+    !Array.isArray(manifest.methods) ||
+    !isPublicServiceAuthContract(manifest.serviceAuth) ||
+    !manifest.methods.every(
+      (method) => typeof method === "string" && isNsid(method),
+    )
+  ) {
+    return false;
+  }
+  return manifest.collections.every((collection) => {
+    if (!collection || typeof collection !== "object") return false;
+    const entry = collection as Partial<PublicServiceCollection>;
+    return (
+      typeof entry.alias === "string" &&
+      entry.alias.length > 0 &&
+      typeof entry.nsid === "string" &&
+      isNsid(entry.nsid) &&
+      Array.isArray(entry.methods) &&
+      entry.methods.every(
+        (method) => typeof method === "string" && isNsid(method),
+      ) &&
+      [
+        entry.queryable,
+        entry.searchable,
+        entry.relations,
+        entry.references,
+      ].every(
+        (items) =>
+          Array.isArray(items) &&
+          items.every((item) => typeof item === "string"),
+      )
+    );
+  });
+}

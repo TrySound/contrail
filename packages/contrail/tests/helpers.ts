@@ -1,10 +1,15 @@
 import { createSqliteDatabase } from "../src/adapters/sqlite";
-import type { Database, IngestEvent, ResolvedContrailConfig } from "../src/core/types";
-import { resolveConfig } from "../src/core/types";
-import { initSchema } from "../src/core/db/schema";
-import { applyEvents as coreApplyEvents, type ExistingRecordInfo } from "../src/core/db/records";
+import { createPgliteDatabase } from "./pglite";
+import type { Database, IngestEvent, ResolvedContrailConfig } from "../src/index";
+import { resolveConfig } from "../src/index";
+import { initSchema } from "../src/index";
+import { ingestRecords as coreIngestRecords, type ExistingRecordInfo } from "../src/index";
+
+/** `CONTRAIL_TEST_DIALECT=postgres` runs suites on in-process PostgreSQL. */
+export const TEST_POSTGRES = process.env.CONTRAIL_TEST_DIALECT === "postgres";
 
 export function createTestDb(): Database {
+  if (TEST_POSTGRES) return createPgliteDatabase();
   return createSqliteDatabase(":memory:");
 }
 
@@ -48,17 +53,18 @@ export async function createTestDbWithSchema(): Promise<Database> {
   return db;
 }
 
-/** Apply events with TEST_CONFIG baked in — avoids each test having to pass it. */
-export function applyEvents(
+/** Ingest records with TEST_CONFIG baked in. */
+export function ingestRecords(
   db: Database,
   events: IngestEvent[],
   options?: {
     skipReplayDetection?: boolean;
     skipFeedFanout?: boolean;
+    skipDerivedProjections?: boolean;
     existing?: Map<string, ExistingRecordInfo>;
   }
 ): Promise<void> {
-  return coreApplyEvents(db, events, TEST_CONFIG, options);
+  return coreIngestRecords(db, events, TEST_CONFIG, options).then(() => undefined);
 }
 
 export function makeEvent(overrides: Partial<{
@@ -85,4 +91,62 @@ export function makeEvent(overrides: Partial<{
     indexed_at: overrides.indexed_at ?? Date.now(),
     operation: overrides.operation ?? ("create" as const),
   };
+}
+
+/** The feed-prune case each ingest entry point is tested against. Alice follows
+ *  Bob and her feed in `collection` sits at its cap of 2; Dave follows no one and
+ *  his feed is 3 over. A new item from Bob grows only Alice's feed, so after it
+ *  is ingested, a grown-feed prune leaves her at 2 with Bob's item kept and Dave
+ *  untouched at 5. Callers configure `collection` as a feed target with
+ *  `maxItems: 2`, and mark the recovery pass as done so it can't trim feeds
+ *  itself. */
+export const GROWN_FEED = {
+  author: "did:plc:bob",
+  follower: "did:plc:alice",
+  bystander: "did:plc:dave",
+} as const;
+
+/** Insert a follow row directly, without ingestion. */
+export async function seedFollow(db: Database, follower: string, subject: string): Promise<void> {
+  const rkey = subject.replace(/\W/g, "");
+  await db
+    .prepare(
+      "INSERT INTO records_follow (uri, did, rkey, cid, record, time_us, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind(
+      `at://${follower}/app.bsky.graph.follow/${rkey}`,
+      follower,
+      rkey,
+      "bafyfollow",
+      JSON.stringify({ subject }),
+      1000,
+      1000
+    )
+    .run();
+}
+
+export async function seedGrownFeed(db: Database, collection: string): Promise<void> {
+  const { author, follower, bystander } = GROWN_FEED;
+  await seedFollow(db, follower, author);
+  const feed: Array<[string, number]> = [
+    [follower, 2],
+    [bystander, 5],
+  ];
+  for (const [actor, count] of feed) {
+    for (let i = 0; i < count; i++) {
+      await db
+        .prepare("INSERT INTO feed_items (actor, uri, collection, time_us) VALUES (?, ?, ?, ?)")
+        .bind(actor, `at://did:plc:old/${collection}/${actor}-${i}`, collection, 1000 + i)
+        .run();
+    }
+  }
+}
+
+/** An actor's feed URIs in `collection`, newest first. */
+export async function feedUris(db: Database, actor: string, collection: string): Promise<string[]> {
+  const res = await db
+    .prepare("SELECT uri FROM feed_items WHERE actor = ? AND collection = ? ORDER BY time_us DESC")
+    .bind(actor, collection)
+    .all<{ uri: string }>();
+  return (res.results ?? []).map((r) => r.uri);
 }

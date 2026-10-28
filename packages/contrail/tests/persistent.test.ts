@@ -1,17 +1,42 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { ContrailConfig, Database } from "../src/core/types";
-import { resolveConfig } from "../src/core/types";
-import { createTestDb, createTestDbWithSchema, TEST_CONFIG } from "./helpers";
-import { runPersistent } from "../src/core/persistent";
-import { getLastCursor, queryRecords } from "../src/core/db/records";
-import { initSchema } from "../src/core/db/schema";
+import type {
+  ContrailConfig,
+  Database,
+  PersistentJetstreamSubscription,
+} from "../src/index";
+import {
+  FEED_PRUNE_RECOVERY_INTERVAL_MS,
+  FEED_PRUNE_SWEEP_ACTORS,
+  resolveConfig,
+} from "../src/index";
+import {
+  createTestDb,
+  createTestDbWithSchema,
+  feedUris,
+  GROWN_FEED,
+  seedFollow,
+  seedGrownFeed,
+  TEST_CONFIG,
+} from "./helpers";
+import { runPersistent } from "../src/index";
+import { JetstreamLiveHistoryExpiredError } from "../src/core/jetstream-live";
+import {
+  getLastCursor,
+  getServingSourcePosition,
+  queryRecords,
+} from "../src/index";
+import { initSchema } from "../src/index";
+import { saveJetstreamCursor } from "../src/core/db/records";
 
-// Mock identity resolution to avoid network calls in tests
 const applyIdentityEventMock = vi.fn().mockResolvedValue(undefined);
-vi.mock("../src/core/identity", () => ({
-  refreshStaleIdentities: vi.fn().mockResolvedValue(undefined),
-  applyIdentityEvent: (...args: unknown[]) => applyIdentityEventMock(...args),
-}));
+vi.mock("../src/core/identity", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/core/identity")>();
+  return {
+    ...actual,
+    refreshStaleIdentities: vi.fn().mockResolvedValue(undefined),
+    applyIdentityEvent: (...args: unknown[]) => applyIdentityEventMock(...args),
+  };
+});
 
 let db: Database;
 
@@ -20,7 +45,14 @@ beforeEach(async () => {
 });
 
 // Helper: create a mock async iterable that yields events then hangs until aborted
-function mockSubscription(events: Array<{ kind: string; did: string; time_us: number; commit?: any }>) {
+function mockSubscription(
+  events: Array<{
+    kind: string;
+    did: string;
+    time_us: number;
+    commit?: any;
+  }>,
+): PersistentJetstreamSubscription {
   let aborted = false;
   return {
     cursor: 0,
@@ -30,7 +62,11 @@ function mockSubscription(events: Array<{ kind: string; did: string; time_us: nu
         next: async () => {
           if (aborted) return { value: undefined, done: true as const };
           if (i < events.length) {
-            return { value: events[i++], done: false as const };
+            const event = events[i++]!;
+            return {
+              value: { ...event, seq: event.time_us },
+              done: false as const,
+            };
           }
           // Hang until iterator is returned (abort)
           return new Promise<IteratorResult<any>>(() => {});
@@ -45,7 +81,78 @@ function mockSubscription(events: Array<{ kind: string; did: string; time_us: nu
 }
 
 describe("runPersistent", () => {
-  it("flushes when batch size is reached", async () => {
+  it("rejects a raw-entry ordered-source mismatch before opening the stream", async () => {
+    await saveJetstreamCursor(db, 42, {
+      source: "jetstream",
+      epoch: "original-epoch",
+    });
+    let subscriptionCreated = false;
+
+    await expect(
+      runPersistent(
+        db,
+        {
+          ...TEST_CONFIG,
+          orderedSource: { source: "jetstream", epoch: "changed-epoch" },
+        },
+        {
+          createSubscription: () => {
+            subscriptionCreated = true;
+            return mockSubscription([]);
+          },
+        },
+      ),
+    ).rejects.toThrow("does not match durable source position");
+    expect(subscriptionCreated).toBe(false);
+  });
+
+  it("persists the initial timestamp bridge before its first source pull", async () => {
+    const bridge = 1_788_008_906_865_272;
+    const controller = new AbortController();
+    let durableCursorDuringPull: number | null = null;
+
+    await runPersistent(db, TEST_CONFIG, {
+      signal: controller.signal,
+      createSubscription: (cursor) => {
+        expect(cursor).toBeNull();
+        return {
+          cursor: bridge,
+          [Symbol.asyncIterator]() {
+            return {
+              next: async () => {
+                durableCursorDuringPull = await getLastCursor(db);
+                controller.abort();
+                return { value: undefined, done: true as const };
+              },
+            };
+          },
+        };
+      },
+    });
+
+    expect(durableCursorDuringPull).toBe(bridge);
+    expect(await getLastCursor(db)).toBe(bridge);
+  });
+
+  it("fails instead of retrying forever when live retention has expired", async () => {
+    const expired = new JetstreamLiveHistoryExpiredError("cursor too old");
+    await expect(
+      runPersistent(db, TEST_CONFIG, {
+        createSubscription: () =>
+          ({
+            async *[Symbol.asyncIterator]() {
+              throw expired;
+            },
+          }) as any,
+      }),
+    ).rejects.toBe(expired);
+  });
+
+  it("flushes records and the ordered source position atomically", async () => {
+    const config = resolveConfig({
+      ...TEST_CONFIG,
+      orderedSource: { source: "jetstream", epoch: "persistent-test" },
+    });
     const events = Array.from({ length: 50 }, (_, i) => ({
       kind: "commit" as const,
       did: `did:plc:user${i}`,
@@ -62,11 +169,14 @@ describe("runPersistent", () => {
     const controller = new AbortController();
 
     // After yielding 50 events, the mock hangs. Give it time to flush, then abort.
-    const promise = runPersistent(db, TEST_CONFIG, {
+    const promise = runPersistent(db, config, {
       batchSize: 50,
       flushIntervalMs: 60_000, // high so only batch size triggers flush
       signal: controller.signal,
-      createSubscription: () => mockSubscription(events) as any,
+      createSubscription: (_cursor, subscriptionSignal) => {
+        expect(subscriptionSignal).toBe(controller.signal);
+        return mockSubscription(events);
+      },
     });
 
     // Wait for flush to complete
@@ -82,6 +192,74 @@ describe("runPersistent", () => {
 
     const cursor = await getLastCursor(db);
     expect(cursor).toBe(1049); // last event's time_us
+    expect(await getServingSourcePosition(db)).toMatchObject({
+      position: {
+        source: "jetstream",
+        epoch: "persistent-test",
+        cursor: "1049",
+      },
+    });
+  });
+
+  it("keeps dependent events discovered in the same flush batch", async () => {
+    const config = resolveConfig({
+      namespace: "com.example",
+      profiles: [],
+      collections: {
+        event: { collection: "com.example.event" },
+        follow: {
+          collection: "app.bsky.graph.follow",
+          discover: false,
+          subjectField: "subject",
+        },
+      },
+    });
+    const localDb = createTestDb();
+    const did = "did:plc:new";
+    const events = [
+      {
+        kind: "commit",
+        did,
+        time_us: 1000,
+        commit: {
+          collection: "com.example.event",
+          operation: "create",
+          rkey: "primary",
+          cid: "primary-cid",
+          record: { name: "Primary" },
+        },
+      },
+      {
+        kind: "commit",
+        did,
+        time_us: 1001,
+        commit: {
+          collection: "app.bsky.graph.follow",
+          operation: "create",
+          rkey: "dependent",
+          cid: "dependent-cid",
+          record: { subject: did },
+        },
+      },
+    ];
+    const controller = new AbortController();
+    const promise = runPersistent(localDb, config, {
+      batchSize: 2,
+      flushIntervalMs: 60_000,
+      signal: controller.signal,
+      createSubscription: () => mockSubscription(events) as any,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    controller.abort();
+    await promise;
+
+    expect(
+      (await queryRecords(localDb, config, { collection: "event" })).records,
+    ).toHaveLength(1);
+    expect(
+      (await queryRecords(localDb, config, { collection: "follow" })).records,
+    ).toHaveLength(1);
   });
 
   it("flushes on timer when buffer is not full", async () => {
@@ -407,5 +585,192 @@ describe("runPersistent", () => {
       "did:plc:someone",
       "newhandle.test"
     );
+  });
+
+  it("checkpoints an identity-only v2 range", async () => {
+    const events = [
+      {
+        kind: "identity" as const,
+        did: "did:plc:identity-only",
+        time_us: 4_100,
+        identity: {
+          did: "did:plc:identity-only",
+          handle: "identity-only.test",
+          time: "2026-04-01T10:00:00Z",
+        },
+      },
+    ];
+    const controller = new AbortController();
+    const promise = runPersistent(db, TEST_CONFIG, {
+      batchSize: 100,
+      flushIntervalMs: 50,
+      signal: controller.signal,
+      createSubscription: () => mockSubscription(events) as any,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(await getLastCursor(db)).toBe(4_100);
+    controller.abort();
+    await promise;
+  });
+
+  it("runs the recovery feed sweep on a fully idle stream", async () => {
+    // Regression: the feed sweep used to sit behind flush()'s early return when
+    // the buffer was empty, so over-cap rows (a lowered cap, a bulk import)
+    // never drained while Jetstream was quiet. The recovery clock starts at 0,
+    // so the recovery sweep is due on the first idle timer flush.
+    const EVENT = "community.lexicon.calendar.event";
+    const feedConfig = resolveConfig({
+      namespace: "com.example",
+      collections: { event: { collection: EVENT } },
+      feeds: { main: { targets: [{ collection: "event", maxItems: 2 }] } },
+    });
+    const feedDb = createTestDb();
+    await initSchema(feedDb, feedConfig);
+
+    // Seed five rows for one actor against a cap of two — over cap, predating
+    // any ingest. No events will ever flow on this run.
+    for (let i = 0; i < 5; i++) {
+      await feedDb
+        .prepare(
+          "INSERT INTO feed_items (actor, uri, collection, time_us) VALUES (?, ?, ?, ?)"
+        )
+        .bind("did:plc:alice", `at://did:plc:alice/${EVENT}/${i}`, EVENT, 1000 + i)
+        .run();
+    }
+
+    const controller = new AbortController();
+    const promise = runPersistent(feedDb, feedConfig, {
+      batchSize: 100,
+      flushIntervalMs: 50,
+      signal: controller.signal,
+      createSubscription: () => mockSubscription([]) as any,
+    });
+
+    await new Promise((r) => setTimeout(r, 300));
+    controller.abort();
+    await promise;
+
+    const res = await feedDb
+      .prepare(
+        "SELECT COUNT(*) AS n FROM feed_items WHERE actor = ? AND collection = ?"
+      )
+      .bind("did:plc:alice", EVENT)
+      .first<{ n: number }>();
+    expect(Number(res?.n)).toBe(2);
+  });
+
+  it("prunes the feeds a flushed batch grew, and no others", async () => {
+    const EVENT = "community.lexicon.calendar.event";
+    const feedConfig = resolveConfig({
+      namespace: "com.example",
+      constellation: false,
+      collections: { event: { collection: EVENT } },
+      feeds: { main: { targets: [{ collection: "event", maxItems: 2 }] } },
+    });
+    const feedDb = createTestDb();
+    await initSchema(feedDb, feedConfig);
+    await seedGrownFeed(feedDb, EVENT);
+    const { author, follower, bystander } = GROWN_FEED;
+
+    // The loop keeps its recovery clock in memory, starting at 0. Pin the clock
+    // inside the first recovery interval, so that pass isn't due and can't trim
+    // feeds itself.
+    const now = vi.spyOn(Date, "now").mockReturnValue(FEED_PRUNE_RECOVERY_INTERVAL_MS - 1);
+    try {
+      const controller = new AbortController();
+      const promise = runPersistent(feedDb, feedConfig, {
+        batchSize: 100,
+        flushIntervalMs: 50,
+        signal: controller.signal,
+        createSubscription: () =>
+          mockSubscription([
+            {
+              kind: "commit",
+              did: author,
+              time_us: 5000,
+              commit: {
+                collection: EVENT,
+                operation: "create",
+                rkey: "new",
+                cid: "cidnew",
+                record: { name: "New", startsAt: "2026-04-01T10:00:00Z", mode: "online" },
+              },
+            },
+          ]) as any,
+      });
+      await new Promise((r) => setTimeout(r, 300));
+      controller.abort();
+      await promise;
+    } finally {
+      now.mockRestore();
+    }
+
+    const aliceFeed = await feedUris(feedDb, follower, EVENT);
+    expect(aliceFeed).toHaveLength(2);
+    expect(aliceFeed[0]).toBe(`at://${author}/${EVENT}/new`);
+    expect(await feedUris(feedDb, bystander, EVENT)).toHaveLength(5);
+  });
+
+  it("sweeps a slice when a flushed batch grew more feeds than the prune's budget", async () => {
+    const EVENT = "community.lexicon.calendar.event";
+    const feedConfig = resolveConfig({
+      namespace: "com.example",
+      constellation: false,
+      collections: { event: { collection: EVENT } },
+      feeds: { main: { targets: [{ collection: "event", maxItems: 2 }] } },
+    });
+    const feedDb = createTestDb();
+    await initSchema(feedDb, feedConfig);
+    // The budget is FEED_PRUNE_SWEEP_ACTORS feeds per capped collection, and
+    // there is one, so one more follower than that overflows it.
+    const author = "did:plc:bob";
+    for (let i = 0; i <= FEED_PRUNE_SWEEP_ACTORS; i++) {
+      await seedFollow(feedDb, `f-${String(i).padStart(4, "0")}`, author);
+    }
+    // Over cap and unrelated to bob, first in actor order: only a sweep slice
+    // reaches it.
+    const bystander = "a-bystander";
+    for (let i = 0; i < 5; i++) {
+      await feedDb
+        .prepare("INSERT INTO feed_items (actor, uri, collection, time_us) VALUES (?, ?, ?, ?)")
+        .bind(bystander, `at://did:plc:old/${EVENT}/${i}`, EVENT, 1000 + i)
+        .run();
+    }
+
+    // As above: keep the in-memory recovery pass from coming due.
+    const now = vi.spyOn(Date, "now").mockReturnValue(FEED_PRUNE_RECOVERY_INTERVAL_MS - 1);
+    try {
+      const controller = new AbortController();
+      const promise = runPersistent(feedDb, feedConfig, {
+        batchSize: 100,
+        flushIntervalMs: 50,
+        signal: controller.signal,
+        createSubscription: () =>
+          mockSubscription([
+            {
+              kind: "commit",
+              did: author,
+              time_us: 5000,
+              commit: {
+                collection: EVENT,
+                operation: "create",
+                rkey: "new",
+                cid: "cidnew",
+                record: { name: "New", startsAt: "2026-04-01T10:00:00Z", mode: "online" },
+              },
+            },
+          ]) as any,
+      });
+      await new Promise((r) => setTimeout(r, 500));
+      controller.abort();
+      await promise;
+    } finally {
+      now.mockRestore();
+    }
+
+    // The fan-out reached every follower, so the batch did overflow.
+    expect(await feedUris(feedDb, `f-${String(FEED_PRUNE_SWEEP_ACTORS).padStart(4, "0")}`, EVENT)).toHaveLength(1);
+    expect(await feedUris(feedDb, bystander, EVENT)).toHaveLength(2);
   });
 });

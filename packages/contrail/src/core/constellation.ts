@@ -1,11 +1,14 @@
 import { isDid } from "@atcute/lexicons/syntax";
+import { parse as parseTid } from "@atcute/tid";
 import type { ContrailConfig, Database, Logger } from "./types";
 import {
   DEFAULT_CONSTELLATION_URL,
   DEFAULT_FOLLOW_NSID,
-  recordsTableName,
+  buildFeedTargetCaps,
   shortNameForNsid,
 } from "./types";
+import { createIngestEvent, ingestRecords } from "./ingest";
+import { pruneGrownFeeds } from "./db";
 
 const PAGE_LIMIT = 100;
 const DID_FILTER_CHUNK = 50;
@@ -54,11 +57,11 @@ function parseBacklink(entry: NonNullable<BacklinksPage["links"]>[number]): Back
     return {
       did: entry.did,
       rkey: entry.rkey,
-      uri: entry.uri ?? `at://${entry.did}/${DEFAULT_FOLLOW_NSID}/${entry.rkey}`,
+      uri: `at://${entry.did}/${DEFAULT_FOLLOW_NSID}/${entry.rkey}`,
     };
   }
   if (entry.uri) {
-    const m = /^at:\/\/(did:[^/]+)\/[^/]+\/([^/]+)$/.exec(entry.uri);
+    const m = /^at:\/\/(did:[^/]+)\/app\.bsky\.graph\.follow\/([^/]+)$/.exec(entry.uri);
     if (m && isDid(m[1])) {
       return { did: m[1], rkey: m[2], uri: entry.uri };
     }
@@ -109,7 +112,12 @@ async function fetchBacklinksPage(
 
 /** For a newly-known subject DID, find existing followers via Constellation
  *  and ingest synthesized follow records into the configured follow table.
- *  Best-effort: failures are logged but not retried (caller can re-trigger). */
+ *  Each page's follows backfill the followers' feeds, so the page prunes
+ *  those feeds itself. A failed prune is logged and the backfill goes on: the
+ *  follows matter more than the trim, which the recovery pass redoes.
+ *  Best-effort: other failures are logged but not retried (caller can
+ *  re-trigger). A throw can come after a page committed; the recovery pass
+ *  trims whatever that leaves over cap. */
 export async function backfillFollowersFromConstellation(
   db: Database,
   config: ContrailConfig,
@@ -121,14 +129,6 @@ export async function backfillFollowersFromConstellation(
   const followShort = getFollowShort(config);
   if (!followShort) return 0;
   const log = getLogger(config);
-
-  const followTable = recordsTableName(followShort);
-  const recordJson = JSON.stringify({
-    $type: DEFAULT_FOLLOW_NSID,
-    subject: subjectDid,
-    createdAt: new Date().toISOString(),
-  });
-  const nowUs = Date.now() * 1000;
 
   let cursor: string | undefined;
   let inserted = 0;
@@ -154,17 +154,59 @@ export async function backfillFollowersFromConstellation(
         rows.map((r) => r.did)
       );
       const survivors = rows.filter((r) => known.has(r.did));
-
-      for (const r of survivors) {
-        const result = await db
-          .prepare(
-            `INSERT INTO ${followTable} (uri, did, rkey, cid, record, time_us, indexed_at)
-             VALUES (?, ?, ?, NULL, ?, ?, ?)
-             ON CONFLICT(uri) DO NOTHING`
-          )
-          .bind(r.uri, r.did, r.rkey, recordJson, nowUs, nowUs)
-          .run();
-        inserted += (result as { changes?: number })?.changes ?? 0;
+      const nowUs = Date.now() * 1000;
+      const events = survivors.flatMap((row) => {
+        try {
+          const { timestamp } = parseTid(row.rkey);
+          return [
+            createIngestEvent({
+              uri: row.uri,
+              did: row.did,
+              collection: DEFAULT_FOLLOW_NSID,
+              rkey: row.rkey,
+              operation: "create",
+              cid: null,
+              value: {
+                $type: DEFAULT_FOLLOW_NSID,
+                subject: subjectDid,
+                createdAt: new Date(timestamp / 1000).toISOString(),
+              },
+              timeUs: timestamp,
+              indexedAt: nowUs,
+              // The backlink API has no record CID. TID-derived source metadata
+              // is stable across repeated acquisitions, keeping feed fanout
+              // idempotent while the shared validator treats this as synthetic.
+              source: {
+                id: "constellation",
+                time_us: timestamp,
+                revision: row.rkey,
+                cursor: row.rkey,
+              },
+            }),
+          ];
+        } catch {
+          return [];
+        }
+      });
+      if (events.length > 0) {
+        known.add(subjectDid);
+        const ingest = await ingestRecords(db, events, config, {
+          phase: "historical",
+          knownDids: known,
+        });
+        inserted += ingest.accepted.length;
+        // A page holds at most PAGE_LIMIT follows, each growing one feed per
+        // capped collection, so this limit is never overflowed.
+        try {
+          await pruneGrownFeeds(
+            db,
+            config,
+            ingest.accepted,
+            PAGE_LIMIT * buildFeedTargetCaps(config).size
+          );
+        } catch (err) {
+          log.warn(`[constellation] subject=${subjectDid} feed prune failed: ${err}`);
+        }
       }
     }
 

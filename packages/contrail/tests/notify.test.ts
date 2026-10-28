@@ -1,9 +1,20 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
-import type { Database } from "../src/core/types";
-import { applyEvents, createTestDbWithSchema, makeEvent, TEST_CONFIG } from "./helpers";
-import { parseAtUri } from "../src/core/router/notify";
-import { createApp } from "../src/core/router/index";
-import { queryRecords } from "../src/core/db/records";
+import type { Database } from "../src/index";
+import { resolveConfig } from "../src/index";
+import {
+  ingestRecords,
+  createTestDb,
+  createTestDbWithSchema,
+  feedUris,
+  GROWN_FEED,
+  makeEvent,
+  seedGrownFeed,
+  TEST_CONFIG,
+} from "./helpers";
+import { initSchema } from "../src/index";
+import { parseAtUri } from "../src/index";
+import { createApp } from "../src/index";
+import { processNotifyUris, queryRecords, runGatedFeedPrune } from "../src/index";
 import type { Hono } from "hono";
 
 const NOTIFY_CONFIG = { ...TEST_CONFIG, notify: true };
@@ -73,19 +84,47 @@ describe("POST notifyOfUpdate", () => {
             headers: { "Content-Type": "application/json" },
           });
         }
-        return new Response("not found", { status: 404 });
+        return new Response(JSON.stringify({ error: "RecordNotFound" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        });
       })
     );
   }
 
   /** Seed the identities table so getPDS resolves without hitting slingshot. */
-  async function seedIdentity(did: string, pds: string) {
-    await db
+  async function seedIdentity(did: string, pds: string, target: Database = db) {
+    await target
       .prepare(
         "INSERT OR REPLACE INTO identities (did, handle, pds, resolved_at) VALUES (?, ?, ?, ?)"
       )
       .bind(did, "test.handle", pds, Date.now())
       .run();
+  }
+
+  async function notify(uri: string | string[]) {
+    return app.request(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(Array.isArray(uri) ? { uris: uri } : { uri }),
+    });
+  }
+
+  async function seedLocalRecord(uri: string, name = "Local") {
+    const did = uri.split("/")[2];
+    const rkey = uri.split("/").pop()!;
+    await ingestRecords(
+      db,
+      [makeEvent({ uri, did, rkey, cid: "local-cid", record: { name } })],
+      TEST_CONFIG,
+    );
+  }
+
+  async function getLocalRecord(uri: string) {
+    const records = await queryRecords(db, TEST_CONFIG, {
+      collection: "community.lexicon.calendar.event",
+    });
+    return records.records.find((record) => record.uri === uri);
   }
 
   it("returns 400 when no uri provided", async () => {
@@ -111,6 +150,15 @@ describe("POST notifyOfUpdate", () => {
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error).toMatch(/max 25/);
+  });
+
+  it("enforces the batch limit for programmatic callers too", async () => {
+    const uris = Array.from({ length: 26 }, (_, index) =>
+      `at://did:plc:test/community.lexicon.calendar.event/r${index}`,
+    );
+    await expect(
+      processNotifyUris(db, NOTIFY_CONFIG, uris),
+    ).rejects.toThrow("max 25 URIs");
   });
 
   it("reports error for invalid AT URI", async () => {
@@ -166,6 +214,40 @@ describe("POST notifyOfUpdate", () => {
     expect(result.records[0].uri).toBe(uri);
     expect(result.records[0].cid).toBe("bafytest");
     expect(JSON.parse(result.records[0].record!)).toEqual(record);
+    const version = await db
+      .prepare("SELECT source_id, source_time_us FROM record_versions WHERE uri = ?")
+      .bind(uri)
+      .first<{ source_id: string; source_time_us: number }>();
+    expect(version?.source_id).toBe("pds-notify");
+    expect(version?.source_time_us).toBeTypeOf("number");
+  });
+
+  it("prunes the feeds a notified record grew, and no others", async () => {
+    const EVENT = "community.lexicon.calendar.event";
+    const feedConfig = resolveConfig({
+      namespace: "com.example",
+      notify: true,
+      constellation: false,
+      collections: { event: { collection: EVENT } },
+      feeds: { main: { targets: [{ collection: "event", maxItems: 2 }] } },
+    });
+    const feedDb = createTestDb();
+    await initSchema(feedDb, feedConfig);
+    // Complete a recovery pass on the empty table, so the next is not due.
+    await runGatedFeedPrune(feedDb, feedConfig, []);
+    await seedGrownFeed(feedDb, EVENT);
+    const { author, follower, bystander } = GROWN_FEED;
+    const uri = `at://${author}/${EVENT}/new`;
+    await seedIdentity(author, "https://pds.example.com", feedDb);
+    mockFetch({ [uri]: { value: { name: "New" }, cid: "bafynew" } });
+
+    const result = await processNotifyUris(feedDb, feedConfig, [uri]);
+
+    expect(result.indexed).toBe(1);
+    const aliceFeed = await feedUris(feedDb, follower, EVENT);
+    expect(aliceFeed).toHaveLength(2);
+    expect(aliceFeed[0]).toBe(uri);
+    expect(await feedUris(feedDb, bystander, EVENT)).toHaveLength(5);
   });
 
   it("deletes locally when record not found on PDS", async () => {
@@ -173,7 +255,7 @@ describe("POST notifyOfUpdate", () => {
     const uri = `at://${did}/community.lexicon.calendar.event/evt1`;
 
     // Pre-populate a record
-    await applyEvents(db, [
+    await ingestRecords(db, [
       makeEvent({ uri, did, rkey: "evt1", record: { name: "Old" } }),
     ], TEST_CONFIG);
 
@@ -196,6 +278,192 @@ describe("POST notifyOfUpdate", () => {
       collection: "community.lexicon.calendar.event",
     });
     expect(result.records).toHaveLength(0);
+  });
+
+  it.each([404, 429, 500])(
+    "preserves local state when the PDS returns %s",
+    async (status) => {
+      const did = "did:plc:test";
+      const uri = `at://${did}/community.lexicon.calendar.event/transient`;
+      await seedLocalRecord(uri);
+      await seedIdentity(did, "https://pds.example.com");
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () =>
+          new Response(JSON.stringify({ error: "UpstreamFailure" }), {
+            status,
+            headers: { "Content-Type": "application/json" },
+          }),
+        ),
+      );
+
+      const body = await (await notify(uri)).json();
+      expect(body).toMatchObject({ indexed: 0, deleted: 0 });
+      expect(body.errors?.[0]).toContain(`PDS returned ${status}`);
+      expect(await getLocalRecord(uri)).toBeDefined();
+    },
+  );
+
+  it("preserves local state after a PDS network failure", async () => {
+    const did = "did:plc:test";
+    const uri = `at://${did}/community.lexicon.calendar.event/network`;
+    await seedLocalRecord(uri);
+    await seedIdentity(did, "https://pds.example.com");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("connection reset");
+      }),
+    );
+
+    const body = await (await notify(uri)).json();
+    expect(body).toMatchObject({ indexed: 0, deleted: 0 });
+    expect(body.errors?.[0]).toContain("network failure");
+    expect(await getLocalRecord(uri)).toBeDefined();
+  });
+
+  it("preserves local state after a PDS timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const did = "did:plc:test";
+      const uri = `at://${did}/community.lexicon.calendar.event/timeout`;
+      await seedLocalRecord(uri);
+      await seedIdentity(did, "https://pds.example.com");
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async (_input: string | URL | Request, init?: RequestInit) =>
+            new Promise<Response>((_resolve, reject) => {
+              init?.signal?.addEventListener(
+                "abort",
+                () => reject(new DOMException("aborted", "AbortError")),
+                { once: true },
+              );
+            }),
+        ),
+      );
+
+      const response = notify(uri);
+      await vi.advanceTimersByTimeAsync(5_000);
+      const body = await (await response).json();
+      expect(body).toMatchObject({ indexed: 0, deleted: 0 });
+      expect(body.errors?.[0]).toContain("timed out");
+      expect(await getLocalRecord(uri)).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("times out when response headers arrive but the body stalls", async () => {
+    vi.useFakeTimers();
+    try {
+      const did = "did:plc:test";
+      const uri = `at://${did}/community.lexicon.calendar.event/stalled-body`;
+      await seedLocalRecord(uri);
+      await seedIdentity(did, "https://pds.example.com");
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+          let bodyController!: ReadableStreamDefaultController<Uint8Array>;
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              bodyController = controller;
+            },
+          });
+          init?.signal?.addEventListener(
+            "abort",
+            () => bodyController.error(new DOMException("aborted", "AbortError")),
+            { once: true },
+          );
+          return new Response(body, {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }),
+      );
+
+      const response = notify(uri);
+      await vi.advanceTimersByTimeAsync(5_000);
+      const body = await (await response).json();
+      expect(body).toMatchObject({ indexed: 0, deleted: 0 });
+      expect(body.errors?.[0]).toContain("timed out");
+      expect(await getLocalRecord(uri)).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves local state after a malformed successful response", async () => {
+    const did = "did:plc:test";
+    const uri = `at://${did}/community.lexicon.calendar.event/malformed`;
+    await seedLocalRecord(uri);
+    await seedIdentity(did, "https://pds.example.com");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("not json", { status: 200 })),
+    );
+
+    const body = await (await notify(uri)).json();
+    expect(body).toMatchObject({ indexed: 0, deleted: 0 });
+    expect(body.errors?.[0]).toContain("malformed JSON response");
+    expect(await getLocalRecord(uri)).toBeDefined();
+  });
+
+  it("treats an explicit RecordNotFound XRPC error as deletion", async () => {
+    const did = "did:plc:test";
+    const uri = `at://${did}/community.lexicon.calendar.event/xrpc-not-found`;
+    await seedLocalRecord(uri);
+    await seedIdentity(did, "https://pds.example.com");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ error: "RecordNotFound" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+
+    const body = await (await notify(uri)).json();
+    expect(body).toMatchObject({ indexed: 0, deleted: 1 });
+    expect(body.errors).toBeUndefined();
+    expect(await getLocalRecord(uri)).toBeUndefined();
+  });
+
+  it("continues a mixed batch when one PDS fetch fails", async () => {
+    const did = "did:plc:test";
+    const failedUri = `at://${did}/community.lexicon.calendar.event/failed`;
+    const foundUri = `at://${did}/community.lexicon.calendar.event/found`;
+    await seedLocalRecord(failedUri, "Keep me");
+    await seedIdentity(did, "https://pds.example.com");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        const url = new URL(
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url,
+        );
+        if (url.searchParams.get("rkey") === "failed") {
+          return new Response(JSON.stringify({ error: "RateLimitExceeded" }), {
+            status: 429,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(
+          JSON.stringify({ value: { name: "Found" }, cid: "found-cid" }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }),
+    );
+
+    const body = await (await notify([failedUri, foundUri])).json();
+    expect(body).toMatchObject({ indexed: 1, deleted: 0 });
+    expect(body.errors).toHaveLength(1);
+    expect(await getLocalRecord(failedUri)).toBeDefined();
+    expect(await getLocalRecord(foundUri)).toBeDefined();
   });
 
   it("handles batch of URIs", async () => {
@@ -230,7 +498,7 @@ describe("POST notifyOfUpdate", () => {
     const uri = `at://${did}/community.lexicon.calendar.event/evt1`;
 
     // Insert original
-    await applyEvents(db, [
+    await ingestRecords(db, [
       makeEvent({ uri, did, rkey: "evt1", record: { name: "V1" } }),
     ]);
 
@@ -263,7 +531,7 @@ describe("POST notifyOfUpdate", () => {
     const rsvpUri = `at://${did}/community.lexicon.calendar.rsvp/r1`;
 
     // Insert parent event
-    await applyEvents(db, [
+    await ingestRecords(db, [
       makeEvent({ uri: eventUri, did, rkey: "evt1", record: { name: "Event" } }),
     ]);
 
@@ -298,10 +566,10 @@ describe("POST notifyOfUpdate", () => {
     const rsvpRecord = { subject: { uri: eventUri }, status: "community.lexicon.calendar.rsvp#going" };
 
     // Insert parent event and RSVP via normal ingestion
-    await applyEvents(db, [
+    await ingestRecords(db, [
       makeEvent({ uri: eventUri, did, rkey: "evt1", record: { name: "Event" } }),
     ]);
-    await applyEvents(
+    await ingestRecords(
       db,
       [
         makeEvent({
@@ -352,10 +620,10 @@ describe("POST notifyOfUpdate", () => {
     const rsvpUri = `at://${did}/community.lexicon.calendar.rsvp/r1`;
 
     // Insert parent event and RSVP via normal ingestion
-    await applyEvents(db, [
+    await ingestRecords(db, [
       makeEvent({ uri: eventUri, did, rkey: "evt1", record: { name: "Event" } }),
     ]);
-    await applyEvents(
+    await ingestRecords(
       db,
       [
         makeEvent({
@@ -403,7 +671,7 @@ describe("POST notifyOfUpdate", () => {
     expect(result.records[0].counts?.["rsvp"]).toBe(1);
   });
 
-  it("does nothing when record not on PDS and not local", async () => {
+  it("records authoritative absence without reporting a visible deletion", async () => {
     const did = "did:plc:test";
     const uri = `at://${did}/community.lexicon.calendar.event/nonexistent`;
 
@@ -419,6 +687,59 @@ describe("POST notifyOfUpdate", () => {
     const body = await res.json();
     expect(body.indexed).toBe(0);
     expect(body.deleted).toBe(0);
+    expect(
+      await db
+        .prepare("SELECT operation, source_id FROM record_versions WHERE uri = ?")
+        .bind(uri)
+        .first(),
+    ).toEqual({ operation: "delete", source_id: "pds-notify" });
+  });
+
+  it("ingests an NSID-keyed collection end-to-end (no short alias)", async () => {
+    // Config keyed directly by NSID, with `collection` omitted — the shape
+    // PR #59 advertised but that normal ingestion entry points used to skip.
+    const nsidConfig = resolveConfig({
+      namespace: "com.example",
+      notify: true,
+      collections: {
+        "com.example.thing": { queryable: { name: {} } },
+      },
+    });
+    const nsidDb = createTestDb();
+    await initSchema(nsidDb, nsidConfig);
+    const nsidApp = createApp(nsidDb, nsidConfig);
+
+    const did = "did:plc:nsidtest";
+    const uri = `at://${did}/com.example.thing/t1`;
+    const record = { name: "Findable Thing" };
+
+    await nsidDb
+      .prepare(
+        "INSERT OR REPLACE INTO identities (did, handle, pds, resolved_at) VALUES (?, ?, ?, ?)"
+      )
+      .bind(did, "test.handle", "https://pds.example.com", Date.now())
+      .run();
+    mockFetch({ [uri]: { value: record, cid: "bafynsid" } });
+
+    const res = await nsidApp.request("/xrpc/com.example.notifyOfUpdate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ uri }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // The collection must NOT be rejected as "not tracked", and must ingest.
+    expect(body.errors).toBeUndefined();
+    expect(body.indexed).toBe(1);
+
+    // And the record is retrievable under the NSID-keyed collection.
+    const result = await queryRecords(nsidDb, nsidConfig, {
+      collection: "com.example.thing",
+    });
+    expect(result.records).toHaveLength(1);
+    expect(result.records[0].uri).toBe(uri);
+    expect(JSON.parse(result.records[0].record!)).toEqual(record);
   });
 
   it("decrements counts when deleting a relation record", async () => {
@@ -427,10 +748,10 @@ describe("POST notifyOfUpdate", () => {
     const rsvpUri = `at://${did}/community.lexicon.calendar.rsvp/r1`;
 
     // Insert event + RSVP
-    await applyEvents(db, [
+    await ingestRecords(db, [
       makeEvent({ uri: eventUri, did, rkey: "evt1", record: { name: "Event" } }),
     ]);
-    await applyEvents(
+    await ingestRecords(
       db,
       [
         makeEvent({

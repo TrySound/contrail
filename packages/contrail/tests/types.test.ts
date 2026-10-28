@@ -9,7 +9,10 @@ import {
   getDiscoverableShortNames,
   getDependentShortNames,
   getCollectionNsids,
-} from "../src/core/types";
+  getDiscoverableNsids,
+  getDependentNsids,
+  shortNameForNsid,
+} from "../src/index";
 
 describe("validateFieldName", () => {
   it("accepts simple field names", () => {
@@ -150,6 +153,36 @@ describe("getRelationField", () => {
 });
 
 describe("resolveConfig", () => {
+  it.each([
+    "did:web:api.example.com#contrail",
+    "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa#contrail",
+  ])("accepts an exact AT Protocol service audience: %s", (audience) => {
+    expect(() =>
+      resolveConfig({
+        namespace: "test",
+        profiles: [],
+        collections: {},
+        serviceAuth: { audience: audience as never, methods: [] },
+      }),
+    ).not.toThrow();
+  });
+
+  it.each([
+    "did:web:api.example.com",
+    "did:web:api.example.com#",
+    "did:web:api.example.com#contrail#other",
+    "did:key:zExample#contrail",
+  ])("rejects an invalid AT Protocol service audience: %s", (audience) => {
+    expect(() =>
+      resolveConfig({
+        namespace: "test",
+        profiles: [],
+        collections: {},
+        serviceAuth: { audience: audience as never, methods: [] },
+      }),
+    ).toThrow("serviceAuth.audience");
+  });
+
   it("adds default profile collection (keyed by short name `profile`)", () => {
     const resolved = resolveConfig({
       namespace: "test",
@@ -183,7 +216,9 @@ describe("resolveConfig", () => {
 
   it("applies default jetstreams and relays", () => {
     const resolved = resolveConfig({ namespace: "test", collections: {} });
-    expect(resolved.jetstreams).toHaveLength(1);
+    expect(resolved.jetstreams).toEqual([
+      "https://jetstream.us-east.bsky.network",
+    ]);
     expect(resolved.relays).toHaveLength(1);
   });
 
@@ -197,6 +232,49 @@ describe("resolveConfig", () => {
     });
     expect(resolved._resolved.nsidToShort["test.event"]).toBe("event");
     expect(resolved._resolved.nsidToShort["test.rsvp"]).toBe("rsvp");
+  });
+});
+
+describe("NSID-keyed collections (no short alias / omitted `collection`)", () => {
+  const config = resolveConfig({
+    namespace: "com.example",
+    collections: {
+      "com.example.event": { searchable: ["name"] },
+      "com.example.follow": { discover: false },
+    },
+  });
+
+  it("validateConfig accepts an NSID-keyed config", () => {
+    expect(() =>
+      validateConfig({
+        namespace: "com.example",
+        collections: {
+          "com.example.event": { searchable: ["name"] },
+        },
+      })
+    ).not.toThrow();
+  });
+
+  it("getCollectionNsids returns the config key as the NSID", () => {
+    const nsids = getCollectionNsids(config);
+    expect(nsids).toContain("com.example.event");
+    expect(nsids).toContain("com.example.follow");
+    expect(nsids).not.toContain(undefined);
+  });
+
+  it("getDiscoverableNsids / getDependentNsids split NSID-keyed entries", () => {
+    expect(getDiscoverableNsids(config)).toContain("com.example.event");
+    expect(getDependentNsids(config)).toContain("com.example.follow");
+    expect(getDiscoverableNsids(config)).not.toContain("com.example.follow");
+  });
+
+  it("shortNameForNsid resolves an NSID-keyed collection to its key", () => {
+    expect(shortNameForNsid(config, "com.example.event")).toBe("com.example.event");
+  });
+
+  it("builds nsidToShort for NSID-keyed entries", () => {
+    expect(config._resolved.nsidToShort["com.example.event"]).toBe("com.example.event");
+    expect(config._resolved.nsidToShort["com.example.follow"]).toBe("com.example.follow");
   });
 });
 

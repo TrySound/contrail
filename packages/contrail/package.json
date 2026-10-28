@@ -1,9 +1,12 @@
 {
   "name": "@atmo-dev/contrail",
-  "version": "0.6.0",
+  "version": "0.25.0",
   "description": "Index AT Protocol records with typed XRPC endpoints. Cloudflare Workers + D1, SvelteKit, Node.js.",
   "type": "module",
   "sideEffects": false,
+  "engines": {
+    "node": ">=22.15.0"
+  },
   "files": [
     "dist"
   ],
@@ -19,6 +22,14 @@
       "types": "./dist/server.d.ts",
       "import": "./dist/server.js"
     },
+    "./client": {
+      "types": "./dist/public-client.d.ts",
+      "import": "./dist/public-client.js"
+    },
+    "./moderation": {
+      "types": "./dist/moderation-client.d.ts",
+      "import": "./dist/moderation-client.js"
+    },
     "./sqlite": {
       "types": "./dist/adapters/sqlite.d.ts",
       "import": "./dist/adapters/sqlite.js"
@@ -31,6 +42,10 @@
       "types": "./dist/adapters/pglite.d.ts",
       "import": "./dist/adapters/pglite.js"
     },
+    "./alluvium": {
+      "types": "./dist/adapters/alluvium.d.ts",
+      "import": "./dist/adapters/alluvium.js"
+    },
     "./workers": {
       "types": "./dist/workers/backfill.d.ts",
       "import": "./dist/workers/backfill.js"
@@ -42,6 +57,10 @@
     "./cli-config": {
       "types": "./dist/cli-config.d.ts",
       "import": "./dist/cli-config.js"
+    },
+    "./lexicons": {
+      "types": "./dist/lexicons/index.d.ts",
+      "import": "./dist/lexicons/index.js"
     }
   },
   "bin": {
@@ -65,35 +84,48 @@
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:postgres": "CONTRAIL_TEST_DIALECT=postgres vitest run --testTimeout=60000 tests/moderation tests/account-lifecycle tests/label-backfill-policy tests/label-live-policy tests/profile-moderation tests/self-labels tests/labels",
+    "test:built": "node tests/built-sqlite.mjs && node tests/built-pglite.mjs && node tests/built-alluvium.mjs && node tests/built-lexicons.mjs && node tests/built-client.mjs && node tests/built-changes.mjs",
+    "test:workerd": "node tests/workerd-smoke.mjs",
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@atcute/atproto": "^3.1.10",
-    "@atcute/cbor": "^2.3.2",
-    "@atcute/cid": "^2.4.1",
-    "@atcute/client": "^4.2.1",
-    "@atcute/identity": "^1.1.4",
-    "@atcute/identity-resolver": "^1.2.2",
-    "@atcute/jetstream": "^1.0.2",
-    "@atcute/lexicons": "^1.2.9",
-    "@atcute/xrpc-server": "^0.1.12",
+    "@atcute/atproto": "^4.0.4",
+    "@atcute/cbor": "^2.3.6",
+    "@atcute/cid": "2.4.2",
+    "@atcute/client": "^5.1.1",
+    "@atcute/identity": "^2.0.2",
+    "@atcute/identity-resolver": "^2.0.1",
+    "@atcute/jetstream": "^2.0.2",
+    "@atcute/lex-cli": "^3.2.1",
+    "@atcute/lexicon-doc": "3.0.2",
+    "@atcute/lexicons": "^2.0.3",
+    "@atcute/oauth-types": "^1.0.1",
+    "@atcute/tid": "1.1.4",
+    "@atcute/uint8array": "1.1.5",
+    "@atcute/xrpc-server": "^2.0.2",
+    "@atproto/lex": "^0.3.8",
+    "@bsky/jetstream": "^1.0.0",
     "cac": "^7.0.0",
-    "hono": "^4.12.8",
-    "jiti": "^2.4.0"
+    "hono": "^4.13.0",
+    "jiti": "^2.7.0",
+    "valibot": "1.4.2"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250124.0",
-    "@types/node": "^25.5.0",
-    "@types/pg": "^8.20.0",
-    "pg": "^8.20.0",
-    "tsup": "^8.5.0",
-    "typescript": "^5.7.3",
-    "vitest": "^4.1.0",
-    "wrangler": "^4.63.0"
+    "@atcute/crypto": "2.4.4",
+    "@cloudflare/workers-types": "5.20260815.1",
+    "@electric-sql/pglite": "0.5.11",
+    "@types/node": "^26.1.2",
+    "@types/pg": "^8.20.4",
+    "pg": "^8.22.0",
+    "tsup": "^8.5.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10",
+    "wrangler": "4.123.0"
   },
   "peerDependencies": {
     "pg": "^8.0.0",
-    "@electric-sql/pglite": "^0.2.0",
+    "@electric-sql/pglite": "^0.5.11",
     "wrangler": "^4.0.0"
   },
   "peerDependenciesMeta": {

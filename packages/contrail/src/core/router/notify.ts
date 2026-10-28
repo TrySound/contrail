@@ -1,38 +1,123 @@
 import type { Hono } from "hono";
 import type { Database, ContrailConfig, IngestEvent } from "../types";
+import type { ServiceAuthGate } from "../service-auth";
 import { shortNameForNsid } from "../types";
-import { applyEvents, lookupExistingRecords } from "../db/records";
+import { lookupExistingRecords } from "../db/records";
+import { createIngestEvent, ingestRecords, recordTimeUs } from "../ingest";
+import { runGatedFeedPrune } from "../jetstream";
 import { getPDS } from "../client";
-import type { Did } from "@atcute/lexicons";
+import type { Did, Nsid } from "@atcute/lexicons";
+import { parseCanonicalResourceUri } from "@atcute/lexicons/syntax";
 
-/** Parse an AT URI into its components. */
+/** Parse a canonical (DID-authority) record AT-URI into its components, or null
+ *  if it isn't a valid full record URI. Backed by atcute's validator, which
+ *  also enforces the DID / NSID / record-key character classes. */
 export function parseAtUri(uri: string): { did: string; collection: string; rkey: string } | null {
-  const match = uri.match(/^at:\/\/(did:[^/]+)\/([^/]+)\/([^/]+)$/);
-  if (!match) return null;
-  return { did: match[1], collection: match[2], rkey: match[3] };
+  try {
+    const { repo, collection, rkey } = parseCanonicalResourceUri(uri);
+    return { did: repo, collection, rkey };
+  } catch {
+    return null;
+  }
 }
 
-/**
- * Fetch a single record from the user's PDS.
- * Returns the record + cid on success, null if not found.
- */
+const NOTIFY_FETCH_TIMEOUT_MS = 5_000;
+export const MAX_NOTIFY_URIS = 25;
+
+type RecordFetchResult =
+  | { kind: "found"; value: Record<string, unknown>; cid: string }
+  | { kind: "not-found" }
+  | { kind: "error"; status?: number; message: string };
+
+function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
+  });
+}
+
+/** Fetch one authoritative record without conflating failure with deletion. */
 async function fetchRecordFromPDS(
   pds: string,
   did: string,
   collection: string,
-  rkey: string
-): Promise<{ value: unknown; cid: string } | null> {
+  rkey: string,
+  signal: AbortSignal,
+): Promise<RecordFetchResult> {
   const url = new URL(`/xrpc/com.atproto.repo.getRecord`, pds);
   url.searchParams.set("repo", did);
   url.searchParams.set("collection", collection);
   url.searchParams.set("rkey", rkey);
 
-  const res = await fetch(url.toString());
-  if (!res.ok) return null;
+  let response: Response;
+  try {
+    response = await fetch(url.toString(), { signal });
+  } catch (error) {
+    if (signal.aborted) throw error;
+    return { kind: "error", message: `network failure: ${String(error)}` };
+  }
 
-  const data = (await res.json()) as { value?: unknown; cid?: string };
-  if (!data.value || !data.cid) return null;
-  return { value: data.value, cid: data.cid };
+  if (!response.ok) {
+    const body = await response.json().catch((error) => {
+      if (signal.aborted) throw error;
+      return null;
+    }) as { error?: unknown; message?: unknown } | null;
+    const errorCode = typeof body?.error === "string" ? body.error : undefined;
+    if (errorCode === "RecordNotFound") {
+      return { kind: "not-found" };
+    }
+    const detail =
+      errorCode ??
+      (typeof body?.message === "string" ? body.message : response.statusText);
+    return {
+      kind: "error",
+      status: response.status,
+      message: `PDS returned ${response.status}${detail ? ` (${detail})` : ""}`,
+    };
+  }
+
+  let data: unknown;
+  try {
+    data = await response.json();
+  } catch (error) {
+    if (signal.aborted) throw error;
+    return {
+      kind: "error",
+      status: response.status,
+      message: `malformed JSON response: ${String(error)}`,
+    };
+  }
+
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return {
+      kind: "error",
+      status: response.status,
+      message: "malformed record response",
+    };
+  }
+  const { value, cid } = data as { value?: unknown; cid?: unknown };
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    typeof cid !== "string" ||
+    cid.length === 0
+  ) {
+    return {
+      kind: "error",
+      status: response.status,
+      message: "malformed record response",
+    };
+  }
+  return {
+    kind: "found",
+    value: value as Record<string, unknown>,
+    cid,
+  };
 }
 
 export interface NotifyResult {
@@ -50,6 +135,10 @@ export async function processNotifyUris(
   config: ContrailConfig,
   uris: string[]
 ): Promise<NotifyResult> {
+  if (uris.length > MAX_NOTIFY_URIS) {
+    throw new RangeError(`max ${MAX_NOTIFY_URIS} URIs per request`);
+  }
+
   const events: IngestEvent[] = [];
   const errors: string[] = [];
 
@@ -78,63 +167,115 @@ export async function processNotifyUris(
   );
 
   for (const { uri, parsed } of validUris) {
-    const pds = await getPDS(parsed.did as Did, db);
-    if (!pds) {
-      errors.push(`could not resolve PDS for ${parsed.did}`);
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(new Error("notify deadline exceeded")),
+      NOTIFY_FETCH_TIMEOUT_MS,
+    );
+    let result: RecordFetchResult;
+    try {
+      const pds = await abortable(
+        getPDS(parsed.did as Did, db, config),
+        controller.signal,
+      );
+      if (!pds) {
+        errors.push(`${uri}: could not resolve PDS for ${parsed.did}`);
+        continue;
+      }
+      result = await abortable(
+        fetchRecordFromPDS(
+          pds,
+          parsed.did,
+          parsed.collection,
+          parsed.rkey,
+          controller.signal,
+        ),
+        controller.signal,
+      );
+    } catch (error) {
+      errors.push(
+        controller.signal.aborted
+          ? `${uri}: PDS request timed out after ${NOTIFY_FETCH_TIMEOUT_MS}ms`
+          : `${uri}: could not resolve or fetch from PDS: ${String(error)}`,
+      );
+      continue;
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    const existingInfo = existing.get(uri);
+    if (result.kind === "error") {
+      errors.push(`${uri}: ${result.message}`);
       continue;
     }
 
-    const result = await fetchRecordFromPDS(
-      pds,
-      parsed.did,
-      parsed.collection,
-      parsed.rkey
-    );
-
-    const now = Date.now() * 1000; // microseconds
-    const existingInfo = existing.get(uri);
-
-    if (result) {
-      if (existingInfo?.cid === result.cid) {
-        // Same CID — nothing changed
-        continue;
-      }
-
-      events.push({
-        uri,
-        did: parsed.did,
-        collection: parsed.collection,
-        rkey: parsed.rkey,
-        operation: existingInfo ? "update" : "create",
-        cid: result.cid,
-        record: JSON.stringify(result.value),
-        time_us: now,
-        indexed_at: now,
-      });
-    } else if (existingInfo) {
-      // Record gone from PDS but exists locally — delete it.
-      events.push({
-        uri,
-        did: parsed.did,
-        collection: parsed.collection,
-        rkey: parsed.rkey,
-        operation: "delete",
-        cid: null,
-        record: existingInfo.record,
-        time_us: now,
-        indexed_at: now,
-      });
+    const now = Date.now() * 1000;
+    if (result.kind === "found") {
+      if (existingInfo?.cid === result.cid) continue;
+      events.push(
+        createIngestEvent({
+          uri,
+          did: parsed.did,
+          collection: parsed.collection,
+          rkey: parsed.rkey,
+          operation: existingInfo ? "update" : "create",
+          cid: result.cid,
+          value: result.value,
+          timeUs: recordTimeUs(result.value, parsed.collection, config, now),
+          indexedAt: now,
+          source: {
+            id: "pds-notify",
+            time_us: now,
+            revision: null,
+            cursor: null,
+          },
+        }),
+      );
+    } else {
+      // An authoritative absence is versioned even when no visible row exists;
+      // that tombstone prevents an older relay create from resurrecting it.
+      events.push(
+        createIngestEvent({
+          uri,
+          did: parsed.did,
+          collection: parsed.collection,
+          rkey: parsed.rkey,
+          operation: "delete",
+          timeUs: now,
+          indexedAt: now,
+          source: {
+            id: "pds-notify",
+            time_us: now,
+            revision: null,
+            cursor: null,
+          },
+        }),
+      );
     }
   }
 
-  if (events.length > 0) {
-    // Pass pre-fetched existing records so applyEvents skips re-querying
-    await applyEvents(db, events, config, { existing });
+  const appliedEvents = events.length > 0
+    ? (await ingestRecords(db, events, config, { existing, phase: "live" })).accepted
+    : [];
+
+  // The shared ingest path fans these records into feed_items exactly like the cron and
+  // persistent ingest paths, so prune here too — otherwise a notify-only
+  // deployment (no jetstream loop) would never sweep. Run the recovery-aware
+  // gate on every call, not only when records changed: a notify-only deployment
+  // that receives no-op notifications (a same-CID re-notify produces no events)
+  // must still be able to advance an overdue recovery pass. Only the feeds this
+  // call's applied records grew are pruned outside that pass.
+  if (config.feeds) {
+    await runGatedFeedPrune(db, config, appliedEvents);
   }
 
   return {
-    indexed: events.filter((e) => e.operation === "create" || e.operation === "update").length,
-    deleted: events.filter((e) => e.operation === "delete").length,
+    indexed: appliedEvents.filter(
+      (event) => event.operation === "create" || event.operation === "update",
+    ).length,
+    deleted: appliedEvents.filter(
+      (event) => event.operation === "delete" && existing.has(event.uri),
+    ).length,
     errors: errors.length > 0 ? errors : undefined,
   };
 }
@@ -142,7 +283,8 @@ export async function processNotifyUris(
 export function registerNotifyRoute(
   app: Hono,
   db: Database,
-  config: ContrailConfig
+  config: ContrailConfig,
+  serviceAuth?: ServiceAuthGate | null
 ) {
   // Endpoint is off by default. Set config.notify to true or a secret string to enable.
   if (!config.notify) return;
@@ -151,6 +293,12 @@ export function registerNotifyRoute(
   const secret = typeof config.notify === "string" ? config.notify : null;
 
   app.post(`/xrpc/${ns}.notifyOfUpdate`, async (c) => {
+    const method = `${ns}.notifyOfUpdate` as Nsid;
+    const authorization = serviceAuth?.protects("notifyOfUpdate")
+      ? await serviceAuth.authorize(c.req.raw, method)
+      : null;
+    if (authorization?.response) return authorization.response;
+
     if (secret) {
       const auth = c.req.header("Authorization");
       if (auth !== `Bearer ${secret}`) {
@@ -169,8 +317,19 @@ export function registerNotifyRoute(
       return c.json({ error: "uri or uris required" }, 400);
     }
 
-    if (uris.length > 25) {
-      return c.json({ error: "max 25 URIs per request" }, 400);
+    if (uris.length > MAX_NOTIFY_URIS) {
+      return c.json({ error: `max ${MAX_NOTIFY_URIS} URIs per request` }, 400);
+    }
+    if (authorization?.principal) {
+      for (const uri of uris) {
+        const parsed = parseAtUri(uri);
+        if (parsed && parsed.did !== authorization.principal.issuer) {
+          return c.json(
+            { error: "notified records must belong to the service-auth issuer" },
+            403
+          );
+        }
+      }
     }
 
     const result = await processNotifyUris(db, config, uris);

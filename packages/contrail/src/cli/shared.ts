@@ -5,11 +5,12 @@ import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import {
   findConfigFile,
+  findLexiconBundle,
   loadConfig,
+  loadLexiconBundle,
   CONFIG_CANDIDATES_MESSAGE,
 } from "../cli-config.js";
 import type { ContrailConfig } from "../core/types.js";
-import type { CollectionStats, RefreshResult } from "../core/refresh.js";
 
 export interface ConfigOpts {
   config?: string;
@@ -20,19 +21,43 @@ export interface ConfigOpts {
  * Resolve and load a ContrailConfig from CLI options. Exits with code 1 if no
  * config file is found, since every command except `append-scheduled` needs one.
  */
-export async function resolveAndLoadConfig(
-  opts: ConfigOpts
-): Promise<ContrailConfig> {
+export async function resolveConfig(
+  opts: ConfigOpts,
+): Promise<{ config: ContrailConfig; path: string }> {
   const root = opts.root ?? process.cwd();
   const path = findConfigFile(root, opts.config);
   if (!path) {
-    console.error(
+    throw new Error(
       "Could not find a Contrail config. Pass --config <path> or place one at\n" +
-        `  ${CONFIG_CANDIDATES_MESSAGE}`
+        `  ${CONFIG_CANDIDATES_MESSAGE}`,
     );
-    process.exit(1);
   }
-  return loadConfig(path);
+  return { config: await loadConfig(path), path };
+}
+
+export async function resolveAndLoadConfig(
+  opts: ConfigOpts,
+): Promise<ContrailConfig> {
+  return (await resolveConfig(opts)).config;
+}
+
+/** Load the standard generated/pinned bundle only when collection policy needs
+ * runtime validation. */
+export async function resolveValidationLexicons(
+  opts: ConfigOpts,
+  config: ContrailConfig,
+): Promise<object[] | undefined> {
+  if (!Object.values(config.collections).some((collection) => collection.validate === true)) {
+    return undefined;
+  }
+  const root = opts.root ?? process.cwd();
+  const path = findLexiconBundle(root);
+  if (!path) {
+    throw new Error(
+      "validated collections require a generated Lexicon bundle; run `contrail lexicons all`",
+    );
+  }
+  return loadLexiconBundle(path);
 }
 
 /**
@@ -57,34 +82,19 @@ export async function promptYesNo(
   }
 }
 
-export function formatStats(s: CollectionStats): string {
-  return `${s.missing} missing, ${s.staleUpdates} stale updates, ${s.inSync} in sync`;
-}
-
-export function printRefreshReport(
-  result: RefreshResult,
-  byCollection: boolean
-): void {
-  console.log("");
-  if (byCollection) {
-    console.log("by collection:");
-    const entries = Object.entries(result.byCollection).sort(([a], [b]) =>
-      a.localeCompare(b)
-    );
-    for (const [nsid, stats] of entries) {
-      if (stats.missing === 0 && stats.staleUpdates === 0 && stats.inSync === 0)
-        continue;
-      console.log(`  ${nsid}`);
-      console.log(`    ${formatStats(stats)}`);
-    }
-    console.log("");
-  }
-  console.log("total:");
-  console.log(`  ${formatStats(result.total)}`);
-  console.log(
-    `  ${result.usersScanned} users scanned` +
-      (result.usersFailed ? `, ${result.usersFailed} failed` : "") +
-      ` in ${(result.elapsedMs / 1000).toFixed(1)}s`
+/** Warn before omitting unresolved documents from a temporary source bundle. */
+export async function confirmUnresolvedLexicons(
+  nsids: readonly string[],
+  autoYes: boolean,
+): Promise<boolean> {
+  console.warn("\nwarning: could not resolve these configured Lexicons:");
+  for (const nsid of nsids) console.warn(`  - ${nsid}`);
+  console.warn(
+    "Continuing omits them and schemas that depend on them from the local " +
+      "bundle. Directly affected record values will be generated as `unknown`.",
   );
-  console.log(`  (ignore window: ${(result.ignoreWindowMs / 1000).toFixed(0)}s)`);
+  console.warn(
+    "Collections with `validate: true` still cannot start without their complete Lexicon closure.",
+  );
+  return promptYesNo("continue without these Lexicons?", false, autoYes);
 }

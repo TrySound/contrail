@@ -1,140 +1,109 @@
+/** Contrail's public API. */
+export type { LexiconDoc } from "@atcute/lexicon-doc";
 export { Contrail } from "./contrail";
-export type { ContrailOptions } from "./contrail";
+export type { AppOptions, ContrailInitOptions, ContrailOptions } from "./contrail";
+export * from "./public-service";
 
-export type {
-  ContrailConfig,
-  CollectionConfig,
-  RelationConfig,
-  ReferenceConfig,
-  QueryableField,
-  FeedConfig,
-  Database,
-  Statement,
-  Logger,
-  IngestEvent,
-  RecordRow,
-  RecordSource,
-  ResolvedContrailConfig,
-  ResolvedMaps,
-  ResolvedRelation,
-  CustomQueryHandler,
-  PipelineQueryHandler,
-} from "./core/types";
-
-export { resolveConfig, validateConfig } from "./core/types";
-
-export type { QueryOptions, SortOption } from "./core/db/records";
-export type { BackfillProgress, BackfillAllOptions } from "./core/backfill";
-export type { NotifyResult } from "./core/router/notify";
-export type {
-  RefreshOptions,
-  RefreshResult,
-  RefreshProgress,
-  CollectionStats,
-} from "./core/refresh";
-
-export { runPersistent } from "./core/persistent";
-export type { PersistentIngestOptions } from "./core/persistent";
-
-// Spaces
-export type {
-  SpacesConfig,
-  AppPolicy,
-  AppPolicyMode,
-  SpaceRow,
-  SpaceMemberRow,
-  StoredRecord,
-  StorageAdapter,
-  ListOptions,
-  ListResult,
-  ListSpacesOptions,
-  CollectionCount,
-  InviteRow,
-  CreateInviteInput,
-  RedeemInviteResult,
-} from "./core/spaces/types";
-export { HostedAdapter } from "./core/spaces/adapter";
-export { nextTid } from "./core/spaces/tid";
-export { generateInviteToken, hashInviteToken, mintInviteToken } from "./core/invite";
+// Configuration, storage, identity, and dialects.
+export * from "./core/types";
+export * from "./core/dialect";
+export * from "./core/identity";
 export {
-  MemoryBlobAdapter,
-  R2BlobAdapter,
-  blobKey,
-} from "./core/spaces/blob-adapter";
-export type { BlobAdapter, BlobUploadMeta, R2BucketLike } from "./core/spaces/blob-adapter";
-export type { SpacesBlobsConfig, BlobMetaRow } from "./core/spaces/types";
+  getClient,
+  getPDS,
+  resolvePDS,
+  validateExternalUrl,
+} from "./core/client";
+export type { ResolvedIdentity } from "./core/client";
 
-// Realtime
-export type {
-  PubSub,
-  RealtimeConfig,
-  RealtimeEvent,
-  RealtimeEventKind,
-} from "./core/realtime/types";
+// Ingestion and maintenance.
+export * from "./core/ingest";
+export * from "./core/sources";
+export * from "./core/bootstrap";
+export * from "./core/verification";
+export * from "./core/generations";
+export * from "./core/pds-snapshot";
+export * from "./core/jetstream-source";
+export * from "./core/jetstream";
 export {
-  InMemoryPubSub,
-  DurableObjectPubSub,
-  RealtimePubSubDO,
-  TicketSigner,
-  wrapWithPublishing,
-  sseResponse,
-  pumpWebSocket,
-  mergeAsyncIterables,
-  resolveTopicForCaller,
-  actorTopic,
-  collectionTopic,
-  communityTopic,
-  spaceTopic,
-  registerRealtimeRoutes,
-} from "./core/realtime";
+  JetstreamLiveHistoryExpiredError,
+} from "./core/jetstream-live";
+export type { JetstreamLiveEvent } from "./core/jetstream-live";
+export * from "./core/persistent";
+export * from "./core/backfill";
+export * from "./core/status";
+export * from "./core/diagnostics";
+export {
+  getChangeLogCostPlan,
+  getChangeLogState,
+  MAX_CHANGE_BATCH_BYTES,
+  MAX_CHANGE_BATCH_CHANGES,
+} from "./core/change-log";
 export type {
-  DurableObjectId,
-  DurableObjectNamespace,
-  DurableObjectStub,
-  DurableObjectState,
-} from "./core/realtime/durable-object";
+  ChangeLogCostPlan,
+  ChangeLogState,
+  RecordChange,
+} from "./core/change-log";
+export * from "./core/changes";
+export * from "./core/change-bootstrap";
+export * from "./core/delivery";
+export * from "./core/validation";
+export * from "./core/search";
+export * from "./core/constellation";
 
-// Labels
-export type {
-  LabelsConfig,
-  LabelerSource,
-  LabelRow,
-  LabelerCursorRow,
-} from "./core/labels/types";
-export type { HydratedLabel } from "./core/labels/hydrate";
-export { hydrateLabels } from "./core/labels/hydrate";
-export { selectAcceptedLabelers } from "./core/labels/select";
-export { applyLabels } from "./core/labels/apply";
-export type { IncomingLabel } from "./core/labels/apply";
+// Database.
+export * from "./core/db/schema";
 export {
-  runLabelIngestCycle,
-  runPersistentLabels,
-} from "./core/labels/subscribe";
-export type { PersistentLabelsOptions } from "./core/labels/subscribe";
-export { resolveLabelerEndpoint } from "./core/labels/resolve";
+  assertServingSourceCompatibility,
+  getFeedPruneCursor,
+  getLastCursor,
+  getServingSourcePosition,
+  lookupExistingRecords,
+  pruneActorFeed,
+  pruneFeedItems,
+  pruneGrownFeeds,
+  queryRecords,
+  saveCursor,
+  saveCursorStatement,
+  saveOrderedSourcePositionStatement,
+  saveServingSourcePositionStatement,
+  orderedSourcePosition,
+  saveFeedPruneCursor,
+  sweepFeedItems,
+} from "./core/db/records";
+export type {
+  ExistingRecordInfo,
+  FeedSweepResult,
+  GrownFeedPruneResult,
+  QueryOptions,
+  SortOption,
+  ServingSourcePosition,
+} from "./core/db/records";
+export * from "./core/db/meta";
+export * from "./core/db/optimize";
 
-// Community
-export {
-  CommunityAdapter,
-  CredentialCipher,
-  registerCommunityRoutes,
-  ACCESS_LEVELS,
-  RESERVED_KEYS,
-  isAccessLevel,
-  isReservedKey,
-  rankOf,
-  resolveEffectiveLevel,
-  flattenEffectiveMembers,
-  wouldCycle,
-  reconcile,
-} from "./core/community";
-export type {
-  CommunityConfig,
-  CommunityMode,
-  CommunityRow,
-  CommunityInviteRow,
-  CreateCommunityInviteInput,
-  AccessLevel,
-  AccessLevelRow,
-  ReservedKey,
-} from "./core/community";
+// HTTP and query pipeline.
+export * from "./core/router";
+export * from "./core/router/notify";
+export * from "./core/router/profiles";
+export * from "./core/router/feed";
+export * from "./core/router/diagnostics";
+export * from "./core/router/collection";
+export * from "./core/router/hydrate";
+export * from "./core/router/helpers";
+
+// Moderation and account lifecycle.
+export * from "./core/moderation";
+export * from "./core/moderation-sync";
+export * from "./core/moderation-policy";
+export { moderationActionLexicon } from "./lexicons/moderation";
+
+// Labels.
+export * from "./core/labels/types";
+export * from "./core/labels/self";
+export * from "./core/labels/hydrate";
+export * from "./core/labels/select";
+export * from "./core/labels/apply";
+export * from "./core/labels/subscribe";
+export * from "./core/labels/resolve";
+export * from "./core/labels/schema";
